@@ -70,7 +70,12 @@ def load_model(args: argparse.Namespace, device: torch.device) -> VGGT:
     ckpt_path = Path(args.ckpt)
     if ckpt_path.is_file():
         model = VGGT()
-        state = torch.load(ckpt_path, map_location="cpu")
+        if ckpt_path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            state = load_file(str(ckpt_path), device="cpu")
+        else:
+            state = torch.load(ckpt_path, map_location="cpu")
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
         model.load_state_dict(state)
