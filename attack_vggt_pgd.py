@@ -66,6 +66,20 @@ def forward_vggt(model: VGGT, images: torch.Tensor, dtype: torch.dtype) -> dict[
     return {k: v for k, v in preds.items() if torch.is_tensor(v)}
 
 
+def load_model(args: argparse.Namespace, device: torch.device) -> VGGT:
+    ckpt_path = Path(args.ckpt)
+    if ckpt_path.is_file():
+        model = VGGT()
+        state = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        model.load_state_dict(state)
+        return model.to(device).eval()
+
+    kwargs = {"local_files_only": True} if args.local_files_only else {}
+    return VGGT.from_pretrained(args.ckpt, **kwargs).to(device).eval()
+
+
 def detach_predictions(preds: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     keys = ("pose_enc", "depth", "depth_conf", "world_points", "world_points_conf")
     return {k: preds[k].detach() for k in keys if k in preds}
@@ -283,6 +297,11 @@ def parse_args() -> argparse.Namespace:
         help="Batch mode: root containing scene_name/vggt_outputs.npz clean outputs.",
     )
     parser.add_argument("--ckpt", default="facebook/VGGT-1B", help="Hugging Face model id or local checkpoint path.")
+    parser.add_argument(
+        "--local_files_only",
+        action="store_true",
+        help="Load Hugging Face checkpoint from local cache only; useful on offline servers.",
+    )
     parser.add_argument("--max_frames", type=int, default=4, help="Maximum number of frames to attack; 0 keeps all frames.")
     parser.add_argument("--steps", type=int, default=10, help="PGD iterations.")
     parser.add_argument("--eps", type=float, default=8 / 255, help="L-infinity perturbation budget in [0, 1] pixels.")
@@ -407,7 +426,7 @@ def main() -> None:
     print(f"[cfg] device={device} dtype={dtype}")
     print(f"[model] loading {args.ckpt}")
 
-    model = VGGT.from_pretrained(args.ckpt).to(device).eval()
+    model = load_model(args, device)
     for param in model.parameters():
         param.requires_grad_(False)
 
