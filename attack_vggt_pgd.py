@@ -252,15 +252,15 @@ def tensor_to_numpy(preds: dict[str, torch.Tensor], image_size_hw: tuple[int, in
     out: dict[str, np.ndarray] = {}
     if "pose_enc" in preds:
         extrinsic, intrinsic = pose_encoding_to_extri_intri(preds["pose_enc"], image_size_hw)
-        out["extrinsic"] = extrinsic.detach().cpu().numpy().astype(np.float32)
-        out["intrinsic"] = intrinsic.detach().cpu().numpy().astype(np.float32)
-        out["pose_enc"] = preds["pose_enc"].detach().cpu().numpy().astype(np.float32)
+        out["extrinsic"] = extrinsic.detach().float().cpu().numpy().astype(np.float32)
+        out["intrinsic"] = intrinsic.detach().float().cpu().numpy().astype(np.float32)
+        out["pose_enc"] = preds["pose_enc"].detach().float().cpu().numpy().astype(np.float32)
     for key in ("depth", "depth_conf", "world_points", "world_points_conf"):
         if key in preds:
-            out[key] = preds[key].detach().cpu().numpy().astype(np.float32)
+            out[key] = preds[key].detach().float().cpu().numpy().astype(np.float32)
     for key in ("track", "vis", "conf"):
         if key in preds:
-            out[key] = preds[key].detach().cpu().numpy().astype(np.float32)
+            out[key] = preds[key].detach().float().cpu().numpy().astype(np.float32)
     return out
 
 
