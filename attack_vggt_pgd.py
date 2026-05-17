@@ -18,10 +18,12 @@ Example:
 
 import argparse
 import glob
+import gzip
 import json
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -31,6 +33,9 @@ from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
+
+
+CO3D_TO_OPENCV = np.diag([-1.0, -1.0, 1.0]).astype(np.float32)
 
 
 def find_images(scene_dir: Path) -> list[str]:
@@ -166,24 +171,205 @@ def align_image_paths_to_clean(scene_dir: Path, clean_npz: Path | None, max_fram
     return paths, frame_indices
 
 
-def normalized_mse(adv: torch.Tensor, clean: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    scale = clean.detach().abs().mean().clamp_min(eps)
-    return ((adv - clean.detach()) / scale).pow(2).mean()
+def parse_flat_scene_name(scene_dir: Path) -> tuple[str, str]:
+    name = scene_dir.name
+    if "__" not in name:
+        raise ValueError(f"CO3D flat scene name must look like category__sequence, got: {name}")
+    category, sequence_name = name.split("__", 1)
+    return category, sequence_name
+
+
+def load_co3d_category_annotations(gt_root: Path, category: str) -> list[dict]:
+    anno_path = gt_root / category / "frame_annotations.jgz"
+    if not anno_path.exists():
+        raise FileNotFoundError(f"Missing CO3D frame annotations: {anno_path}")
+    with gzip.open(anno_path, "rt") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError(f"Expected list annotations in {anno_path}, got {type(data)}")
+    return data
+
+
+def co3d_ndc_intrinsics_to_pixels(viewpoint: dict, image_size_hw: tuple[int, int]) -> np.ndarray:
+    height, width = image_size_hw
+    min_size = float(min(height, width))
+    focal = np.asarray(viewpoint["focal_length"], dtype=np.float32)
+    principal = np.asarray(viewpoint["principal_point"], dtype=np.float32)
+
+    intrinsics = np.eye(3, dtype=np.float32)
+    intrinsics[0, 0] = focal[0] * min_size / 2.0
+    intrinsics[1, 1] = focal[1] * min_size / 2.0
+    intrinsics[0, 2] = width / 2.0 - principal[0] * min_size / 2.0
+    intrinsics[1, 2] = height / 2.0 - principal[1] * min_size / 2.0
+    return intrinsics
+
+
+def co3d_viewpoint_to_opencv_extrinsic(viewpoint: dict) -> np.ndarray:
+    rotation = np.asarray(viewpoint["R"], dtype=np.float32)
+    translation = np.asarray(viewpoint["T"], dtype=np.float32)
+    rotation = CO3D_TO_OPENCV @ rotation
+    translation = CO3D_TO_OPENCV @ translation
+    return np.concatenate([rotation, translation[:, None]], axis=1).astype(np.float32)
+
+
+def read_co3d_depth(depth_path: Path, scale_adjustment: float | None) -> np.ndarray:
+    depth_raw = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+    if depth_raw is None:
+        raise FileNotFoundError(f"Could not read depth map: {depth_path}")
+    depth = depth_raw.astype(np.float32)
+    if depth_raw.dtype == np.uint16:
+        depth = depth / 1000.0
+    if scale_adjustment is not None:
+        depth = depth * float(scale_adjustment)
+    return depth
+
+
+def resolve_co3d_asset(gt_root: Path, category: str, rel_path: str) -> Path:
+    candidates = [
+        gt_root / category / rel_path,
+        gt_root / rel_path,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def preprocess_gt_like_vggt_input(
+    depth: np.ndarray,
+    mask: np.ndarray,
+    intrinsics: np.ndarray,
+    target_hw: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    target_h, target_w = target_hw
+    orig_h, orig_w = depth.shape[:2]
+    new_w = target_w
+    new_h = round(orig_h * (new_w / orig_w) / 14) * 14
+    scale = new_w / orig_w
+
+    depth = cv2.resize(depth, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    mask = cv2.resize(mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST) > 0
+
+    intrinsics = intrinsics.copy()
+    intrinsics[:2, :] *= scale
+
+    if new_h > target_h:
+        start_y = (new_h - target_h) // 2
+        depth = depth[start_y : start_y + target_h]
+        mask = mask[start_y : start_y + target_h]
+        intrinsics[1, 2] -= start_y
+    elif new_h < target_h:
+        pad_top = (target_h - new_h) // 2
+        pad_bottom = target_h - new_h - pad_top
+        depth = np.pad(depth, ((pad_top, pad_bottom), (0, 0)), mode="constant", constant_values=0)
+        mask = np.pad(mask, ((pad_top, pad_bottom), (0, 0)), mode="constant", constant_values=False)
+        intrinsics[1, 2] += pad_top
+
+    depth[~mask] = 0.0
+    return depth.astype(np.float32), mask.astype(bool), intrinsics.astype(np.float32)
+
+
+def load_co3d_gt_reference(
+    gt_root: Path,
+    scene_dir: Path,
+    image_paths: list[str],
+    device: torch.device,
+    image_size_hw: tuple[int, int],
+) -> dict[str, torch.Tensor]:
+    category, sequence_name = parse_flat_scene_name(scene_dir)
+    annotations = load_co3d_category_annotations(gt_root, category)
+    sequence_frames = [item for item in annotations if item.get("sequence_name") == sequence_name]
+    if not sequence_frames:
+        raise ValueError(f"No CO3D GT frames for {category}/{sequence_name}")
+
+    by_basename = {Path(item["image"]["path"]).name: item for item in sequence_frames}
+    depths = []
+    masks = []
+    extrinsics = []
+    intrinsics = []
+    world_points = []
+
+    for image_path in image_paths:
+        basename = Path(image_path).name
+        if basename not in by_basename:
+            raise ValueError(f"No GT annotation for frame {basename} in {category}/{sequence_name}")
+        anno = by_basename[basename]
+        gt_image_path = resolve_co3d_asset(gt_root, category, anno["image"]["path"])
+        if not gt_image_path.exists():
+            raise FileNotFoundError(f"Could not resolve GT image path: {gt_image_path}")
+        with Image.open(gt_image_path) as gt_image:
+            image_width, image_height = gt_image.size
+
+        extrinsic = co3d_viewpoint_to_opencv_extrinsic(anno["viewpoint"])
+        intrinsic = co3d_ndc_intrinsics_to_pixels(anno["viewpoint"], (int(image_height), int(image_width)))
+
+        depth_rel = anno["depth"]["path"]
+        mask_rel = anno["depth"].get("mask_path") or anno.get("mask", {}).get("path")
+        depth_path = resolve_co3d_asset(gt_root, category, depth_rel)
+        mask_path = resolve_co3d_asset(gt_root, category, mask_rel)
+        depth = read_co3d_depth(depth_path, anno["depth"].get("scale_adjustment"))
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise FileNotFoundError(f"Could not read depth mask: {mask_path}")
+        mask = mask > 128
+
+        depth, mask, intrinsic = preprocess_gt_like_vggt_input(depth, mask, intrinsic, image_size_hw)
+        world = unproject_depth_map_to_point_map(depth[None, ..., None], extrinsic[None], intrinsic[None])[0]
+
+        depths.append(depth)
+        masks.append(mask)
+        extrinsics.append(extrinsic)
+        intrinsics.append(intrinsic)
+        world_points.append(world)
+
+    extrinsics_t = torch.from_numpy(np.stack(extrinsics).astype(np.float32)).to(device).unsqueeze(0)
+    intrinsics_t = torch.from_numpy(np.stack(intrinsics).astype(np.float32)).to(device).unsqueeze(0)
+    refs = {
+        "pose_enc": extri_intri_to_pose_encoding(extrinsics_t, intrinsics_t, image_size_hw),
+        "depth": torch.from_numpy(np.stack(depths).astype(np.float32)).to(device).unsqueeze(0)[..., None],
+        "world_points": torch.from_numpy(np.stack(world_points).astype(np.float32)).to(device).unsqueeze(0),
+        "point_mask": torch.from_numpy(np.stack(masks).astype(bool)).to(device).unsqueeze(0),
+        "extrinsic": extrinsics_t,
+        "intrinsic": intrinsics_t,
+    }
+    return refs
+
+
+def normalized_mse(
+    pred: torch.Tensor,
+    reference: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    reference = reference.detach()
+    diff = pred - reference
+    if mask is not None:
+        while mask.ndim < diff.ndim:
+            mask = mask.unsqueeze(-1)
+        mask = mask.to(device=diff.device, dtype=torch.bool).expand_as(diff)
+        if mask.sum() == 0:
+            return (0.0 * pred).mean()
+        scale = reference[mask].abs().mean().clamp_min(eps)
+        return ((diff[mask]) / scale).pow(2).mean()
+
+    scale = reference.abs().mean().clamp_min(eps)
+    return (diff / scale).pow(2).mean()
 
 
 def attack_loss(
     adv: dict[str, torch.Tensor],
-    clean: dict[str, torch.Tensor],
+    reference: dict[str, torch.Tensor],
     weights: dict[str, float],
 ) -> tuple[torch.Tensor, dict[str, float]]:
     terms: dict[str, torch.Tensor] = {}
+    point_mask = reference.get("point_mask")
 
-    if "depth" in adv and "depth" in clean:
-        terms["depth"] = normalized_mse(adv["depth"], clean["depth"])
-    if "pose_enc" in adv and "pose_enc" in clean:
-        terms["pose"] = normalized_mse(adv["pose_enc"], clean["pose_enc"])
-    if "world_points" in adv and "world_points" in clean:
-        terms["points"] = normalized_mse(adv["world_points"], clean["world_points"])
+    if "depth" in adv and "depth" in reference:
+        terms["depth"] = normalized_mse(adv["depth"], reference["depth"], mask=point_mask)
+    if "pose_enc" in adv and "pose_enc" in reference:
+        terms["pose"] = normalized_mse(adv["pose_enc"], reference["pose_enc"])
+    if "world_points" in adv and "world_points" in reference:
+        terms["points"] = normalized_mse(adv["world_points"], reference["world_points"], mask=point_mask)
 
     if not terms:
         raise RuntimeError("No comparable VGGT outputs were produced.")
@@ -248,6 +434,97 @@ def pgd_attack(
     return adv_images, history
 
 
+def resolve_patch_box(
+    image_hw: tuple[int, int],
+    patch_size: int,
+    patch_x: int,
+    patch_y: int,
+) -> tuple[int, int, int, int]:
+    height, width = image_hw
+    patch_h = min(patch_size, height)
+    patch_w = min(patch_size, width)
+    if patch_x < 0:
+        patch_x = (width - patch_w) // 2
+    if patch_y < 0:
+        patch_y = (height - patch_h) // 2
+    patch_x = int(np.clip(patch_x, 0, width - patch_w))
+    patch_y = int(np.clip(patch_y, 0, height - patch_h))
+    return patch_x, patch_y, patch_h, patch_w
+
+
+def apply_adversarial_patch(
+    images: torch.Tensor,
+    patch: torch.Tensor,
+    patch_x: int,
+    patch_y: int,
+) -> torch.Tensor:
+    _, _, height, width = images.shape
+    _, _, patch_h, patch_w = patch.shape
+    mask = torch.zeros((1, 1, height, width), device=images.device, dtype=images.dtype)
+    canvas = torch.zeros((1, 3, height, width), device=images.device, dtype=images.dtype)
+    mask[:, :, patch_y : patch_y + patch_h, patch_x : patch_x + patch_w] = 1.0
+    canvas[:, :, patch_y : patch_y + patch_h, patch_x : patch_x + patch_w] = patch.to(dtype=images.dtype)
+    return (images * (1.0 - mask) + canvas * mask).clamp(0.0, 1.0)
+
+
+def patch_attack(
+    model: VGGT,
+    images: torch.Tensor,
+    reference_preds: dict[str, torch.Tensor],
+    dtype: torch.dtype,
+    steps: int,
+    alpha: float,
+    patch_size: int,
+    patch_x: int,
+    patch_y: int,
+    weights: dict[str, float],
+) -> tuple[torch.Tensor, list[dict[str, float]], torch.Tensor, dict[str, int]]:
+    base = images.detach()
+    image_hw = tuple(base.shape[-2:])
+    patch_x, patch_y, patch_h, patch_w = resolve_patch_box(image_hw, patch_size, patch_x, patch_y)
+    patch = torch.rand((1, 3, patch_h, patch_w), device=base.device, dtype=torch.float32)
+    patch.requires_grad_(True)
+    patch.retain_grad()
+
+    history: list[dict[str, float]] = []
+    for step in range(steps):
+        adv_images = apply_adversarial_patch(base, patch, patch_x, patch_y)
+        preds = forward_vggt(model, adv_images, dtype)
+        loss, terms = attack_loss(preds, reference_preds, weights)
+
+        model.zero_grad(set_to_none=True)
+        if patch.grad is not None:
+            patch.grad.zero_()
+        loss.backward()
+
+        with torch.no_grad():
+            grad = patch.grad
+            if grad is None:
+                raise RuntimeError("Patch gradient is None; check the forward graph.")
+            patch = (patch + alpha * grad.sign()).clamp(0.0, 1.0).detach()
+            patch.requires_grad_(True)
+            patch.retain_grad()
+
+        terms["step"] = step + 1
+        history.append(terms)
+        print(
+            f"[patch] step {step + 1:03d}/{steps:03d} "
+            f"loss={terms['total']:.6f} "
+            f"depth={terms.get('depth', 0.0):.6f} "
+            f"pose={terms.get('pose', 0.0):.6f} "
+            f"points={terms.get('points', 0.0):.6f}"
+        )
+
+    adv_images = apply_adversarial_patch(base, patch, patch_x, patch_y).detach()
+    patch_meta = {
+        "patch_x": patch_x,
+        "patch_y": patch_y,
+        "patch_h": patch_h,
+        "patch_w": patch_w,
+    }
+    return adv_images, history, patch.detach(), patch_meta
+
+
 def tensor_to_numpy(preds: dict[str, torch.Tensor], image_size_hw: tuple[int, int]) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
     if "pose_enc" in preds:
@@ -255,6 +532,10 @@ def tensor_to_numpy(preds: dict[str, torch.Tensor], image_size_hw: tuple[int, in
         out["extrinsic"] = extrinsic.detach().float().cpu().numpy().astype(np.float32)
         out["intrinsic"] = intrinsic.detach().float().cpu().numpy().astype(np.float32)
         out["pose_enc"] = preds["pose_enc"].detach().float().cpu().numpy().astype(np.float32)
+    if "extrinsic" in preds:
+        out["extrinsic"] = preds["extrinsic"].detach().float().cpu().numpy().astype(np.float32)
+    if "intrinsic" in preds:
+        out["intrinsic"] = preds["intrinsic"].detach().float().cpu().numpy().astype(np.float32)
     for key in ("depth", "depth_conf", "world_points", "world_points_conf"):
         if key in preds:
             out[key] = preds[key].detach().float().cpu().numpy().astype(np.float32)
@@ -375,7 +656,11 @@ def camera_paper_proxy_metrics(clean: dict[str, torch.Tensor], adv: dict[str, to
     return camera_metrics_from_pair_errors(camera_pair_error_records(clean, adv, image_size_hw))
 
 
-def sample_point_cloud(points: np.ndarray, max_points: int) -> np.ndarray:
+def sample_point_cloud(points: np.ndarray, max_points: int, mask: np.ndarray | None = None) -> np.ndarray:
+    if mask is not None:
+        points = points[mask.astype(bool)]
+    else:
+        points = points.reshape(-1, 3)
     points = points.reshape(-1, 3).astype(np.float32)
     finite = np.isfinite(points).all(axis=1)
     points = points[finite]
@@ -393,16 +678,24 @@ def nearest_distances(src: torch.Tensor, dst: torch.Tensor, chunk_size: int = 20
     return torch.cat(mins, dim=0)
 
 
-def chamfer_proxy_metrics(clean_points: np.ndarray, adv_points: np.ndarray, prefix: str, max_points: int, device: torch.device) -> dict[str, float]:
-    clean_points = sample_point_cloud(clean_points, max_points)
-    adv_points = sample_point_cloud(adv_points, max_points)
-    if len(clean_points) == 0 or len(adv_points) == 0:
+def chamfer_metrics(
+    reference_points: np.ndarray,
+    pred_points: np.ndarray,
+    prefix: str,
+    max_points: int,
+    device: torch.device,
+    reference_mask: np.ndarray | None = None,
+    pred_mask: np.ndarray | None = None,
+) -> dict[str, float]:
+    reference_points = sample_point_cloud(reference_points, max_points, reference_mask)
+    pred_points = sample_point_cloud(pred_points, max_points, pred_mask)
+    if len(reference_points) == 0 or len(pred_points) == 0:
         return {}
 
-    clean_t = torch.from_numpy(clean_points).to(device)
-    adv_t = torch.from_numpy(adv_points).to(device)
-    acc = nearest_distances(adv_t, clean_t).mean()
-    comp = nearest_distances(clean_t, adv_t).mean()
+    reference_t = torch.from_numpy(reference_points).to(device)
+    pred_t = torch.from_numpy(pred_points).to(device)
+    acc = nearest_distances(pred_t, reference_t).mean()
+    comp = nearest_distances(reference_t, pred_t).mean()
     overall = (acc + comp) * 0.5
     return {
         f"{prefix}_accuracy": float(acc.detach().cpu()),
@@ -412,42 +705,67 @@ def chamfer_proxy_metrics(clean_points: np.ndarray, adv_points: np.ndarray, pref
 
 
 def paper_style_proxy_metrics(
-    clean: dict[str, torch.Tensor],
-    adv: dict[str, torch.Tensor],
+    reference: dict[str, torch.Tensor],
+    pred: dict[str, torch.Tensor],
     image_size_hw: tuple[int, int],
     max_points: int,
     device: torch.device,
 ) -> dict[str, float | str]:
     metrics: dict[str, float | str] = {}
-    metrics.update(camera_paper_proxy_metrics(clean, adv, image_size_hw))
+    metrics.update(camera_paper_proxy_metrics(reference, pred, image_size_hw))
 
-    clean_np = tensor_to_numpy(clean, image_size_hw)
-    adv_np = tensor_to_numpy(adv, image_size_hw)
+    reference_np = tensor_to_numpy(reference, image_size_hw)
+    pred_np = tensor_to_numpy(pred, image_size_hw)
+    reference_mask = None
+    if "point_mask" in reference:
+        reference_mask = reference["point_mask"].detach().cpu().numpy()[0].astype(bool)
 
-    if all(k in clean_np for k in ("depth", "extrinsic", "intrinsic")) and all(
-        k in adv_np for k in ("depth", "extrinsic", "intrinsic")
+    if all(k in reference_np for k in ("depth", "extrinsic", "intrinsic")) and all(
+        k in pred_np for k in ("depth", "extrinsic", "intrinsic")
     ):
-        clean_depth_points = unproject_depth_map_to_point_map(clean_np["depth"][0], clean_np["extrinsic"][0], clean_np["intrinsic"][0])
-        adv_depth_points = unproject_depth_map_to_point_map(adv_np["depth"][0], adv_np["extrinsic"][0], adv_np["intrinsic"][0])
-        metrics.update(chamfer_proxy_metrics(clean_depth_points, adv_depth_points, "depth", max_points, device))
+        reference_depth_points = unproject_depth_map_to_point_map(
+            reference_np["depth"][0], reference_np["extrinsic"][0], reference_np["intrinsic"][0]
+        )
+        pred_depth_points = unproject_depth_map_to_point_map(
+            pred_np["depth"][0], pred_np["extrinsic"][0], pred_np["intrinsic"][0]
+        )
+        metrics.update(
+            chamfer_metrics(
+                reference_depth_points,
+                pred_depth_points,
+                "depth",
+                max_points,
+                device,
+                reference_mask=reference_mask,
+            )
+        )
 
-    if "world_points" in clean_np and "world_points" in adv_np:
-        metrics.update(chamfer_proxy_metrics(clean_np["world_points"][0], adv_np["world_points"][0], "point", max_points, device))
+    if "world_points" in reference_np and "world_points" in pred_np:
+        metrics.update(
+            chamfer_metrics(
+                reference_np["world_points"][0],
+                pred_np["world_points"][0],
+                "point",
+                max_points,
+                device,
+                reference_mask=reference_mask,
+            )
+        )
 
     metrics["tracking_image_matching"] = "not_computed_requires_two_view_matching_protocol"
     return metrics
 
 
 def paper_style_proxy_records(
-    clean: dict[str, torch.Tensor],
-    adv: dict[str, torch.Tensor],
+    reference: dict[str, torch.Tensor],
+    pred: dict[str, torch.Tensor],
     image_size_hw: tuple[int, int],
     max_points: int,
     device: torch.device,
 ) -> dict:
-    metrics = paper_style_proxy_metrics(clean, adv, image_size_hw, max_points, device)
+    metrics = paper_style_proxy_metrics(reference, pred, image_size_hw, max_points, device)
     return {
-        "camera_pair_errors": camera_pair_error_records(clean, adv, image_size_hw),
+        "camera_pair_errors": camera_pair_error_records(reference, pred, image_size_hw),
         "depth_scene_metrics": {
             key: metrics[key]
             for key in ("depth_accuracy", "depth_completeness", "depth_overall")
@@ -512,6 +830,14 @@ def save_delta_preview(clean_images: torch.Tensor, adv_images: torch.Tensor, out
         to_pil_image(img).save(preview_dir / f"{i:03d}_clean_adv_delta.png")
 
 
+def save_patch_image(patch: torch.Tensor | None, out_dir: Path) -> None:
+    if patch is None:
+        return
+    patch_dir = out_dir / "patch"
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    to_pil_image(patch.squeeze(0).detach().cpu().clamp(0, 1)).save(patch_dir / "learned_patch.png")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a PGD attack baseline against VGGT.")
     parser.add_argument("--scene_dir", default=None, help="Single scene directory, with images under scene/images or scene itself.")
@@ -524,6 +850,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Batch mode: root containing scene_name/vggt_outputs.npz clean outputs.",
     )
+    parser.add_argument(
+        "--gt_root",
+        required=True,
+        help="CO3D raw GT root containing category/frame_annotations.jgz plus images/depths/depth_masks.",
+    )
     parser.add_argument("--ckpt", default="facebook/VGGT-1B", help="Hugging Face model id or local checkpoint path.")
     parser.add_argument(
         "--local_files_only",
@@ -531,9 +862,14 @@ def parse_args() -> argparse.Namespace:
         help="Load Hugging Face checkpoint from local cache only; useful on offline servers.",
     )
     parser.add_argument("--max_frames", type=int, default=4, help="Maximum number of frames to attack; 0 keeps all frames.")
+    parser.add_argument("--attack_type", choices=("global", "patch"), default="global", help="Attack perturbation type.")
     parser.add_argument("--steps", type=int, default=10, help="PGD iterations.")
     parser.add_argument("--eps", type=float, default=8 / 255, help="L-infinity perturbation budget in [0, 1] pixels.")
     parser.add_argument("--alpha", type=float, default=1 / 255, help="PGD step size in [0, 1] pixels.")
+    parser.add_argument("--patch_size", type=int, default=96, help="Square patch size in preprocessed input pixels.")
+    parser.add_argument("--patch_alpha", type=float, default=None, help="Patch PGD step size; defaults to --alpha.")
+    parser.add_argument("--patch_x", type=int, default=-1, help="Patch left coordinate; -1 centers the patch.")
+    parser.add_argument("--patch_y", type=int, default=-1, help="Patch top coordinate; -1 centers the patch.")
     parser.add_argument("--no_random_start", action="store_true", help="Start PGD from the clean images.")
     parser.add_argument("--depth_weight", type=float, default=1.0)
     parser.add_argument("--pose_weight", type=float, default=0.2)
@@ -570,6 +906,8 @@ def process_scene(
 
     clean_images = load_and_preprocess_images(image_paths).to(device)
     image_size_hw = tuple(clean_images.shape[-2:])
+    gt_refs = load_co3d_gt_reference(Path(args.gt_root), scene_dir, image_paths, device, image_size_hw)
+    print(f"[gt] loaded CO3D real GT from {args.gt_root}")
 
     if clean_npz is not None and not args.run_clean_forward:
         clean_preds = load_clean_reference(clean_npz, device, image_size_hw, frame_indices=frame_indices)
@@ -586,44 +924,76 @@ def process_scene(
         "pose": args.pose_weight,
         "points": args.points_weight,
     }
-    adv_images, history = pgd_attack(
-        model=model,
-        images=clean_images,
-        clean_preds=clean_preds,
-        dtype=dtype,
-        steps=args.steps,
-        eps=args.eps,
-        alpha=args.alpha,
-        random_start=not args.no_random_start,
-        weights=weights,
-    )
+    patch_tensor = None
+    patch_meta = None
+    if args.attack_type == "patch":
+        adv_images, history, patch_tensor, patch_meta = patch_attack(
+            model=model,
+            images=clean_images,
+            reference_preds=gt_refs,
+            dtype=dtype,
+            steps=args.steps,
+            alpha=args.patch_alpha if args.patch_alpha is not None else args.alpha,
+            patch_size=args.patch_size,
+            patch_x=args.patch_x,
+            patch_y=args.patch_y,
+            weights=weights,
+        )
+    else:
+        adv_images, history = pgd_attack(
+            model=model,
+            images=clean_images,
+            clean_preds=gt_refs,
+            dtype=dtype,
+            steps=args.steps,
+            eps=args.eps,
+            alpha=args.alpha,
+            random_start=not args.no_random_start,
+            weights=weights,
+        )
 
     track_query = clean_preds["track"][:, 0] if "track" in clean_preds else None
     with torch.no_grad():
         adv_preds_full = forward_vggt(model, adv_images, dtype, query_points=track_query)
     adv_preds = detach_predictions(adv_preds_full)
-    output_drift_metrics = compare_predictions(clean_preds, adv_preds, clean_images, adv_images)
-    paper_proxy_metrics = paper_style_proxy_metrics(
+    clean_gt_metrics = paper_style_proxy_metrics(
+        gt_refs,
         clean_preds,
+        image_size_hw,
+        max_points=args.metric_max_points,
+        device=device,
+    )
+    adv_gt_metrics = paper_style_proxy_metrics(
+        gt_refs,
         adv_preds,
         image_size_hw,
         max_points=args.metric_max_points,
         device=device,
     )
-    eval_records = paper_style_proxy_records(
+    clean_gt_records = paper_style_proxy_records(
+        gt_refs,
         clean_preds,
+        image_size_hw,
+        max_points=args.metric_max_points,
+        device=device,
+    )
+    adv_gt_records = paper_style_proxy_records(
+        gt_refs,
         adv_preds,
         image_size_hw,
         max_points=args.metric_max_points,
         device=device,
     )
 
-    print("\n[output drift: clean prediction vs pgd prediction]")
-    for key, value in output_drift_metrics.items():
-        print(f"  {key}: {value:.6f}")
+    print("\n[clean vs real GT]")
+    for key, value in clean_gt_metrics.items():
+        if isinstance(value, float):
+            print(f"  {key}: {value:.6f}")
+        else:
+            print(f"  {key}: {value}")
 
-    print("\n[paper-style proxy: clean prediction as pseudo-GT]")
-    for key, value in paper_proxy_metrics.items():
+    print("\n[pgd vs real GT]")
+    for key, value in adv_gt_metrics.items():
         if isinstance(value, float):
             print(f"  {key}: {value:.6f}")
         else:
@@ -645,15 +1015,20 @@ def process_scene(
         "ckpt": args.ckpt,
         "n_frames": len(image_paths),
         "steps": args.steps,
+        "attack_type": args.attack_type,
         "eps": args.eps,
         "alpha": args.alpha,
+        "patch": patch_meta,
         "random_start": not args.no_random_start,
         "weights": weights,
         "metrics": {
-            "output_drift": output_drift_metrics,
-            "paper_style_proxy": paper_proxy_metrics,
+            "clean_vs_gt": clean_gt_metrics,
+            "pgd_vs_gt": adv_gt_metrics,
         },
-        "eval_records": eval_records,
+        "eval_records": {
+            "clean_vs_gt": clean_gt_records,
+            "pgd_vs_gt": adv_gt_records,
+        },
         "history": history,
         "image_paths": [str(p) for p in image_paths],
     }
@@ -661,6 +1036,7 @@ def process_scene(
         json.dump(summary, f, indent=2)
 
     save_delta_preview(clean_images, adv_images, out_dir)
+    save_patch_image(patch_tensor, out_dir)
     if args.save_adv_images:
         save_adv_images(adv_images, image_paths, out_dir)
 
@@ -668,10 +1044,10 @@ def process_scene(
     return summary
 
 
-def mean_scene_metric(summaries: list[dict], record_name: str, metric_name: str) -> float | None:
+def mean_scene_metric(summaries: list[dict], eval_key: str, record_name: str, metric_name: str) -> float | None:
     values = []
     for summary in summaries:
-        records = summary.get("eval_records", {})
+        records = summary.get("eval_records", {}).get(eval_key, {})
         value = records.get(record_name, {}).get(metric_name)
         if isinstance(value, (int, float)) and np.isfinite(value):
             values.append(float(value))
@@ -680,14 +1056,14 @@ def mean_scene_metric(summaries: list[dict], record_name: str, metric_name: str)
     return float(np.mean(values))
 
 
-def aggregate_dataset_metrics(summaries: list[dict]) -> dict:
+def aggregate_eval_key(summaries: list[dict], eval_key: str) -> dict:
     camera_r_errors: list[float] = []
     camera_t_errors: list[float] = []
     matching_r_errors: list[float] = []
     matching_t_errors: list[float] = []
 
     for summary in summaries:
-        records = summary.get("eval_records", {})
+        records = summary.get("eval_records", {}).get(eval_key, {})
         camera_records = records.get("camera_pair_errors", {})
         camera_r_errors.extend(camera_records.get("rotation_deg", []))
         camera_t_errors.extend(camera_records.get("translation_deg", []))
@@ -697,13 +1073,6 @@ def aggregate_dataset_metrics(summaries: list[dict]) -> dict:
         matching_t_errors.extend(matching_records.get("translation_deg", []))
 
     metrics: dict[str, dict] = {
-        "protocol": {
-            "reference": "clean_vggt_outputs_as_pseudo_gt",
-            "camera": "VGGT official evaluation branch style: AUC over per-pair max(rotation_error, translation_error)",
-            "depth": "scene mean of clean-vs-adv Accuracy/Completeness/Overall",
-            "point": "scene mean of clean-vs-adv Accuracy/Completeness/Overall",
-            "tracking_image_matching": "not computed yet; requires two-view matching protocol",
-        },
         "camera": {},
         "depth": {},
         "point": {},
@@ -716,12 +1085,12 @@ def aggregate_dataset_metrics(summaries: list[dict]) -> dict:
     )
 
     for name in ("accuracy", "completeness", "overall"):
-        value = mean_scene_metric(summaries, "depth_scene_metrics", f"depth_{name}")
+        value = mean_scene_metric(summaries, eval_key, "depth_scene_metrics", f"depth_{name}")
         if value is not None:
             metrics["depth"][name] = value
 
     for name in ("accuracy", "completeness", "overall"):
-        value = mean_scene_metric(summaries, "point_scene_metrics", f"point_{name}")
+        value = mean_scene_metric(summaries, eval_key, "point_scene_metrics", f"point_{name}")
         if value is not None:
             metrics["point"][name] = value
 
@@ -736,6 +1105,21 @@ def aggregate_dataset_metrics(summaries: list[dict]) -> dict:
         }
 
     return metrics
+
+
+def aggregate_dataset_metrics(summaries: list[dict]) -> dict:
+    return {
+        "protocol": {
+            "reference": "real_co3d_gt",
+            "attack_loss": "maximize prediction error against real CO3D GT",
+            "camera": "VGGT official evaluation branch style: AUC over per-pair max(rotation_error, translation_error)",
+            "depth": "scene mean of prediction-vs-GT Accuracy/Completeness/Overall",
+            "point": "scene mean of prediction-vs-GT Accuracy/Completeness/Overall",
+            "tracking_image_matching": "not computed yet; requires two-view matching protocol",
+        },
+        "clean_vs_gt": aggregate_eval_key(summaries, "clean_vs_gt"),
+        "pgd_vs_gt": aggregate_eval_key(summaries, "pgd_vs_gt"),
+    }
 
 
 def main() -> None:
