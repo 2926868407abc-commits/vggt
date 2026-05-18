@@ -57,6 +57,24 @@ def find_images(scene_dir: Path):
     return sorted(paths)
 
 
+def load_model(ckpt: str, device: str):
+    ckpt_path = Path(ckpt)
+    if ckpt_path.is_file():
+        model = VGGT()
+        if ckpt_path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            state = load_file(str(ckpt_path), device="cpu")
+        else:
+            state = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
+        model.load_state_dict(state)
+        return model.to(device).eval()
+
+    return VGGT.from_pretrained(ckpt).to(device).eval()
+
+
 def subsample(paths, max_n):
     """等距下采样到 max_n 张。"""
     if len(paths) <= max_n:
@@ -136,24 +154,24 @@ def process_scene(model, scene_dir: Path, out_root: Path, args, device, dtype):
         # ---- 保存主结果 ----
         np.savez_compressed(
             out_dir / "vggt_outputs.npz",
-            extrinsic=extrinsic.squeeze(0).cpu().numpy().astype(np.float32),
-            intrinsic=intrinsic.squeeze(0).cpu().numpy().astype(np.float32),
-            depth=depth.squeeze(0).cpu().numpy().astype(np.float16),
-            depth_conf=depth_conf.squeeze(0).cpu().numpy().astype(np.float16),
-            point_map=pmap.squeeze(0).cpu().numpy().astype(np.float16),
-            point_conf=pmap_conf.squeeze(0).cpu().numpy().astype(np.float16),
+            extrinsic=extrinsic.squeeze(0).float().cpu().numpy().astype(np.float32),
+            intrinsic=intrinsic.squeeze(0).float().cpu().numpy().astype(np.float32),
+            depth=depth.squeeze(0).float().cpu().numpy().astype(np.float16),
+            depth_conf=depth_conf.squeeze(0).float().cpu().numpy().astype(np.float16),
+            point_map=pmap.squeeze(0).float().cpu().numpy().astype(np.float16),
+            point_conf=pmap_conf.squeeze(0).float().cpu().numpy().astype(np.float16),
             point_cloud_unproj=pcd_unproj.astype(np.float16),
-            tracks=tracks[-1].cpu().numpy() if isinstance(tracks, list)
-                   else tracks.cpu().numpy(),
-            track_visibility=vis_score.cpu().numpy(),
-            track_confidence=conf_score.cpu().numpy(),
+            tracks=tracks[-1].float().cpu().numpy() if isinstance(tracks, list)
+                   else tracks.float().cpu().numpy(),
+            track_visibility=vis_score.float().cpu().numpy(),
+            track_confidence=conf_score.float().cpu().numpy(),
             image_paths=np.array([os.path.basename(p) for p in image_paths]),
         )
 
         # ---- 可选：导出可视化点云 ----
         if args.save_ply:
             # 用 depth 反投影 + 置信度过滤
-            conf_np = depth_conf.squeeze(0).cpu().numpy()
+            conf_np = depth_conf.squeeze(0).float().cpu().numpy()
             mask = conf_np > np.quantile(conf_np, 0.3)  # 保留高置信 70%
 
             imgs_np = (images.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
@@ -217,7 +235,7 @@ def main():
     print(f"[cfg] device={device}, dtype={dtype}, ckpt={args.ckpt}")
 
     print(f"[model] loading {args.ckpt} ...")
-    model = VGGT.from_pretrained(args.ckpt).to(device).eval()
+    model = load_model(args.ckpt, device)
 
     scenes_root = Path(args.scenes_root)
     output_root = Path(args.output_root)
