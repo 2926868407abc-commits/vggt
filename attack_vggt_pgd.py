@@ -17,6 +17,7 @@ Example:
 """
 
 import argparse
+import csv
 import glob
 import gzip
 import json
@@ -811,6 +812,99 @@ def compare_predictions(
     return metrics
 
 
+def finite_float(value) -> float | None:
+    if isinstance(value, (int, float)) and np.isfinite(value):
+        return float(value)
+    return None
+
+
+def metric_delta(after: dict, before: dict, key: str, larger_is_worse: bool) -> float | None:
+    after_value = finite_float(after.get(key))
+    before_value = finite_float(before.get(key))
+    if after_value is None or before_value is None:
+        return None
+    delta = after_value - before_value if larger_is_worse else before_value - after_value
+    return float(delta)
+
+
+def scene_attack_row(summary: dict) -> dict[str, float | str | None]:
+    scene = Path(summary.get("scene", "")).name or str(summary.get("scene", ""))
+    metrics = summary.get("metrics", {})
+    clean_vs_gt = metrics.get("clean_vs_gt", {})
+    pgd_vs_gt = metrics.get("pgd_vs_gt", {})
+    clean_vs_pgd = metrics.get("clean_vs_pgd", {})
+
+    row: dict[str, float | str | None] = {
+        "scene": scene,
+        "attack_type": summary.get("attack_type"),
+        "steps": summary.get("steps"),
+        "eps": summary.get("eps"),
+        "linf": finite_float(clean_vs_pgd.get("linf")),
+        "pixel_mae": finite_float(clean_vs_pgd.get("pixel_mae")),
+        "clean_adv_depth_rel_rmse": finite_float(clean_vs_pgd.get("depth_rel_rmse")),
+        "clean_adv_points_rel_rmse": finite_float(clean_vs_pgd.get("points_rel_rmse")),
+        "clean_adv_pose_rel_rmse": finite_float(clean_vs_pgd.get("pose_rel_rmse")),
+        "clean_depth_overall": finite_float(clean_vs_gt.get("depth_overall")),
+        "pgd_depth_overall": finite_float(pgd_vs_gt.get("depth_overall")),
+        "depth_overall_delta": metric_delta(pgd_vs_gt, clean_vs_gt, "depth_overall", larger_is_worse=True),
+        "clean_point_overall": finite_float(clean_vs_gt.get("point_overall")),
+        "pgd_point_overall": finite_float(pgd_vs_gt.get("point_overall")),
+        "point_overall_delta": metric_delta(pgd_vs_gt, clean_vs_gt, "point_overall", larger_is_worse=True),
+        "clean_camera_auc30": finite_float(clean_vs_gt.get("camera_auc@30")),
+        "pgd_camera_auc30": finite_float(pgd_vs_gt.get("camera_auc@30")),
+        "camera_auc30_drop": metric_delta(pgd_vs_gt, clean_vs_gt, "camera_auc@30", larger_is_worse=False),
+    }
+    return row
+
+
+def normalized_attack_ranking(summaries: list[dict]) -> list[dict]:
+    rows = [scene_attack_row(summary) for summary in summaries]
+    score_weights = {
+        "clean_adv_depth_rel_rmse": 0.25,
+        "clean_adv_points_rel_rmse": 0.25,
+        "clean_adv_pose_rel_rmse": 0.15,
+        "depth_overall_delta": 0.15,
+        "point_overall_delta": 0.15,
+        "camera_auc30_drop": 0.05,
+    }
+
+    max_values: dict[str, float] = {}
+    for key in score_weights:
+        positives = [float(row[key]) for row in rows if finite_float(row.get(key)) is not None and float(row[key]) > 0]
+        max_values[key] = max(positives) if positives else 0.0
+
+    for row in rows:
+        weighted_sum = 0.0
+        used_weight = 0.0
+        for key, weight in score_weights.items():
+            value = finite_float(row.get(key))
+            max_value = max_values[key]
+            if value is None or max_value <= 0:
+                continue
+            weighted_sum += weight * max(0.0, value) / max_value
+            used_weight += weight
+        row["attack_score"] = float(weighted_sum / used_weight) if used_weight > 0 else 0.0
+
+    rows.sort(key=lambda item: float(item.get("attack_score") or 0.0), reverse=True)
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    return rows
+
+
+def write_attack_ranking(summaries: list[dict], output_dir: Path) -> list[dict]:
+    ranking = normalized_attack_ranking(summaries)
+    with open(output_dir / "pgd_attack_ranking.json", "w", encoding="utf-8") as f:
+        json.dump(ranking, f, indent=2)
+
+    if ranking:
+        fieldnames = list(ranking[0].keys())
+        with open(output_dir / "pgd_attack_ranking.csv", "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(ranking)
+    return ranking
+
+
 def save_adv_images(adv_images: torch.Tensor, image_paths: list[str], out_dir: Path) -> None:
     img_dir = out_dir / "adv_images"
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -984,6 +1078,14 @@ def process_scene(
         max_points=args.metric_max_points,
         device=device,
     )
+    clean_adv_metrics = compare_predictions(clean_preds, adv_preds, clean_images, adv_images)
+    clean_adv_records = paper_style_proxy_records(
+        clean_preds,
+        adv_preds,
+        image_size_hw,
+        max_points=args.metric_max_points,
+        device=device,
+    )
 
     print("\n[clean vs real GT]")
     for key, value in clean_gt_metrics.items():
@@ -998,6 +1100,10 @@ def process_scene(
             print(f"  {key}: {value:.6f}")
         else:
             print(f"  {key}: {value}")
+
+    print("\n[clean vs pgd]")
+    for key, value in clean_adv_metrics.items():
+        print(f"  {key}: {value:.6f}")
 
     clean_np = tensor_to_numpy(clean_preds, image_size_hw)
     adv_np = tensor_to_numpy(adv_preds, image_size_hw)
@@ -1024,10 +1130,12 @@ def process_scene(
         "metrics": {
             "clean_vs_gt": clean_gt_metrics,
             "pgd_vs_gt": adv_gt_metrics,
+            "clean_vs_pgd": clean_adv_metrics,
         },
         "eval_records": {
             "clean_vs_gt": clean_gt_records,
             "pgd_vs_gt": adv_gt_records,
+            "clean_vs_pgd": clean_adv_records,
         },
         "history": history,
         "image_paths": [str(p) for p in image_paths],
@@ -1119,6 +1227,7 @@ def aggregate_dataset_metrics(summaries: list[dict]) -> dict:
         },
         "clean_vs_gt": aggregate_eval_key(summaries, "clean_vs_gt"),
         "pgd_vs_gt": aggregate_eval_key(summaries, "pgd_vs_gt"),
+        "clean_vs_pgd": aggregate_eval_key(summaries, "clean_vs_pgd"),
     }
 
 
@@ -1152,6 +1261,7 @@ def main() -> None:
         dataset_metrics = aggregate_dataset_metrics([summary])
         with open(output_dir / "pgd_dataset_metrics.json", "w", encoding="utf-8") as f:
             json.dump(dataset_metrics, f, indent=2)
+        write_attack_ranking([summary], output_dir)
         return
 
     output_root = Path(args.output_dir)
@@ -1189,11 +1299,21 @@ def main() -> None:
     dataset_metrics = aggregate_dataset_metrics(summaries)
     with open(output_root / "pgd_dataset_metrics.json", "w", encoding="utf-8") as f:
         json.dump(dataset_metrics, f, indent=2)
+    ranking = write_attack_ranking(summaries, output_root)
     print("\n[dataset metrics: clean output as pseudo-GT]")
     for group, values in dataset_metrics.items():
         if group == "protocol":
             continue
         print(f"  {group}: {values}")
+    if ranking:
+        print("\n[attack ranking: largest clean-to-PGD output change]")
+        for row in ranking[:10]:
+            print(
+                f"  #{row['rank']} {row['scene']}: "
+                f"score={float(row['attack_score']):.4f} "
+                f"depth_rmse={row.get('clean_adv_depth_rel_rmse')} "
+                f"point_rmse={row.get('clean_adv_points_rel_rmse')}"
+            )
     print(f"\n[batch done] {len(summaries)}/{len(scene_dirs)} scenes attacked")
 
 
