@@ -1,15 +1,18 @@
 """
-PGD attack baseline for VGGT.
+PGD/patch attack baseline for VGGT with paper-aligned evaluation metrics.
 
-This script performs an untargeted PGD attack in pixel space. It can either use
-existing clean VGGT outputs as the fixed reference, or run one clean forward
-when no clean output file is provided.
+The attack is optimized against CO3D ground truth when --gt_root is supplied.
+Evaluation uses the metric definitions used in the VGGT paper:
+camera pose AUC over pairwise relative pose errors, Sim(3)-aligned Chamfer
+Accuracy/Completeness/Overall for depth-derived and point-map clouds, and an
+optional ALIKED-query two-view matching protocol for tracking.
 
 Example:
-    python attack_vggt_pgd.py ^
+    python attack_vggt_new1.py ^
         --scene_dir examples/kitchen ^
         --clean_npz clean_outputs/kitchen/vggt_outputs.npz ^
         --output_dir outputs_pgd/kitchen ^
+        --gt_root /path/to/co3d ^
         --max_frames 4 ^
         --steps 10 ^
         --eps 0.03137255 ^
@@ -24,7 +27,6 @@ import json
 import time
 from pathlib import Path
 
-import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -37,6 +39,23 @@ from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_e
 
 
 CO3D_TO_OPENCV = np.diag([-1.0, -1.0, 1.0]).astype(np.float32)
+
+try:
+    import cv2
+except ImportError as exc:
+    cv2 = None
+    CV2_IMPORT_ERROR = exc
+else:
+    CV2_IMPORT_ERROR = None
+
+
+def require_cv2():
+    if cv2 is None:
+        raise RuntimeError(
+            "OpenCV is required for CO3D depth/mask loading and Essential matrix matching. "
+            "Install opencv-python or run in an environment that provides cv2."
+        ) from CV2_IMPORT_ERROR
+    return cv2
 
 
 def find_images(scene_dir: Path) -> list[str]:
@@ -206,15 +225,29 @@ def co3d_ndc_intrinsics_to_pixels(viewpoint: dict, image_size_hw: tuple[int, int
 
 
 def co3d_viewpoint_to_opencv_extrinsic(viewpoint: dict) -> np.ndarray:
-    rotation = np.asarray(viewpoint["R"], dtype=np.float32)
-    translation = np.asarray(viewpoint["T"], dtype=np.float32)
-    rotation = CO3D_TO_OPENCV @ rotation
-    translation = CO3D_TO_OPENCV @ translation
-    return np.concatenate([rotation, translation[:, None]], axis=1).astype(np.float32)
+    """Convert CO3D (PyTorch3D convention) viewpoint to OpenCV-convention extrinsic.
+
+    PyTorch3D uses ROW-vector convention: X_cam = X_world @ R_pt3d + T_pt3d.
+    OpenCV uses COLUMN-vector convention: X_cam = R_opencv @ X_world + T_opencv.
+    So R_opencv (in orientation terms) is R_pt3d.T.
+    PyTorch3D camera frame is (-x, -y, +z), OpenCV is (+x, +y, +z), so we
+    additionally left-multiply by diag(-1, -1, 1) to flip the camera axes.
+    Reference: pytorch3d.utils.opencv_from_cameras_projection.
+    """
+    R_pt3d = np.asarray(viewpoint["R"], dtype=np.float32)
+    T_pt3d = np.asarray(viewpoint["T"], dtype=np.float32)
+    # Row-vector -> column-vector: transpose
+    R = R_pt3d.T
+    T = T_pt3d
+    # Flip camera-frame axes: PyTorch3D (-x, -y, +z) -> OpenCV (+x, +y, +z)
+    R = CO3D_TO_OPENCV @ R
+    T = CO3D_TO_OPENCV @ T
+    return np.concatenate([R, T[:, None]], axis=1).astype(np.float32)
 
 
 def read_co3d_depth(depth_path: Path, scale_adjustment: float | None) -> np.ndarray:
-    depth_raw = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+    cv = require_cv2()
+    depth_raw = cv.imread(str(depth_path), cv.IMREAD_UNCHANGED)
     if depth_raw is None:
         raise FileNotFoundError(f"Could not read depth map: {depth_path}")
     depth = depth_raw.astype(np.float32)
@@ -248,8 +281,9 @@ def preprocess_gt_like_vggt_input(
     new_h = round(orig_h * (new_w / orig_w) / 14) * 14
     scale = new_w / orig_w
 
-    depth = cv2.resize(depth, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-    mask = cv2.resize(mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST) > 0
+    cv = require_cv2()
+    depth = cv.resize(depth, (new_w, new_h), interpolation=cv.INTER_NEAREST)
+    mask = cv.resize(mask.astype(np.uint8), (new_w, new_h), interpolation=cv.INTER_NEAREST) > 0
 
     intrinsics = intrinsics.copy()
     intrinsics[:2, :] *= scale
@@ -309,7 +343,8 @@ def load_co3d_gt_reference(
         depth_path = resolve_co3d_asset(gt_root, category, depth_rel)
         mask_path = resolve_co3d_asset(gt_root, category, mask_rel)
         depth = read_co3d_depth(depth_path, anno["depth"].get("scale_adjustment"))
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        cv = require_cv2()
+        mask = cv.imread(str(mask_path), cv.IMREAD_GRAYSCALE)
         if mask is None:
             raise FileNotFoundError(f"Could not read depth mask: {mask_path}")
         mask = mask > 128
@@ -551,6 +586,31 @@ def relative_rmse(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-6) -> float:
     return float((((a - b.detach()) / denom).pow(2).mean().sqrt()).detach().cpu())
 
 
+def normalize_to_first_frame(extrinsic: torch.Tensor) -> torch.Tensor:
+    """Re-express extrinsics so that the first camera sits at the world origin.
+
+    extrinsic: [B, N, 3, 4] camera-from-world (OpenCV convention).
+    Returns same shape, with extrinsic_new[:, 0] = [I | 0] up to numerical noise.
+    This is gauge-fixing: pair-wise relative poses are gauge-invariant in theory
+    but doing this explicitly removes any global-frame mismatch between the
+    VGGT prediction (first-frame-as-origin) and CO3D GT (scene-centered).
+    """
+    R0 = extrinsic[..., 0, :3, :3]                              # [B, 3, 3]
+    t0 = extrinsic[..., 0, :3, 3]                               # [B, 3]
+    R = extrinsic[..., :3, :3]                                  # [B, N, 3, 3]
+    t = extrinsic[..., :3, 3]                                   # [B, N, 3]
+    # New world frame = old cam0 frame. The pose mapping old-world -> new-world
+    # is X_new = R0 @ X_old + t0. So the new extrinsic for cam i is:
+    #   R_new_i = R_i @ R0^T
+    #   t_new_i = t_i - R_i @ R0^T @ t0 = t_i - R_new_i @ t0
+    R_new = torch.matmul(R, R0.unsqueeze(-3).transpose(-1, -2))
+    t_new = t - torch.matmul(R_new, t0.unsqueeze(-3).unsqueeze(-1)).squeeze(-1)
+    out = extrinsic.clone()
+    out[..., :3, :3] = R_new
+    out[..., :3, 3] = t_new
+    return out
+
+
 def rotation_angle_deg(rel_a: torch.Tensor, rel_b: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     rel = torch.matmul(rel_a.transpose(-1, -2), rel_b)
     trace = rel.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
@@ -558,7 +618,12 @@ def rotation_angle_deg(rel_a: torch.Tensor, rel_b: torch.Tensor, eps: float = 1e
     return torch.rad2deg(torch.acos(cos))
 
 
-def translation_angle_deg_and_valid(t_a: torch.Tensor, t_b: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:
+def translation_angle_deg_and_valid(
+    t_a: torch.Tensor,
+    t_b: torch.Tensor,
+    eps: float = 1e-6,
+    ambiguity: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
     norm_a = t_a.norm(dim=-1)
     norm_b = t_b.norm(dim=-1)
     valid = (norm_a > eps) & (norm_b > eps)
@@ -566,10 +631,18 @@ def translation_angle_deg_and_valid(t_a: torch.Tensor, t_b: torch.Tensor, eps: f
     cos[valid] = (t_a[valid] * t_b[valid]).sum(dim=-1) / (norm_a[valid] * norm_b[valid])
     cos = cos.clamp(-1.0 + eps, 1.0 - eps)
     angle = torch.rad2deg(torch.acos(cos))
+    if ambiguity:
+        angle = torch.minimum(angle, (180.0 - angle).abs())
     return angle, valid
 
 
 def camera_auc_from_max_errors(r_errors: np.ndarray, t_errors: np.ndarray, threshold: int) -> float:
+    """Compute AUC@threshold over max(rotation_error, translation_error) in degrees.
+
+    Follows the standard PoseDiffusion / VGGSfM / VGGT-style definition:
+    integrate the CDF of max-pair-errors over [0, threshold] degrees, then
+    normalize by threshold so the score lies in [0, 1].
+    """
     if r_errors.size == 0 or t_errors.size == 0:
         return float("nan")
     error_matrix = np.concatenate((r_errors[:, None], t_errors[:, None]), axis=1)
@@ -577,7 +650,31 @@ def camera_auc_from_max_errors(r_errors: np.ndarray, t_errors: np.ndarray, thres
     bins = np.arange(threshold + 1)
     histogram, _ = np.histogram(max_errors, bins=bins)
     normalized_histogram = histogram.astype(float) / float(len(max_errors))
+    # Cumulative-sum gives the empirical CDF evaluated at each integer degree;
+    # mean of CDF over [0, threshold) = (1/threshold) * sum_{t=1..threshold} F(t).
     return float(np.mean(np.cumsum(normalized_histogram)))
+
+
+def pose_metrics_from_pair_errors(
+    records: dict[str, list[float]],
+    thresholds: tuple[int, ...],
+    prefix: str,
+) -> dict[str, float]:
+    r_err_np = np.asarray(records.get("rotation_deg", []), dtype=np.float64)
+    t_err_np = np.asarray(records.get("translation_deg", []), dtype=np.float64)
+    if r_err_np.size == 0 or t_err_np.size == 0:
+        return {}
+
+    r_err = torch.from_numpy(r_err_np)
+    t_err = torch.from_numpy(t_err_np)
+    metrics = {
+        f"{prefix}_pair_count": float(len(r_err_np)),
+    }
+    for threshold in thresholds:
+        metrics[f"{prefix}_rra@{threshold}"] = float((r_err < threshold).float().mean().detach().cpu())
+        metrics[f"{prefix}_rta@{threshold}"] = float((t_err < threshold).float().mean().detach().cpu())
+        metrics[f"{prefix}_auc@{threshold}"] = camera_auc_from_max_errors(r_err_np, t_err_np, threshold)
+    return metrics
 
 
 def camera_pair_error_records(
@@ -592,6 +689,11 @@ def camera_pair_error_records(
     adv_extri, _ = pose_encoding_to_extri_intri(adv["pose_enc"], image_size_hw)
     clean_extri = clean_extri.detach().float()
     adv_extri = adv_extri.detach().float()
+
+    # Gauge-fix: both prediction and GT are expressed relative to their own
+    # first-frame, so global-frame mismatch cannot leak into pair errors.
+    clean_extri = normalize_to_first_frame(clean_extri)
+    adv_extri = normalize_to_first_frame(adv_extri)
 
     rotations_clean: list[torch.Tensor] = []
     rotations_adv: list[torch.Tensor] = []
@@ -636,24 +738,10 @@ def camera_pair_error_records(
 
 
 def camera_metrics_from_pair_errors(records: dict[str, list[float]], thresholds: tuple[int, ...] = (5, 10, 20, 30)) -> dict[str, float]:
-    r_err_np = np.asarray(records.get("rotation_deg", []), dtype=np.float64)
-    t_err_np = np.asarray(records.get("translation_deg", []), dtype=np.float64)
-    if r_err_np.size == 0 or t_err_np.size == 0:
-        return {}
-
-    r_err = torch.from_numpy(r_err_np)
-    t_err = torch.from_numpy(t_err_np)
-    metrics = {
-        "camera_pair_count": float(len(r_err_np)),
-    }
-    for threshold in thresholds:
-        metrics[f"camera_rra@{threshold}"] = float((r_err < threshold).float().mean().detach().cpu())
-        metrics[f"camera_rta@{threshold}"] = float((t_err < threshold).float().mean().detach().cpu())
-        metrics[f"camera_auc@{threshold}"] = camera_auc_from_max_errors(r_err_np, t_err_np, threshold)
-    return metrics
+    return pose_metrics_from_pair_errors(records, thresholds=thresholds, prefix="camera")
 
 
-def camera_paper_proxy_metrics(clean: dict[str, torch.Tensor], adv: dict[str, torch.Tensor], image_size_hw: tuple[int, int]) -> dict[str, float]:
+def camera_paper_metrics(clean: dict[str, torch.Tensor], adv: dict[str, torch.Tensor], image_size_hw: tuple[int, int]) -> dict[str, float]:
     return camera_metrics_from_pair_errors(camera_pair_error_records(clean, adv, image_size_hw))
 
 
@@ -669,6 +757,61 @@ def sample_point_cloud(points: np.ndarray, max_points: int, mask: np.ndarray | N
         idx = np.linspace(0, len(points) - 1, max_points, dtype=np.int64)
         points = points[idx]
     return points
+
+
+def umeyama_sim3(src: np.ndarray, dst: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """Closed-form Sim(3) alignment: find s, R, t minimizing ||s * R @ src_i + t - dst_i||^2.
+
+    src, dst: [N, 3] paired point arrays. Returns (scale, R(3x3), t(3,)).
+    Reference: Umeyama 1991.
+    """
+    assert src.shape == dst.shape and src.shape[1] == 3
+    n = src.shape[0]
+    mu_src = src.mean(axis=0)
+    mu_dst = dst.mean(axis=0)
+    src_c = src - mu_src
+    dst_c = dst - mu_dst
+    cov = (dst_c.T @ src_c) / n
+    U, D, Vt = np.linalg.svd(cov)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1.0
+    R = U @ S @ Vt
+    var_src = (src_c ** 2).sum() / n
+    scale = float(np.trace(np.diag(D) @ S) / max(var_src, 1e-12))
+    t = mu_dst - scale * R @ mu_src
+    return scale, R.astype(np.float32), t.astype(np.float32)
+
+
+def estimate_sim3_from_paired_pointmaps(
+    src_pointmap: np.ndarray,
+    dst_pointmap: np.ndarray,
+    mask: np.ndarray | None = None,
+    max_samples: int = 20000,
+) -> tuple[float, np.ndarray, np.ndarray] | None:
+    """Estimate Sim(3) from two pixel-aligned pointmaps (same H, W).
+
+    src_pointmap, dst_pointmap: [N, H, W, 3] OR flattened [K, 3] with point-to-point
+    correspondence (i-th pred point corresponds to i-th GT point).
+    mask: optional boolean mask of valid GT points, same leading shape.
+    """
+    src = src_pointmap.reshape(-1, 3).astype(np.float32)
+    dst = dst_pointmap.reshape(-1, 3).astype(np.float32)
+    if mask is not None:
+        m = mask.reshape(-1).astype(bool)
+        src = src[m]
+        dst = dst[m]
+    # Drop non-finite entries
+    finite = np.isfinite(src).all(axis=1) & np.isfinite(dst).all(axis=1)
+    src = src[finite]
+    dst = dst[finite]
+    if len(src) < 8:
+        return None
+    if len(src) > max_samples:
+        idx = np.linspace(0, len(src) - 1, max_samples, dtype=np.int64)
+        src = src[idx]
+        dst = dst[idx]
+    return umeyama_sim3(src, dst)
 
 
 def nearest_distances(src: torch.Tensor, dst: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
@@ -687,11 +830,23 @@ def chamfer_metrics(
     device: torch.device,
     reference_mask: np.ndarray | None = None,
     pred_mask: np.ndarray | None = None,
+    sim3: tuple[float, np.ndarray, np.ndarray] | None = None,
 ) -> dict[str, float]:
+    """Bidirectional Chamfer between two point clouds.
+
+    If `sim3 = (s, R, t)` is given, the pred cloud is first aligned to the
+    reference frame via `pred -> s * R @ pred + t` before computing distances.
+    This is the standard protocol for evaluating up-to-scale predictions
+    (DUSt3R / MASt3R / VGGT report numbers under this alignment).
+    """
     reference_points = sample_point_cloud(reference_points, max_points, reference_mask)
     pred_points = sample_point_cloud(pred_points, max_points, pred_mask)
     if len(reference_points) == 0 or len(pred_points) == 0:
         return {}
+
+    if sim3 is not None:
+        s, R, t = sim3
+        pred_points = (s * (R @ pred_points.T).T + t).astype(np.float32)
 
     reference_t = torch.from_numpy(reference_points).to(device)
     pred_t = torch.from_numpy(pred_points).to(device)
@@ -705,7 +860,7 @@ def chamfer_metrics(
     }
 
 
-def paper_style_proxy_metrics(
+def vggt_paper_metrics(
     reference: dict[str, torch.Tensor],
     pred: dict[str, torch.Tensor],
     image_size_hw: tuple[int, int],
@@ -713,7 +868,7 @@ def paper_style_proxy_metrics(
     device: torch.device,
 ) -> dict[str, float | str]:
     metrics: dict[str, float | str] = {}
-    metrics.update(camera_paper_proxy_metrics(reference, pred, image_size_hw))
+    metrics.update(camera_paper_metrics(reference, pred, image_size_hw))
 
     reference_np = tensor_to_numpy(reference, image_size_hw)
     pred_np = tensor_to_numpy(pred, image_size_hw)
@@ -721,6 +876,9 @@ def paper_style_proxy_metrics(
     if "point_mask" in reference:
         reference_mask = reference["point_mask"].detach().cpu().numpy()[0].astype(bool)
 
+    # VGGT reports up-to-scale geometry. For each geometry branch we align
+    # prediction to ground truth with pixel-aligned Umeyama Sim(3), then report
+    # Chamfer Accuracy/Completeness/Overall as in the DTU/ETH3D protocol.
     if all(k in reference_np for k in ("depth", "extrinsic", "intrinsic")) and all(
         k in pred_np for k in ("depth", "extrinsic", "intrinsic")
     ):
@@ -730,6 +888,14 @@ def paper_style_proxy_metrics(
         pred_depth_points = unproject_depth_map_to_point_map(
             pred_np["depth"][0], pred_np["extrinsic"][0], pred_np["intrinsic"][0]
         )
+        sim3 = estimate_sim3_from_paired_pointmaps(
+            src_pointmap=pred_depth_points,
+            dst_pointmap=reference_depth_points,
+            mask=reference_mask,
+            max_samples=max_points,
+        )
+        if sim3 is not None:
+            metrics["depth_sim3_scale"] = float(sim3[0])
         metrics.update(
             chamfer_metrics(
                 reference_depth_points,
@@ -738,10 +904,20 @@ def paper_style_proxy_metrics(
                 max_points,
                 device,
                 reference_mask=reference_mask,
+                pred_mask=reference_mask,
+                sim3=sim3,
             )
         )
 
     if "world_points" in reference_np and "world_points" in pred_np:
+        wp_sim3 = estimate_sim3_from_paired_pointmaps(
+            src_pointmap=pred_np["world_points"][0],
+            dst_pointmap=reference_np["world_points"][0],
+            mask=reference_mask,
+            max_samples=max_points,
+        )
+        if wp_sim3 is not None:
+            metrics["point_sim3_scale"] = float(wp_sim3[0])
         metrics.update(
             chamfer_metrics(
                 reference_np["world_points"][0],
@@ -750,21 +926,23 @@ def paper_style_proxy_metrics(
                 max_points,
                 device,
                 reference_mask=reference_mask,
+                pred_mask=reference_mask,
+                sim3=wp_sim3,
             )
         )
 
-    metrics["tracking_image_matching"] = "not_computed_requires_two_view_matching_protocol"
+    metrics["tracking_image_matching"] = "not_computed"
     return metrics
 
 
-def paper_style_proxy_records(
+def vggt_paper_records(
     reference: dict[str, torch.Tensor],
     pred: dict[str, torch.Tensor],
     image_size_hw: tuple[int, int],
     max_points: int,
     device: torch.device,
 ) -> dict:
-    metrics = paper_style_proxy_metrics(reference, pred, image_size_hw, max_points, device)
+    metrics = vggt_paper_metrics(reference, pred, image_size_hw, max_points, device)
     return {
         "camera_pair_errors": camera_pair_error_records(reference, pred, image_size_hw),
         "depth_scene_metrics": {
@@ -780,9 +958,242 @@ def paper_style_proxy_records(
         "tracking_image_matching_pair_errors": {
             "rotation_deg": [],
             "translation_deg": [],
-            "status": "not_computed_requires_two_view_matching_protocol",
+            "status": "not_computed",
         },
     }
+
+
+def relative_pose_from_extrinsics_np(extri_i: np.ndarray, extri_j: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return camera-j-from-camera-i relative pose from world-to-camera extrinsics."""
+    r_i = extri_i[:3, :3]
+    t_i = extri_i[:3, 3]
+    r_j = extri_j[:3, :3]
+    t_j = extri_j[:3, 3]
+    r_rel = r_j @ r_i.T
+    t_rel = t_j - r_rel @ t_i
+    return r_rel.astype(np.float64), t_rel.astype(np.float64)
+
+
+def rotation_error_deg_np(r_gt: np.ndarray, r_pred: np.ndarray, eps: float = 1e-7) -> float:
+    rel = r_gt.T @ r_pred
+    cos = np.clip((np.trace(rel) - 1.0) * 0.5, -1.0 + eps, 1.0 - eps)
+    return float(np.degrees(np.arccos(cos)))
+
+
+def translation_error_deg_np(
+    t_gt: np.ndarray,
+    t_pred: np.ndarray,
+    eps: float = 1e-12,
+    ambiguity: bool = True,
+) -> float | None:
+    norm_gt = float(np.linalg.norm(t_gt))
+    norm_pred = float(np.linalg.norm(t_pred))
+    if norm_gt <= eps or norm_pred <= eps:
+        return None
+    cos = float(np.dot(t_gt, t_pred) / (norm_gt * norm_pred))
+    angle = float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+    if ambiguity:
+        angle = min(angle, abs(180.0 - angle))
+    return angle
+
+
+def normalized_image_points(points: np.ndarray, intrinsic: np.ndarray) -> np.ndarray:
+    points = points.astype(np.float64).reshape(-1, 1, 2)
+    intrinsic = intrinsic.astype(np.float64)
+    cv = require_cv2()
+    return cv.undistortPoints(points, intrinsic, None).reshape(-1, 2)
+
+
+def estimate_relative_pose_from_tracks(
+    points_i: np.ndarray,
+    points_j: np.ndarray,
+    intrinsic_i: np.ndarray,
+    intrinsic_j: np.ndarray,
+    ransac_thresh: float,
+    min_inliers: int,
+) -> tuple[np.ndarray, np.ndarray, int] | None:
+    if len(points_i) < max(8, min_inliers) or len(points_j) < max(8, min_inliers):
+        return None
+
+    pts_i = normalized_image_points(points_i, intrinsic_i)
+    pts_j = normalized_image_points(points_j, intrinsic_j)
+    cv = require_cv2()
+    essential, inlier_mask = cv.findEssentialMat(
+        pts_i,
+        pts_j,
+        cameraMatrix=np.eye(3, dtype=np.float64),
+        method=cv.RANSAC,
+        prob=0.999,
+        threshold=ransac_thresh,
+    )
+    if essential is None or inlier_mask is None:
+        return None
+
+    best: tuple[np.ndarray, np.ndarray, int] | None = None
+    essential = essential.reshape(-1, 3, 3)
+    for e_mat in essential:
+        inliers, r_pred, t_pred, _ = cv.recoverPose(
+            e_mat,
+            pts_i,
+            pts_j,
+            cameraMatrix=np.eye(3, dtype=np.float64),
+            mask=inlier_mask,
+        )
+        if inliers < min_inliers:
+            continue
+        if best is None or inliers > best[2]:
+            best = (r_pred.astype(np.float64), t_pred.reshape(3).astype(np.float64), int(inliers))
+    return best
+
+
+def build_aliked_extractor(
+    max_keypoints: int,
+    detection_threshold: float,
+    device: torch.device,
+):
+    try:
+        from lightglue import ALIKED
+    except Exception as exc:
+        return None, f"skipped_missing_lightglue_aliked: {exc}"
+
+    extractor = ALIKED(max_num_keypoints=max_keypoints, detection_threshold=detection_threshold).to(device).eval()
+    return extractor, None
+
+
+def extract_aliked_keypoints(image: torch.Tensor, extractor) -> tuple[torch.Tensor | None, str | None]:
+    with torch.no_grad():
+        data = extractor.extract(image, invalid_mask=None)
+    keypoints = data.get("keypoints")
+    if keypoints is None or keypoints.shape[1] == 0:
+        return None, "skipped_no_aliked_keypoints"
+    return keypoints.float(), None
+
+
+def build_pair_indices(num_frames: int, max_pairs: int) -> list[tuple[int, int]]:
+    pairs = [(i, j) for i in range(num_frames) for j in range(i + 1, num_frames)]
+    if max_pairs > 0 and len(pairs) > max_pairs:
+        selected = np.linspace(0, len(pairs) - 1, max_pairs, dtype=int)
+        pairs = [pairs[int(idx)] for idx in selected]
+    return pairs
+
+
+def tracking_image_matching_records(
+    model: VGGT,
+    images: torch.Tensor,
+    reference: dict[str, torch.Tensor],
+    dtype: torch.dtype,
+    max_keypoints: int,
+    detection_threshold: float,
+    ransac_thresh: float,
+    min_inliers: int,
+    min_visibility: float,
+    min_confidence: float,
+    max_pairs: int,
+) -> dict[str, list[float] | str | int]:
+    """VGGT paper-style image matching: ALIKED queries -> VGGT tracks -> Essential matrix."""
+    if "extrinsic" not in reference or "intrinsic" not in reference:
+        return {"rotation_deg": [], "translation_deg": [], "status": "skipped_missing_gt_cameras"}
+
+    num_frames = images.shape[0]
+    pairs = build_pair_indices(num_frames, max_pairs)
+    if not pairs:
+        return {"rotation_deg": [], "translation_deg": [], "status": "skipped_not_enough_frames"}
+
+    records: dict[str, list[float] | str | int] = {
+        "rotation_deg": [],
+        "translation_deg": [],
+        "status": "computed",
+        "attempted_pairs": len(pairs),
+        "valid_pairs": 0,
+    }
+
+    extrinsics = reference["extrinsic"][0].detach().float().cpu().numpy()
+    intrinsics = reference["intrinsic"][0].detach().float().cpu().numpy()
+    height, width = images.shape[-2:]
+    extractor, extractor_error = build_aliked_extractor(max_keypoints, detection_threshold, images.device)
+    if extractor is None:
+        return {"rotation_deg": [], "translation_deg": [], "status": extractor_error or "skipped_no_aliked"}
+
+    for pair_idx, (i, j) in enumerate(pairs):
+        query_points, skip_reason = extract_aliked_keypoints(images[i], extractor)
+        if query_points is None:
+            records["status"] = skip_reason or "skipped_keypoint_failure"
+            break
+
+        image_pair = torch.stack([images[i], images[j]], dim=0)
+        with torch.no_grad():
+            preds = forward_vggt(model, image_pair, dtype, query_points=query_points)
+        if "track" not in preds:
+            records["status"] = "skipped_missing_track_head"
+            break
+
+        tracks = preds["track"][0].detach().float()
+        src = tracks[0]
+        dst = tracks[1]
+        finite = torch.isfinite(src).all(dim=-1) & torch.isfinite(dst).all(dim=-1)
+        in_bounds = (
+            (src[:, 0] >= 0)
+            & (src[:, 0] < width)
+            & (src[:, 1] >= 0)
+            & (src[:, 1] < height)
+            & (dst[:, 0] >= 0)
+            & (dst[:, 0] < width)
+            & (dst[:, 1] >= 0)
+            & (dst[:, 1] < height)
+        )
+        valid = finite & in_bounds
+        if "vis" in preds:
+            valid = valid & (preds["vis"][0, 1].detach().float() >= min_visibility)
+        if "conf" in preds:
+            valid = valid & (preds["conf"][0, 1].detach().float() >= min_confidence)
+
+        if int(valid.sum().item()) < max(8, min_inliers):
+            continue
+
+        src_np = src[valid].detach().cpu().numpy().astype(np.float64)
+        dst_np = dst[valid].detach().cpu().numpy().astype(np.float64)
+        pose = estimate_relative_pose_from_tracks(
+            src_np,
+            dst_np,
+            intrinsics[i],
+            intrinsics[j],
+            ransac_thresh=ransac_thresh,
+            min_inliers=min_inliers,
+        )
+        if pose is None:
+            continue
+
+        r_pred, t_pred, _ = pose
+        r_gt, t_gt = relative_pose_from_extrinsics_np(extrinsics[i], extrinsics[j])
+        t_err = translation_error_deg_np(t_gt, t_pred, ambiguity=True)
+        if t_err is None:
+            continue
+
+        records["rotation_deg"].append(rotation_error_deg_np(r_gt, r_pred))
+        records["translation_deg"].append(t_err)
+        records["valid_pairs"] = int(records["valid_pairs"]) + 1
+        print(
+            f"[matching] pair {pair_idx + 1:03d}/{len(pairs):03d} "
+            f"frames=({i},{j}) R={records['rotation_deg'][-1]:.3f} T={t_err:.3f}"
+        )
+
+    if not records["rotation_deg"]:
+        records["status"] = str(records["status"]) if records["status"] != "computed" else "skipped_no_valid_pairs"
+    return records
+
+
+def add_tracking_matching_metrics(metrics: dict, records: dict[str, list[float] | str | int]) -> None:
+    if records.get("rotation_deg") and records.get("translation_deg"):
+        metrics["tracking_image_matching"] = "computed"
+        metrics.update(
+            pose_metrics_from_pair_errors(
+                records,  # type: ignore[arg-type]
+                thresholds=(5, 10, 20),
+                prefix="tracking",
+            )
+        )
+    else:
+        metrics["tracking_image_matching"] = records.get("status", "not_computed")
 
 
 def compare_predictions(
@@ -853,6 +1264,9 @@ def scene_attack_row(summary: dict) -> dict[str, float | str | None]:
         "clean_camera_auc30": finite_float(clean_vs_gt.get("camera_auc@30")),
         "pgd_camera_auc30": finite_float(pgd_vs_gt.get("camera_auc@30")),
         "camera_auc30_drop": metric_delta(pgd_vs_gt, clean_vs_gt, "camera_auc@30", larger_is_worse=False),
+        "clean_tracking_auc20": finite_float(clean_vs_gt.get("tracking_auc@20")),
+        "pgd_tracking_auc20": finite_float(pgd_vs_gt.get("tracking_auc@20")),
+        "tracking_auc20_drop": metric_delta(pgd_vs_gt, clean_vs_gt, "tracking_auc@20", larger_is_worse=False),
     }
     return row
 
@@ -972,13 +1386,41 @@ def parse_args() -> argparse.Namespace:
         "--metric_max_points",
         type=int,
         default=20000,
-        help="Maximum sampled points per cloud for paper-style clean-vs-adv proxy Chamfer metrics.",
+        help="Maximum sampled points per cloud for Sim(3)-aligned Chamfer metrics.",
+    )
+    parser.add_argument(
+        "--skip_matching_eval",
+        action="store_true",
+        help="Skip the ALIKED-query two-view matching evaluation for the tracking head.",
+    )
+    parser.add_argument("--matching_max_keypoints", type=int, default=2048, help="ALIKED keypoints per query image.")
+    parser.add_argument("--matching_det_thresh", type=float, default=0.005, help="ALIKED detection threshold.")
+    parser.add_argument(
+        "--matching_ransac_thresh",
+        type=float,
+        default=1e-3,
+        help="RANSAC threshold in normalized camera coordinates for Essential matrix fitting.",
+    )
+    parser.add_argument("--matching_min_inliers", type=int, default=15, help="Minimum recoverPose inliers per pair.")
+    parser.add_argument("--matching_min_vis", type=float, default=0.5, help="Minimum VGGT visibility score.")
+    parser.add_argument("--matching_min_conf", type=float, default=0.0, help="Minimum VGGT tracking confidence score.")
+    parser.add_argument(
+        "--matching_max_pairs",
+        type=int,
+        default=0,
+        help="Maximum frame pairs for matching evaluation; 0 evaluates all pairs.",
     )
     parser.add_argument("--save_adv_images", action="store_true", help="Save adversarial input frames.")
     parser.add_argument(
         "--run_clean_forward",
         action="store_true",
         help="Ignore --clean_npz and run a clean VGGT forward as the reference.",
+    )
+    parser.add_argument(
+        "--eval_only_clean",
+        action="store_true",
+        help="Skip the attack and adversarial forward; only evaluate clean predictions against GT. "
+             "Useful for sanity-checking the evaluation pipeline.",
     )
     return parser.parse_args()
 
@@ -1020,7 +1462,14 @@ def process_scene(
     }
     patch_tensor = None
     patch_meta = None
-    if args.attack_type == "patch":
+    history: list[dict[str, float]] = []
+    if args.eval_only_clean:
+        # Skip the attack entirely; reuse clean images/predictions in place of adv ones
+        # so that downstream eval/save logic stays identical.
+        adv_images = clean_images.detach().clone()
+        adv_preds = {k: v.detach().clone() for k, v in clean_preds.items()}
+        print("[eval_only_clean] skipping attack; adv_* = clean_*")
+    elif args.attack_type == "patch":
         adv_images, history, patch_tensor, patch_meta = patch_attack(
             model=model,
             images=clean_images,
@@ -1046,32 +1495,33 @@ def process_scene(
             weights=weights,
         )
 
-    track_query = clean_preds["track"][:, 0] if "track" in clean_preds else None
-    with torch.no_grad():
-        adv_preds_full = forward_vggt(model, adv_images, dtype, query_points=track_query)
-    adv_preds = detach_predictions(adv_preds_full)
-    clean_gt_metrics = paper_style_proxy_metrics(
+    if not args.eval_only_clean:
+        track_query = clean_preds["track"][:, 0] if "track" in clean_preds else None
+        with torch.no_grad():
+            adv_preds_full = forward_vggt(model, adv_images, dtype, query_points=track_query)
+        adv_preds = detach_predictions(adv_preds_full)
+    clean_gt_metrics = vggt_paper_metrics(
         gt_refs,
         clean_preds,
         image_size_hw,
         max_points=args.metric_max_points,
         device=device,
     )
-    adv_gt_metrics = paper_style_proxy_metrics(
+    adv_gt_metrics = vggt_paper_metrics(
         gt_refs,
         adv_preds,
         image_size_hw,
         max_points=args.metric_max_points,
         device=device,
     )
-    clean_gt_records = paper_style_proxy_records(
+    clean_gt_records = vggt_paper_records(
         gt_refs,
         clean_preds,
         image_size_hw,
         max_points=args.metric_max_points,
         device=device,
     )
-    adv_gt_records = paper_style_proxy_records(
+    adv_gt_records = vggt_paper_records(
         gt_refs,
         adv_preds,
         image_size_hw,
@@ -1079,13 +1529,53 @@ def process_scene(
         device=device,
     )
     clean_adv_metrics = compare_predictions(clean_preds, adv_preds, clean_images, adv_images)
-    clean_adv_records = paper_style_proxy_records(
+    clean_adv_records = vggt_paper_records(
         clean_preds,
         adv_preds,
         image_size_hw,
         max_points=args.metric_max_points,
         device=device,
     )
+
+    if args.skip_matching_eval:
+        clean_gt_records["tracking_image_matching_pair_errors"]["status"] = "skipped_by_user"
+        adv_gt_records["tracking_image_matching_pair_errors"]["status"] = "skipped_by_user"
+        clean_gt_metrics["tracking_image_matching"] = "skipped_by_user"
+        adv_gt_metrics["tracking_image_matching"] = "skipped_by_user"
+    else:
+        print("\n[tracking/image matching: clean vs real GT]")
+        clean_matching_records = tracking_image_matching_records(
+            model=model,
+            images=clean_images,
+            reference=gt_refs,
+            dtype=dtype,
+            max_keypoints=args.matching_max_keypoints,
+            detection_threshold=args.matching_det_thresh,
+            ransac_thresh=args.matching_ransac_thresh,
+            min_inliers=args.matching_min_inliers,
+            min_visibility=args.matching_min_vis,
+            min_confidence=args.matching_min_conf,
+            max_pairs=args.matching_max_pairs,
+        )
+        clean_gt_records["tracking_image_matching_pair_errors"] = clean_matching_records
+        add_tracking_matching_metrics(clean_gt_metrics, clean_matching_records)
+
+        print("\n[tracking/image matching: pgd vs real GT]")
+        adv_matching_records = tracking_image_matching_records(
+            model=model,
+            images=adv_images,
+            reference=gt_refs,
+            dtype=dtype,
+            max_keypoints=args.matching_max_keypoints,
+            detection_threshold=args.matching_det_thresh,
+            ransac_thresh=args.matching_ransac_thresh,
+            min_inliers=args.matching_min_inliers,
+            min_visibility=args.matching_min_vis,
+            min_confidence=args.matching_min_conf,
+            max_pairs=args.matching_max_pairs,
+        )
+        adv_gt_records["tracking_image_matching_pair_errors"] = adv_matching_records
+        add_tracking_matching_metrics(adv_gt_metrics, adv_matching_records)
 
     print("\n[clean vs real GT]")
     for key, value in clean_gt_metrics.items():
@@ -1203,13 +1693,14 @@ def aggregate_eval_key(summaries: list[dict], eval_key: str) -> dict:
             metrics["point"][name] = value
 
     if matching_r_errors and matching_t_errors:
-        metrics["tracking_image_matching"] = camera_metrics_from_pair_errors(
+        metrics["tracking_image_matching"] = pose_metrics_from_pair_errors(
             {"rotation_deg": matching_r_errors, "translation_deg": matching_t_errors},
             thresholds=(5, 10, 20),
+            prefix="tracking",
         )
     else:
         metrics["tracking_image_matching"] = {
-            "status": "not_computed_requires_two_view_matching_protocol",
+            "status": "not_computed_or_no_valid_pairs",
         }
 
     return metrics
@@ -1221,9 +1712,10 @@ def aggregate_dataset_metrics(summaries: list[dict]) -> dict:
             "reference": "real_co3d_gt",
             "attack_loss": "maximize prediction error against real CO3D GT",
             "camera": "VGGT official evaluation branch style: AUC over per-pair max(rotation_error, translation_error)",
-            "depth": "scene mean of prediction-vs-GT Accuracy/Completeness/Overall",
-            "point": "scene mean of prediction-vs-GT Accuracy/Completeness/Overall",
-            "tracking_image_matching": "not computed yet; requires two-view matching protocol",
+            "depth": "VGGT paper metric definition: Sim(3)-aligned depth+camera point cloud Accuracy/Completeness/Overall",
+            "point": "VGGT paper metric definition: independently Sim(3)-aligned point-map Accuracy/Completeness/Overall",
+            "tracking_image_matching": "VGGT paper metric definition: ALIKED query points -> VGGT tracks -> Essential matrix pose AUC@5/10/20",
+            "dataset_note": "This script loads CO3D GT; use DTU/ETH3D/ScanNet loaders for exact paper dataset splits.",
         },
         "clean_vs_gt": aggregate_eval_key(summaries, "clean_vs_gt"),
         "pgd_vs_gt": aggregate_eval_key(summaries, "pgd_vs_gt"),
