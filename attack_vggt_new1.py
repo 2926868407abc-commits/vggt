@@ -3,9 +3,10 @@ PGD/patch attack baseline for VGGT with paper-aligned evaluation metrics.
 
 The attack is optimized against CO3D ground truth when --gt_root is supplied.
 Evaluation uses the metric definitions used in the VGGT paper:
-camera pose AUC over pairwise relative pose errors, Sim(3)-aligned Chamfer
-Accuracy/Completeness/Overall for depth-derived and point-map clouds, and an
-optional ALIKED-query two-view matching protocol for tracking.
+camera pose AUC over pairwise relative pose errors, no-scale-alignment and
+Sim(3)-aligned Chamfer Accuracy/Completeness/Overall for depth-derived clouds,
+Sim(3)-aligned point-map Chamfer, and an optional ALIKED-query two-view
+matching protocol for tracking.
 
 Example:
     python attack_vggt_new1.py ^
@@ -13,7 +14,7 @@ Example:
         --clean_npz clean_outputs/kitchen/vggt_outputs.npz ^
         --output_dir outputs_pgd/kitchen ^
         --gt_root /path/to/co3d ^
-        --max_frames 4 ^
+        --max_frames 10 ^
         --steps 10 ^
         --eps 0.03137255 ^
         --alpha 0.00392157
@@ -23,6 +24,7 @@ import argparse
 import csv
 import glob
 import gzip
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -39,6 +41,32 @@ from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_e
 
 
 CO3D_TO_OPENCV = np.diag([-1.0, -1.0, 1.0]).astype(np.float32)
+EVALUATION_PROTOCOL = {
+    "reference": "real_co3d_gt",
+    "attack_loss": "maximize prediction error against real CO3D GT",
+    "camera": (
+        "Paper Table 1 (CO3D/RE10K) protocol: AUC over pairwise relative pose errors, "
+        "implemented as AUC over max(rotation_error, translation_error)."
+    ),
+    "depth": "Reports both depth_align_none_* and depth_align_sim3_* for the depth+camera unprojected cloud.",
+    "depth_align_none": (
+        "Paper Table 2 (DTU) metric definition: depth+camera unproject + Chamfer, no Sim(3). "
+        "When run on CO3D, absolute values are scale-mismatched proxy values; use relative "
+        "clean-vs-adversarial changes."
+    ),
+    "depth_align_sim3": (
+        "Paper Table 3 (ETH3D), Ours(Depth+Cam): depth+camera unproject + Umeyama Sim(3) "
+        "alignment + Chamfer."
+    ),
+    "point": (
+        "Paper Table 3 (ETH3D), Ours(Point): point-head output + Umeyama Sim(3) alignment + Chamfer."
+    ),
+    "tracking_image_matching": (
+        "Paper Table 4 (ScanNet-1500) protocol: ALIKED query points -> VGGT tracks -> "
+        "Essential matrix -> pose AUC@5/10/20."
+    ),
+    "dataset_note": "This script loads CO3D GT; use DTU/ETH3D/ScanNet loaders for exact paper dataset splits.",
+}
 
 try:
     import cv2
@@ -69,21 +97,35 @@ def find_images(scene_dir: Path) -> list[str]:
     return sorted(paths)
 
 
-def subsample(paths: list[str], max_frames: int) -> list[str]:
-    if max_frames <= 0 or len(paths) <= max_frames:
-        return paths
-    return [paths[i] for i in subsample_indices(len(paths), max_frames)]
+def derive_scene_seed(seed: int, scene_name: str) -> int:
+    scene_hash = hashlib.sha256(scene_name.encode("utf-8")).digest()
+    scene_offset = int.from_bytes(scene_hash[:4], byteorder="little", signed=False)
+    return (int(seed) + scene_offset) % (2**32)
 
 
-def subsample_indices(length: int, max_frames: int) -> np.ndarray:
+def subsample(paths: list[str], max_frames: int, seed: int) -> tuple[list[str], np.ndarray]:
+    indices = subsample_indices(len(paths), max_frames, seed)
+    return [paths[int(i)] for i in indices], indices
+
+
+def subsample_indices(length: int, max_frames: int, seed: int) -> np.ndarray:
     if max_frames <= 0 or length <= max_frames:
         return np.arange(length)
-    return np.linspace(0, length - 1, max_frames, dtype=int)
+    rng = np.random.default_rng(seed)
+    return np.sort(rng.choice(length, size=max_frames, replace=False))
 
 
 def autocast_context(device: torch.device, dtype: torch.dtype):
     enabled = device.type == "cuda"
     return torch.cuda.amp.autocast(enabled=enabled, dtype=dtype)
+
+
+def set_random_seeds(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
 
 
 def forward_vggt(
@@ -175,18 +217,22 @@ def read_clean_image_names(npz_path: Path | None) -> list[str] | None:
     return [str(x) for x in data["image_paths"].tolist()]
 
 
-def align_image_paths_to_clean(scene_dir: Path, clean_npz: Path | None, max_frames: int) -> tuple[list[str], np.ndarray | None]:
+def align_image_paths_to_clean(
+    scene_dir: Path,
+    clean_npz: Path | None,
+    max_frames: int,
+    seed: int,
+) -> tuple[list[str], np.ndarray]:
     clean_names = read_clean_image_names(clean_npz)
     if clean_names is None:
-        paths = subsample(find_images(scene_dir), max_frames)
-        return paths, None
+        return subsample(find_images(scene_dir), max_frames, seed)
 
     by_name = {Path(path).name: path for path in find_images(scene_dir)}
     missing = [name for name in clean_names if Path(name).name not in by_name]
     if missing:
         raise ValueError(f"{len(missing)} clean frames are missing from {scene_dir}; first missing: {missing[0]}")
 
-    frame_indices = subsample_indices(len(clean_names), max_frames)
+    frame_indices = subsample_indices(len(clean_names), max_frames, seed)
     paths = [by_name[Path(clean_names[i]).name] for i in frame_indices]
     return paths, frame_indices
 
@@ -563,15 +609,16 @@ def patch_attack(
 
 def tensor_to_numpy(preds: dict[str, torch.Tensor], image_size_hw: tuple[int, int]) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
-    if "pose_enc" in preds:
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(preds["pose_enc"], image_size_hw)
-        out["extrinsic"] = extrinsic.detach().float().cpu().numpy().astype(np.float32)
-        out["intrinsic"] = intrinsic.detach().float().cpu().numpy().astype(np.float32)
-        out["pose_enc"] = preds["pose_enc"].detach().float().cpu().numpy().astype(np.float32)
     if "extrinsic" in preds:
         out["extrinsic"] = preds["extrinsic"].detach().float().cpu().numpy().astype(np.float32)
     if "intrinsic" in preds:
         out["intrinsic"] = preds["intrinsic"].detach().float().cpu().numpy().astype(np.float32)
+    if "pose_enc" in preds:
+        out["pose_enc"] = preds["pose_enc"].detach().float().cpu().numpy().astype(np.float32)
+        if "extrinsic" not in out or "intrinsic" not in out:
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(preds["pose_enc"], image_size_hw)
+            out.setdefault("extrinsic", extrinsic.detach().float().cpu().numpy().astype(np.float32))
+            out.setdefault("intrinsic", intrinsic.detach().float().cpu().numpy().astype(np.float32))
     for key in ("depth", "depth_conf", "world_points", "world_points_conf"):
         if key in preds:
             out[key] = preds[key].detach().float().cpu().numpy().astype(np.float32)
@@ -876,9 +923,6 @@ def vggt_paper_metrics(
     if "point_mask" in reference:
         reference_mask = reference["point_mask"].detach().cpu().numpy()[0].astype(bool)
 
-    # VGGT reports up-to-scale geometry. For each geometry branch we align
-    # prediction to ground truth with pixel-aligned Umeyama Sim(3), then report
-    # Chamfer Accuracy/Completeness/Overall as in the DTU/ETH3D protocol.
     if all(k in reference_np for k in ("depth", "extrinsic", "intrinsic")) and all(
         k in pred_np for k in ("depth", "extrinsic", "intrinsic")
     ):
@@ -888,6 +932,18 @@ def vggt_paper_metrics(
         pred_depth_points = unproject_depth_map_to_point_map(
             pred_np["depth"][0], pred_np["extrinsic"][0], pred_np["intrinsic"][0]
         )
+        metrics.update(
+            chamfer_metrics(
+                reference_depth_points,
+                pred_depth_points,
+                "depth_align_none",
+                max_points,
+                device,
+                reference_mask=reference_mask,
+                pred_mask=reference_mask,
+                sim3=None,
+            )
+        )
         sim3 = estimate_sim3_from_paired_pointmaps(
             src_pointmap=pred_depth_points,
             dst_pointmap=reference_depth_points,
@@ -895,19 +951,21 @@ def vggt_paper_metrics(
             max_samples=max_points,
         )
         if sim3 is not None:
-            metrics["depth_sim3_scale"] = float(sim3[0])
-        metrics.update(
-            chamfer_metrics(
-                reference_depth_points,
-                pred_depth_points,
-                "depth",
-                max_points,
-                device,
-                reference_mask=reference_mask,
-                pred_mask=reference_mask,
-                sim3=sim3,
+            metrics["depth_align_sim3_scale"] = float(sim3[0])
+            metrics.update(
+                chamfer_metrics(
+                    reference_depth_points,
+                    pred_depth_points,
+                    "depth_align_sim3",
+                    max_points,
+                    device,
+                    reference_mask=reference_mask,
+                    pred_mask=reference_mask,
+                    sim3=sim3,
+                )
             )
-        )
+        else:
+            metrics["depth_align_sim3_status"] = "skipped_insufficient_correspondences"
 
     if "world_points" in reference_np and "world_points" in pred_np:
         wp_sim3 = estimate_sim3_from_paired_pointmaps(
@@ -918,18 +976,20 @@ def vggt_paper_metrics(
         )
         if wp_sim3 is not None:
             metrics["point_sim3_scale"] = float(wp_sim3[0])
-        metrics.update(
-            chamfer_metrics(
-                reference_np["world_points"][0],
-                pred_np["world_points"][0],
-                "point",
-                max_points,
-                device,
-                reference_mask=reference_mask,
-                pred_mask=reference_mask,
-                sim3=wp_sim3,
+            metrics.update(
+                chamfer_metrics(
+                    reference_np["world_points"][0],
+                    pred_np["world_points"][0],
+                    "point",
+                    max_points,
+                    device,
+                    reference_mask=reference_mask,
+                    pred_mask=reference_mask,
+                    sim3=wp_sim3,
+                )
             )
-        )
+        else:
+            metrics["point_status"] = "skipped_insufficient_correspondences"
 
     metrics["tracking_image_matching"] = "not_computed"
     return metrics
@@ -943,11 +1003,16 @@ def vggt_paper_records(
     device: torch.device,
 ) -> dict:
     metrics = vggt_paper_metrics(reference, pred, image_size_hw, max_points, device)
+    depth_keys = [
+        f"depth_align_{align}_{name}"
+        for align in ("none", "sim3")
+        for name in ("accuracy", "completeness", "overall")
+    ]
     return {
         "camera_pair_errors": camera_pair_error_records(reference, pred, image_size_hw),
         "depth_scene_metrics": {
             key: metrics[key]
-            for key in ("depth_accuracy", "depth_completeness", "depth_overall")
+            for key in depth_keys
             if key in metrics
         },
         "point_scene_metrics": {
@@ -1255,9 +1320,16 @@ def scene_attack_row(summary: dict) -> dict[str, float | str | None]:
         "clean_adv_depth_rel_rmse": finite_float(clean_vs_pgd.get("depth_rel_rmse")),
         "clean_adv_points_rel_rmse": finite_float(clean_vs_pgd.get("points_rel_rmse")),
         "clean_adv_pose_rel_rmse": finite_float(clean_vs_pgd.get("pose_rel_rmse")),
-        "clean_depth_overall": finite_float(clean_vs_gt.get("depth_overall")),
-        "pgd_depth_overall": finite_float(pgd_vs_gt.get("depth_overall")),
-        "depth_overall_delta": metric_delta(pgd_vs_gt, clean_vs_gt, "depth_overall", larger_is_worse=True),
+        "clean_depth_align_none_overall": finite_float(clean_vs_gt.get("depth_align_none_overall")),
+        "pgd_depth_align_none_overall": finite_float(pgd_vs_gt.get("depth_align_none_overall")),
+        "depth_align_none_overall_delta": metric_delta(
+            pgd_vs_gt, clean_vs_gt, "depth_align_none_overall", larger_is_worse=True
+        ),
+        "clean_depth_align_sim3_overall": finite_float(clean_vs_gt.get("depth_align_sim3_overall")),
+        "pgd_depth_align_sim3_overall": finite_float(pgd_vs_gt.get("depth_align_sim3_overall")),
+        "depth_align_sim3_overall_delta": metric_delta(
+            pgd_vs_gt, clean_vs_gt, "depth_align_sim3_overall", larger_is_worse=True
+        ),
         "clean_point_overall": finite_float(clean_vs_gt.get("point_overall")),
         "pgd_point_overall": finite_float(pgd_vs_gt.get("point_overall")),
         "point_overall_delta": metric_delta(pgd_vs_gt, clean_vs_gt, "point_overall", larger_is_worse=True),
@@ -1277,7 +1349,7 @@ def normalized_attack_ranking(summaries: list[dict]) -> list[dict]:
         "clean_adv_depth_rel_rmse": 0.25,
         "clean_adv_points_rel_rmse": 0.25,
         "clean_adv_pose_rel_rmse": 0.15,
-        "depth_overall_delta": 0.15,
+        "depth_align_sim3_overall_delta": 0.15,
         "point_overall_delta": 0.15,
         "camera_auc30_drop": 0.05,
     }
@@ -1369,7 +1441,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Load Hugging Face checkpoint from local cache only; useful on offline servers.",
     )
-    parser.add_argument("--max_frames", type=int, default=4, help="Maximum number of frames to attack; 0 keeps all frames.")
+    parser.add_argument("--max_frames", type=int, default=10, help="Maximum number of frames to attack/evaluate; 0 keeps all frames.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for frame sampling and attack initialization.")
     parser.add_argument("--attack_type", choices=("global", "patch"), default="global", help="Attack perturbation type.")
     parser.add_argument("--steps", type=int, default=10, help="PGD iterations.")
     parser.add_argument("--eps", type=float, default=8 / 255, help="L-infinity perturbation budget in [0, 1] pixels.")
@@ -1393,7 +1466,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the ALIKED-query two-view matching evaluation for the tracking head.",
     )
-    parser.add_argument("--matching_max_keypoints", type=int, default=2048, help="ALIKED keypoints per query image.")
+    parser.add_argument("--matching_max_keypoints", type=int, default=5000, help="ALIKED keypoints per query image.")
     parser.add_argument("--matching_det_thresh", type=float, default=0.005, help="ALIKED detection threshold.")
     parser.add_argument(
         "--matching_ransac_thresh",
@@ -1436,7 +1509,8 @@ def process_scene(
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    image_paths, frame_indices = align_image_paths_to_clean(scene_dir, clean_npz, args.max_frames)
+    scene_seed = derive_scene_seed(args.seed, scene_dir.name)
+    image_paths, frame_indices = align_image_paths_to_clean(scene_dir, clean_npz, args.max_frames, scene_seed)
     if not image_paths:
         raise ValueError(f"No images found under {scene_dir}")
 
@@ -1617,6 +1691,13 @@ def process_scene(
         "patch": patch_meta,
         "random_start": not args.no_random_start,
         "weights": weights,
+        "frame_sampling": {
+            "method": "random_without_replacement",
+            "seed": int(args.seed),
+            "scene_seed": int(scene_seed),
+            "frame_indices": frame_indices.astype(int).tolist(),
+        },
+        "evaluation_protocol": EVALUATION_PROTOCOL,
         "metrics": {
             "clean_vs_gt": clean_gt_metrics,
             "pgd_vs_gt": adv_gt_metrics,
@@ -1682,10 +1763,12 @@ def aggregate_eval_key(summaries: list[dict], eval_key: str) -> dict:
         thresholds=(30,),
     )
 
-    for name in ("accuracy", "completeness", "overall"):
-        value = mean_scene_metric(summaries, eval_key, "depth_scene_metrics", f"depth_{name}")
-        if value is not None:
-            metrics["depth"][name] = value
+    for align in ("none", "sim3"):
+        for name in ("accuracy", "completeness", "overall"):
+            metric_key = f"depth_align_{align}_{name}"
+            value = mean_scene_metric(summaries, eval_key, "depth_scene_metrics", metric_key)
+            if value is not None:
+                metrics["depth"][f"align_{align}_{name}"] = value
 
     for name in ("accuracy", "completeness", "overall"):
         value = mean_scene_metric(summaries, eval_key, "point_scene_metrics", f"point_{name}")
@@ -1708,15 +1791,7 @@ def aggregate_eval_key(summaries: list[dict], eval_key: str) -> dict:
 
 def aggregate_dataset_metrics(summaries: list[dict]) -> dict:
     return {
-        "protocol": {
-            "reference": "real_co3d_gt",
-            "attack_loss": "maximize prediction error against real CO3D GT",
-            "camera": "VGGT official evaluation branch style: AUC over per-pair max(rotation_error, translation_error)",
-            "depth": "VGGT paper metric definition: Sim(3)-aligned depth+camera point cloud Accuracy/Completeness/Overall",
-            "point": "VGGT paper metric definition: independently Sim(3)-aligned point-map Accuracy/Completeness/Overall",
-            "tracking_image_matching": "VGGT paper metric definition: ALIKED query points -> VGGT tracks -> Essential matrix pose AUC@5/10/20",
-            "dataset_note": "This script loads CO3D GT; use DTU/ETH3D/ScanNet loaders for exact paper dataset splits.",
-        },
+        "protocol": EVALUATION_PROTOCOL,
         "clean_vs_gt": aggregate_eval_key(summaries, "clean_vs_gt"),
         "pgd_vs_gt": aggregate_eval_key(summaries, "pgd_vs_gt"),
         "clean_vs_pgd": aggregate_eval_key(summaries, "clean_vs_pgd"),
@@ -1725,6 +1800,7 @@ def aggregate_dataset_metrics(summaries: list[dict]) -> dict:
 
 def main() -> None:
     args = parse_args()
+    set_random_seeds(args.seed)
     if args.scene_dir is None and args.scenes_root is None:
         raise ValueError("Provide either --scene_dir for one scene or --scenes_root for batch mode.")
     if args.scene_dir is not None and args.scenes_root is not None:
@@ -1792,7 +1868,7 @@ def main() -> None:
     with open(output_root / "pgd_dataset_metrics.json", "w", encoding="utf-8") as f:
         json.dump(dataset_metrics, f, indent=2)
     ranking = write_attack_ranking(summaries, output_root)
-    print("\n[dataset metrics: clean output as pseudo-GT]")
+    print("\n[dataset metrics: VGGT paper-aligned metrics]")
     for group, values in dataset_metrics.items():
         if group == "protocol":
             continue
