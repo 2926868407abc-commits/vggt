@@ -46,7 +46,9 @@ EVALUATION_PROTOCOL = {
     "attack_loss": "maximize prediction error against real CO3D GT",
     "camera": (
         "Paper Table 1 (CO3D/RE10K) protocol: AUC over pairwise relative pose errors, "
-        "implemented as AUC over max(rotation_error, translation_error)."
+        "implemented as AUC over max(rotation_error, translation_error). Dataset-level "
+        "CO3D aggregation follows the official protocol: compute metrics per category, "
+        "then average categories."
     ),
     "depth": "Reports both depth_align_none_* and depth_align_sim3_* for the depth+camera unprojected cloud.",
     "depth_align_none": (
@@ -1680,8 +1682,15 @@ def process_scene(
         **{f"adv_{k}": v for k, v in adv_np.items()},
     )
 
+    if "__" in scene_dir.name:
+        scene_category, scene_sequence = scene_dir.name.split("__", 1)
+    else:
+        scene_category, scene_sequence = scene_dir.name, ""
+
     summary = {
         "scene": str(scene_dir),
+        "category": scene_category,
+        "sequence_name": scene_sequence,
         "ckpt": args.ckpt,
         "n_frames": len(image_paths),
         "steps": args.steps,
@@ -1735,18 +1744,77 @@ def mean_scene_metric(summaries: list[dict], eval_key: str, record_name: str, me
     return float(np.mean(values))
 
 
+def scene_category_from_summary(summary: dict) -> str:
+    category = summary.get("category")
+    if isinstance(category, str) and category:
+        return category
+
+    scene_name = Path(summary.get("scene", "")).name
+    if "__" in scene_name:
+        return scene_name.split("__", 1)[0]
+    return scene_name or "unknown"
+
+
+def aggregate_camera_by_category(
+    summaries: list[dict],
+    eval_key: str,
+    thresholds: tuple[int, ...] = (30,),
+) -> dict:
+    """Official CO3D-style dataset aggregation: metric per category, then category mean."""
+    records_by_category: dict[str, dict[str, list[float]]] = {}
+    pooled_records = {"rotation_deg": [], "translation_deg": []}
+
+    for summary in summaries:
+        records = summary.get("eval_records", {}).get(eval_key, {})
+        camera_records = records.get("camera_pair_errors", {})
+        r_errors = camera_records.get("rotation_deg", [])
+        t_errors = camera_records.get("translation_deg", [])
+        if not r_errors or not t_errors:
+            continue
+
+        category = scene_category_from_summary(summary)
+        category_records = records_by_category.setdefault(category, {"rotation_deg": [], "translation_deg": []})
+        category_records["rotation_deg"].extend(r_errors)
+        category_records["translation_deg"].extend(t_errors)
+        pooled_records["rotation_deg"].extend(r_errors)
+        pooled_records["translation_deg"].extend(t_errors)
+
+    if not records_by_category:
+        return {}
+
+    category_metrics = {
+        category: camera_metrics_from_pair_errors(records, thresholds=thresholds)
+        for category, records in sorted(records_by_category.items())
+    }
+
+    metrics: dict[str, float | str] = {
+        "camera_aggregation": "category_mean",
+        "camera_category_count": float(len(category_metrics)),
+        "camera_pair_count": float(len(pooled_records["rotation_deg"])),
+    }
+    for threshold in thresholds:
+        for name in ("rra", "rta", "auc"):
+            key = f"camera_{name}@{threshold}"
+            values = [cat_metrics[key] for cat_metrics in category_metrics.values() if key in cat_metrics]
+            if values:
+                metrics[key] = float(np.mean(values))
+
+    pooled_metrics = camera_metrics_from_pair_errors(pooled_records, thresholds=thresholds)
+    for threshold in thresholds:
+        for name in ("rra", "rta", "auc"):
+            key = f"camera_{name}@{threshold}"
+            if key in pooled_metrics:
+                metrics[f"{key}_pooled"] = pooled_metrics[key]
+
+    return metrics
+
+
 def aggregate_eval_key(summaries: list[dict], eval_key: str) -> dict:
-    camera_r_errors: list[float] = []
-    camera_t_errors: list[float] = []
     matching_r_errors: list[float] = []
     matching_t_errors: list[float] = []
 
     for summary in summaries:
         records = summary.get("eval_records", {}).get(eval_key, {})
-        camera_records = records.get("camera_pair_errors", {})
-        camera_r_errors.extend(camera_records.get("rotation_deg", []))
-        camera_t_errors.extend(camera_records.get("translation_deg", []))
-
         matching_records = records.get("tracking_image_matching_pair_errors", {})
         matching_r_errors.extend(matching_records.get("rotation_deg", []))
         matching_t_errors.extend(matching_records.get("translation_deg", []))
@@ -1758,10 +1826,7 @@ def aggregate_eval_key(summaries: list[dict], eval_key: str) -> dict:
         "tracking_image_matching": {},
     }
 
-    metrics["camera"] = camera_metrics_from_pair_errors(
-        {"rotation_deg": camera_r_errors, "translation_deg": camera_t_errors},
-        thresholds=(30,),
-    )
+    metrics["camera"] = aggregate_camera_by_category(summaries, eval_key, thresholds=(30,))
 
     for align in ("none", "sim3"):
         for name in ("accuracy", "completeness", "overall"):
