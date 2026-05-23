@@ -40,20 +40,16 @@ from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_e
 
 CO3D_TO_OPENCV = np.diag([-1.0, -1.0, 1.0]).astype(np.float32)
 EVALUATION_PROTOCOL = {
-    "reference": "real_co3d_gt",
-    "attack_loss": "maximize prediction error against real CO3D GT",
+    "reference": "paper_original_dataset_gt",
+    "attack_loss": "maximize prediction error against the available task reference; falls back to clean output if a task has no dense GT tensor.",
     "camera": (
         "Paper Table 1 (CO3D/RE10K) protocol: AUC over pairwise relative pose errors, "
         "implemented as AUC over max(rotation_error, translation_error). Dataset-level "
         "CO3D aggregation follows the official protocol: compute metrics per category, "
         "then average categories."
     ),
-    "depth": "Reports both depth_align_none_* and depth_align_sim3_* for the depth+camera unprojected cloud.",
-    "depth_align_none": (
-        "Paper Table 2 (DTU) metric definition: depth+camera unproject + Chamfer, no Sim(3). "
-        "When run on CO3D, absolute values are scale-mismatched proxy values; use relative "
-        "clean-vs-adversarial changes."
-    ),
+    "depth": "Paper Table 2: DTU dense MVS benchmark with GT scan point clouds.",
+    "depth_align_none": "DTU-style Chamfer between prediction and DTU GT scan point cloud.",
     "depth_align_sim3": (
         "Paper Table 3 (ETH3D), Ours(Depth+Cam): depth+camera unproject + Umeyama Sim(3) "
         "alignment + Chamfer."
@@ -65,9 +61,18 @@ EVALUATION_PROTOCOL = {
         "Paper Table 4 (ScanNet-1500) protocol: ALIKED query points -> VGGT tracks -> "
         "Essential matrix -> pose AUC@5/10/20."
     ),
-    "dataset_note": "This script loads CO3D GT; use DTU/ETH3D/ScanNet loaders for exact paper dataset splits.",
+    "dataset_note": (
+        "Paper protocol uses different datasets per task: camera=CO3Dv2/Re10K, "
+        "depth=DTU, point=ETH3D, tracking=ScanNet-1500."
+    ),
 }
 EVAL_TASKS = ("camera", "depth", "point", "tracking")
+PAPER_TASK_DATASETS = {
+    "camera": {"co3d", "re10k"},
+    "depth": {"dtu"},
+    "point": {"eth3d"},
+    "tracking": {"scannet1500"},
+}
 
 try:
     import cv2
@@ -108,6 +113,42 @@ def parse_eval_tasks(value: str | list[str] | tuple[str, ...] | None) -> set[str
     if unknown:
         raise ValueError(f"Unknown eval task(s): {unknown}. Choose from: {', '.join(EVAL_TASKS)}")
     return tasks
+
+
+def infer_paper_eval_dataset(eval_tasks: set[str], requested: str) -> str:
+    if requested != "auto":
+        return requested
+    if len(eval_tasks) != 1:
+        raise ValueError(
+            "--eval_dataset auto can only infer a dataset for a single --eval_tasks value. "
+            "Run paper tasks separately, e.g. --eval_tasks depth --eval_dataset dtu."
+        )
+    task = next(iter(eval_tasks))
+    if task == "camera":
+        return "co3d"
+    if task == "depth":
+        return "dtu"
+    if task == "point":
+        return "eth3d"
+    if task == "tracking":
+        return "scannet1500"
+    raise ValueError(f"Unsupported eval task: {task}")
+
+
+def validate_paper_eval_dataset(eval_tasks: set[str], eval_dataset: str) -> None:
+    if len(eval_tasks) != 1:
+        raise ValueError(
+            "Paper-aligned evaluation must be run one task at a time because VGGT reports "
+            "camera/depth/point/tracking on different datasets. Use --eval_tasks camera, "
+            "then --eval_tasks depth, etc."
+        )
+    task = next(iter(eval_tasks))
+    allowed = PAPER_TASK_DATASETS[task]
+    if eval_dataset not in allowed:
+        raise ValueError(
+            f"Paper task '{task}' must use one of {sorted(allowed)}, got --eval_dataset {eval_dataset!r}. "
+            "This prevents CO3D proxy metrics from being reported as paper metrics."
+        )
 
 
 def find_images(scene_dir: Path) -> list[str]:
@@ -305,6 +346,163 @@ def load_saved_attack_images(npz_path: Path, device: torch.device) -> tuple[torc
     return clean_images, adv_images
 
 
+def read_ply_xyz(ply_path: Path) -> np.ndarray:
+    with open(ply_path, "rb") as f:
+        header_lines: list[bytes] = []
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"PLY header is missing end_header: {ply_path}")
+            header_lines.append(line)
+            if line.strip() == b"end_header":
+                break
+        header = [line.decode("ascii", errors="replace").strip() for line in header_lines]
+        vertex_count = 0
+        fmt = None
+        properties: list[tuple[str, str]] = []
+        in_vertex = False
+        for line in header:
+            if line.startswith("format "):
+                fmt = line.split()[1]
+            elif line.startswith("element "):
+                parts = line.split()
+                in_vertex = parts[1] == "vertex"
+                if in_vertex:
+                    vertex_count = int(parts[2])
+            elif in_vertex and line.startswith("property "):
+                _, dtype_name, name = line.split()[:3]
+                properties.append((dtype_name, name))
+
+        if vertex_count <= 0:
+            raise ValueError(f"PLY file has no vertices: {ply_path}")
+        if not {"x", "y", "z"}.issubset({name for _, name in properties}):
+            raise ValueError(f"PLY vertices must contain x/y/z properties: {ply_path}")
+
+        if fmt == "ascii":
+            rows = []
+            for _ in range(vertex_count):
+                values = f.readline().decode("ascii", errors="replace").split()
+                rows.append([float(values[[name for _, name in properties].index(axis)]) for axis in ("x", "y", "z")])
+            return np.asarray(rows, dtype=np.float32)
+
+        if fmt != "binary_little_endian":
+            raise ValueError(f"Unsupported PLY format {fmt!r}; use ascii or binary_little_endian: {ply_path}")
+
+        dtype_map = {
+            "char": "i1",
+            "uchar": "u1",
+            "int8": "i1",
+            "uint8": "u1",
+            "short": "<i2",
+            "ushort": "<u2",
+            "int16": "<i2",
+            "uint16": "<u2",
+            "int": "<i4",
+            "uint": "<u4",
+            "int32": "<i4",
+            "uint32": "<u4",
+            "float": "<f4",
+            "float32": "<f4",
+            "double": "<f8",
+            "float64": "<f8",
+        }
+        dtype = np.dtype([(name, dtype_map[dtype_name]) for dtype_name, name in properties])
+        data = np.fromfile(f, dtype=dtype, count=vertex_count)
+        return np.stack([data["x"], data["y"], data["z"]], axis=1).astype(np.float32)
+
+
+def resolve_dtu_gt_ply(args: argparse.Namespace, scene_dir: Path) -> Path:
+    if args.gt_pointcloud:
+        return Path(args.gt_pointcloud)
+    if not args.gt_root:
+        raise ValueError("--eval_dataset dtu needs --gt_pointcloud or --gt_root")
+    scan_id = args.scan_id
+    if scan_id is None:
+        digits = "".join(ch for ch in scene_dir.name if ch.isdigit())
+        if digits:
+            scan_id = int(digits)
+    candidates = []
+    gt_root = Path(args.gt_root)
+    if scan_id is not None:
+        candidates.extend(
+            [
+                gt_root / "Points" / "stl" / f"stl{int(scan_id):03d}_total.ply",
+                gt_root / "Points" / "stl" / f"stl{int(scan_id)}_total.ply",
+                gt_root / f"stl{int(scan_id):03d}_total.ply",
+                gt_root / f"scan{int(scan_id)}" / "gt.ply",
+            ]
+        )
+    candidates.extend([gt_root / scene_dir.name / "gt.ply", gt_root / f"{scene_dir.name}.ply"])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Could not locate DTU GT point cloud. Tried: {[str(p) for p in candidates]}")
+
+
+def resolve_eth3d_gt_ply(args: argparse.Namespace, scene_dir: Path) -> Path:
+    if args.gt_pointcloud:
+        return Path(args.gt_pointcloud)
+    if not args.gt_root:
+        raise ValueError("--eval_dataset eth3d needs --gt_pointcloud or --gt_root")
+    gt_root = Path(args.gt_root)
+    candidates = [
+        gt_root / scene_dir.name / "dslr_scan_eval" / "scan_alignment.mlp.ply",
+        gt_root / scene_dir.name / "dslr_scan_eval" / "gt.ply",
+        gt_root / scene_dir.name / "gt.ply",
+        gt_root / f"{scene_dir.name}.ply",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Could not locate ETH3D GT point cloud. Tried: {[str(p) for p in candidates]}")
+
+
+def load_gt_pointcloud_reference(
+    ply_path: Path,
+    device: torch.device,
+    alignment: str,
+) -> dict[str, torch.Tensor | str]:
+    points = read_ply_xyz(ply_path)
+    return {
+        "gt_point_cloud": torch.from_numpy(points.astype(np.float32)),
+        "pointcloud_alignment": alignment,
+        "gt_point_cloud_path": str(ply_path),
+    }
+
+
+def load_gt_camera_npz_reference(
+    npz_path: Path | None,
+    device: torch.device,
+    image_size_hw: tuple[int, int],
+    image_paths: list[str],
+) -> dict[str, torch.Tensor]:
+    if npz_path is None:
+        return {}
+    data = np.load(npz_path)
+    if "extrinsic" not in data or "intrinsic" not in data:
+        raise ValueError(f"{npz_path} must contain extrinsic and intrinsic arrays")
+    extrinsic = data["extrinsic"].astype(np.float32)
+    intrinsic = data["intrinsic"].astype(np.float32)
+    if "image_paths" in data:
+        by_name = {Path(str(name)).name: idx for idx, name in enumerate(data["image_paths"].tolist())}
+        indices = []
+        for image_path in image_paths:
+            name = Path(image_path).name
+            if name not in by_name:
+                raise ValueError(f"GT camera npz {npz_path} has no camera for image {name}")
+            indices.append(by_name[name])
+        extrinsic = extrinsic[indices]
+        intrinsic = intrinsic[indices]
+
+    extrinsic_t = torch.from_numpy(ensure_prediction_batch(extrinsic, 3).astype(np.float32)).to(device)
+    intrinsic_t = torch.from_numpy(ensure_prediction_batch(intrinsic, 3).astype(np.float32)).to(device)
+    return {
+        "extrinsic": extrinsic_t,
+        "intrinsic": intrinsic_t,
+        "pose_enc": extri_intri_to_pose_encoding(extrinsic_t, intrinsic_t, image_size_hw),
+    }
+
+
 def read_clean_image_names(npz_path: Path | None) -> list[str] | None:
     if npz_path is None or not npz_path.exists():
         return None
@@ -353,6 +551,33 @@ def load_co3d_category_annotations(gt_root: Path, category: str) -> list[dict]:
     return data
 
 
+def load_co3d_official_camera_reference(
+    anno_root: Path,
+    scene_dir: Path,
+    image_paths: list[str],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    category, sequence_name = parse_flat_scene_name(scene_dir)
+    anno_path = anno_root / f"{category}_test.jgz"
+    if not anno_path.exists():
+        raise FileNotFoundError(f"Missing official CO3D test annotation: {anno_path}")
+    with gzip.open(anno_path, "rt") as f:
+        data = json.load(f)
+    if sequence_name not in data:
+        raise ValueError(f"Sequence {sequence_name} is not in {anno_path}")
+
+    by_basename = {Path(item["filepath"]).name: item for item in data[sequence_name]}
+    extrinsics = []
+    for image_path in image_paths:
+        basename = Path(image_path).name
+        if basename not in by_basename:
+            raise ValueError(f"No official CO3D GT camera for {basename} in {category}/{sequence_name}")
+        item = by_basename[basename]
+        extrinsics.append(co3d_rt_to_opencv_extrinsic(item["R"], item["T"]))
+    extrinsic_t = torch.from_numpy(np.stack(extrinsics).astype(np.float32)).to(device).unsqueeze(0)
+    return {"extrinsic": extrinsic_t}
+
+
 def co3d_ndc_intrinsics_to_pixels(viewpoint: dict, image_size_hw: tuple[int, int]) -> np.ndarray:
     height, width = image_size_hw
     min_size = float(min(height, width))
@@ -365,6 +590,17 @@ def co3d_ndc_intrinsics_to_pixels(viewpoint: dict, image_size_hw: tuple[int, int
     intrinsics[0, 2] = width / 2.0 - principal[0] * min_size / 2.0
     intrinsics[1, 2] = height / 2.0 - principal[1] * min_size / 2.0
     return intrinsics
+
+
+def co3d_rt_to_opencv_extrinsic(rotation: list | np.ndarray, translation: list | np.ndarray) -> np.ndarray:
+    rot_pt3d = np.asarray(rotation, dtype=np.float32)
+    trans_pt3d = np.asarray(translation, dtype=np.float32)
+    trans_pt3d = trans_pt3d.copy()
+    rot_pt3d = rot_pt3d.copy()
+    trans_pt3d[:2] *= -1
+    rot_pt3d[:, :2] *= -1
+    rot_pt3d = rot_pt3d.transpose(1, 0)
+    return np.hstack((rot_pt3d, trans_pt3d[:, None])).astype(np.float32)
 
 
 def co3d_viewpoint_to_opencv_extrinsic(viewpoint: dict) -> np.ndarray:
@@ -595,6 +831,10 @@ def attack_loss(
         term_values[name] = float(value.detach().cpu())
     term_values["total"] = float(total.detach().cpu())
     return total, term_values
+
+
+def has_attack_reference_terms(reference: dict) -> bool:
+    return any(key in reference for key in ("depth", "pose_enc", "world_points"))
 
 
 def pgd_attack(
@@ -860,13 +1100,21 @@ def camera_pair_error_records(
     adv: dict[str, torch.Tensor],
     image_size_hw: tuple[int, int],
 ) -> dict[str, list[float]]:
-    if "pose_enc" not in clean or "pose_enc" not in adv:
+    if "extrinsic" in clean:
+        clean_extri = clean["extrinsic"].detach().float()
+    elif "pose_enc" in clean:
+        clean_extri, _ = pose_encoding_to_extri_intri(clean["pose_enc"], image_size_hw)
+        clean_extri = clean_extri.detach().float()
+    else:
         return {"rotation_deg": [], "translation_deg": []}
 
-    clean_extri, _ = pose_encoding_to_extri_intri(clean["pose_enc"], image_size_hw)
-    adv_extri, _ = pose_encoding_to_extri_intri(adv["pose_enc"], image_size_hw)
-    clean_extri = clean_extri.detach().float()
-    adv_extri = adv_extri.detach().float()
+    if "extrinsic" in adv:
+        adv_extri = adv["extrinsic"].detach().float()
+    elif "pose_enc" in adv:
+        adv_extri, _ = pose_encoding_to_extri_intri(adv["pose_enc"], image_size_hw)
+        adv_extri = adv_extri.detach().float()
+    else:
+        return {"rotation_deg": [], "translation_deg": []}
 
     # Gauge-fix: both prediction and GT are expressed relative to their own
     # first-frame, so global-frame mismatch cannot leak into pair errors.
@@ -992,6 +1240,38 @@ def estimate_sim3_from_paired_pointmaps(
     return umeyama_sim3(src, dst)
 
 
+def camera_centers_from_extrinsics(extrinsic: np.ndarray) -> np.ndarray:
+    extrinsic = extrinsic.reshape(-1, 3, 4).astype(np.float32)
+    rotation = extrinsic[:, :3, :3]
+    translation = extrinsic[:, :3, 3]
+    centers = -np.matmul(rotation.transpose(0, 2, 1), translation[..., None]).squeeze(-1)
+    return centers.astype(np.float32)
+
+
+def estimate_sim3_from_camera_centers(
+    reference: dict[str, torch.Tensor],
+    pred_np: dict[str, np.ndarray],
+    image_size_hw: tuple[int, int],
+) -> tuple[float, np.ndarray, np.ndarray] | None:
+    if "extrinsic" not in reference:
+        return None
+    if "extrinsic" in pred_np:
+        pred_extrinsic = pred_np["extrinsic"][0]
+    elif "pose_enc" in pred_np:
+        pose_enc = torch.from_numpy(pred_np["pose_enc"]).float()
+        pred_extrinsic_t, _ = pose_encoding_to_extri_intri(pose_enc, image_size_hw)
+        pred_extrinsic = pred_extrinsic_t.detach().cpu().numpy()[0]
+    else:
+        return None
+
+    ref_extrinsic = reference["extrinsic"][0].detach().float().cpu().numpy()
+    pred_centers = camera_centers_from_extrinsics(pred_extrinsic)
+    ref_centers = camera_centers_from_extrinsics(ref_extrinsic)
+    if len(pred_centers) != len(ref_centers) or len(pred_centers) < 3:
+        return None
+    return umeyama_sim3(pred_centers, ref_centers)
+
+
 def nearest_distances(src: torch.Tensor, dst: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
     mins = []
     for start in range(0, src.shape[0], chunk_size):
@@ -1056,7 +1336,32 @@ def depth_paper_metrics(
     pred_np = tensor_to_numpy(pred, image_size_hw)
     reference_mask = reference_point_mask(reference)
 
-    if all(k in reference_np for k in ("depth", "extrinsic", "intrinsic")) and all(
+    if "gt_point_cloud" in reference and all(k in pred_np for k in ("depth", "extrinsic", "intrinsic")):
+        gt_points = reference["gt_point_cloud"].detach().float().cpu().numpy()
+        pred_depth_points = unproject_depth_map_to_point_map(
+            pred_np["depth"][0], pred_np["extrinsic"][0], pred_np["intrinsic"][0]
+        )
+        alignment = str(reference.get("pointcloud_alignment", "none"))
+        sim3 = None
+        if alignment == "sim3":
+            sim3 = estimate_sim3_from_camera_centers(reference, pred_np, image_size_hw)
+            if sim3 is not None:
+                metrics["depth_align_sim3_scale"] = float(sim3[0])
+            else:
+                metrics["depth_align_sim3_status"] = "skipped_missing_camera_correspondences"
+                return metrics
+        prefix = "depth_align_sim3" if sim3 is not None else "depth_align_none"
+        metrics.update(
+            chamfer_metrics(
+                gt_points,
+                pred_depth_points,
+                prefix,
+                max_points,
+                device,
+                sim3=sim3,
+            )
+        )
+    elif all(k in reference_np for k in ("depth", "extrinsic", "intrinsic")) and all(
         k in pred_np for k in ("depth", "extrinsic", "intrinsic")
     ):
         reference_depth_points = unproject_depth_map_to_point_map(
@@ -1116,7 +1421,28 @@ def point_paper_metrics(
     pred_np = tensor_to_numpy(pred, image_size_hw)
     reference_mask = reference_point_mask(reference)
 
-    if "world_points" in reference_np and "world_points" in pred_np:
+    if "gt_point_cloud" in reference and "world_points" in pred_np:
+        gt_points = reference["gt_point_cloud"].detach().float().cpu().numpy()
+        alignment = str(reference.get("pointcloud_alignment", "sim3"))
+        sim3 = None
+        if alignment == "sim3":
+            sim3 = estimate_sim3_from_camera_centers(reference, pred_np, image_size_hw)
+            if sim3 is not None:
+                metrics["point_sim3_scale"] = float(sim3[0])
+            else:
+                metrics["point_status"] = "skipped_missing_camera_correspondences_for_sim3"
+                return metrics
+        metrics.update(
+            chamfer_metrics(
+                gt_points,
+                pred_np["world_points"][0],
+                "point",
+                max_points,
+                device,
+                sim3=sim3,
+            )
+        )
+    elif "world_points" in reference_np and "world_points" in pred_np:
         wp_sim3 = estimate_sim3_from_paired_pointmaps(
             src_pointmap=pred_np["world_points"][0],
             dst_pointmap=reference_np["world_points"][0],
@@ -1319,6 +1645,33 @@ def build_pair_indices(num_frames: int, max_pairs: int) -> list[tuple[int, int]]
     return pairs
 
 
+def read_matching_pairs(pair_file: Path | None, image_paths: list[str]) -> list[tuple[int, int]] | None:
+    if pair_file is None:
+        return None
+    name_to_idx = {Path(path).name: idx for idx, path in enumerate(image_paths)}
+    stem_to_idx = {Path(path).stem: idx for idx, path in enumerate(image_paths)}
+    pairs: list[tuple[int, int]] = []
+    with open(pair_file, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.replace(",", " ").split()
+            if len(parts) < 2:
+                continue
+            if parts[0].isdigit() and parts[1].isdigit():
+                i, j = int(parts[0]), int(parts[1])
+            else:
+                token_i = Path(parts[0]).name
+                token_j = Path(parts[1]).name
+                i = name_to_idx.get(token_i, stem_to_idx.get(Path(token_i).stem, -1))
+                j = name_to_idx.get(token_j, stem_to_idx.get(Path(token_j).stem, -1))
+            if i < 0 or j < 0 or i >= len(image_paths) or j >= len(image_paths):
+                raise ValueError(f"Pair {parts[:2]} from {pair_file} is not present in image_paths")
+            pairs.append((i, j))
+    return pairs
+
+
 def tracking_image_matching_records(
     model: torch.nn.Module,
     images: torch.Tensor,
@@ -1331,13 +1684,14 @@ def tracking_image_matching_records(
     min_visibility: float,
     min_confidence: float,
     max_pairs: int,
+    pairs: list[tuple[int, int]] | None = None,
 ) -> dict[str, list[float] | str | int]:
     """VGGT paper-style image matching: ALIKED queries -> VGGT tracks -> Essential matrix."""
     if "extrinsic" not in reference or "intrinsic" not in reference:
         return {"rotation_deg": [], "translation_deg": [], "status": "skipped_missing_gt_cameras"}
 
     num_frames = images.shape[0]
-    pairs = build_pair_indices(num_frames, max_pairs)
+    pairs = pairs if pairs is not None else build_pair_indices(num_frames, max_pairs)
     if not pairs:
         return {"rotation_deg": [], "translation_deg": [], "status": "skipped_not_enough_frames"}
 
@@ -1609,8 +1963,35 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gt_root",
-        required=True,
-        help="CO3D raw GT root containing category/frame_annotations.jgz plus images/depths/depth_masks.",
+        default=None,
+        help="Task GT root. CO3D raw root for attacks/proxy loading; DTU/ETH3D roots for paper point-cloud GT.",
+    )
+    parser.add_argument(
+        "--eval_dataset",
+        choices=("auto", "co3d", "re10k", "dtu", "eth3d", "scannet1500"),
+        default="auto",
+        help="Original paper dataset for --eval_tasks. auto infers from a single task.",
+    )
+    parser.add_argument(
+        "--co3d_anno_dir",
+        default=None,
+        help="Official CO3D annotation dir containing category_test.jgz for paper camera evaluation.",
+    )
+    parser.add_argument(
+        "--gt_pointcloud",
+        default=None,
+        help="Explicit DTU/ETH3D GT point cloud PLY. Overrides auto lookup under --gt_root.",
+    )
+    parser.add_argument("--scan_id", type=int, default=None, help="DTU scan id for locating stlXXX_total.ply.")
+    parser.add_argument(
+        "--gt_camera_npz",
+        default=None,
+        help="GT cameras npz with extrinsic/intrinsic/image_paths for RE10K/DTU/ETH3D/ScanNet-1500.",
+    )
+    parser.add_argument(
+        "--pairs_file",
+        default=None,
+        help="Paper tracking pair list for ScanNet-1500 style matching. Lines may be 'idx idx' or 'image image'.",
     )
     parser.add_argument("--ckpt", default="facebook/VGGT-1B", help="Hugging Face model id or local checkpoint path.")
     parser.add_argument(
@@ -1702,6 +2083,7 @@ def set_tracking_eval_status(records: dict, metrics: dict, status: str) -> None:
 def evaluate_prediction_pair(
     *,
     model: torch.nn.Module | None,
+    image_paths: list[str],
     clean_images: torch.Tensor,
     adv_images: torch.Tensor,
     clean_preds: dict[str, torch.Tensor],
@@ -1756,6 +2138,7 @@ def evaluate_prediction_pair(
     )
 
     if "tracking" in eval_tasks:
+        pairs_override = read_matching_pairs(Path(args.pairs_file) if args.pairs_file else None, image_paths)
         if args.skip_matching_eval:
             set_tracking_eval_status(clean_gt_records, clean_gt_metrics, "skipped_by_user")
             set_tracking_eval_status(adv_gt_records, adv_gt_metrics, "skipped_by_user")
@@ -1776,6 +2159,7 @@ def evaluate_prediction_pair(
                 min_visibility=args.matching_min_vis,
                 min_confidence=args.matching_min_conf,
                 max_pairs=args.matching_max_pairs,
+                pairs=pairs_override,
             )
             clean_gt_records["tracking_image_matching_pair_errors"] = clean_matching_records
             add_tracking_matching_metrics(clean_gt_metrics, clean_matching_records)
@@ -1793,6 +2177,7 @@ def evaluate_prediction_pair(
                 min_visibility=args.matching_min_vis,
                 min_confidence=args.matching_min_conf,
                 max_pairs=args.matching_max_pairs,
+                pairs=pairs_override,
             )
             adv_gt_records["tracking_image_matching_pair_errors"] = adv_matching_records
             add_tracking_matching_metrics(adv_gt_metrics, adv_matching_records)
@@ -1839,6 +2224,67 @@ def load_saved_scene_predictions(
     return image_paths, clean_images, adv_images, clean_preds, adv_preds, image_size_hw
 
 
+def load_paper_gt_reference(
+    args: argparse.Namespace,
+    eval_dataset: str,
+    scene_dir: Path,
+    image_paths: list[str],
+    device: torch.device,
+    image_size_hw: tuple[int, int],
+    needs_attack_geometry: bool,
+) -> dict:
+    if eval_dataset == "co3d":
+        if args.co3d_anno_dir:
+            return load_co3d_official_camera_reference(Path(args.co3d_anno_dir), scene_dir, image_paths, device)
+        if not args.gt_root:
+            raise ValueError("--eval_dataset co3d needs --co3d_anno_dir or --gt_root")
+        return load_co3d_gt_reference(
+            Path(args.gt_root),
+            scene_dir,
+            image_paths,
+            device,
+            image_size_hw,
+            load_geometry=needs_attack_geometry,
+        )
+    if eval_dataset == "dtu":
+        ply_path = resolve_dtu_gt_ply(args, scene_dir)
+        refs = load_gt_pointcloud_reference(ply_path, device, alignment="none")
+        refs.update(
+            load_gt_camera_npz_reference(
+                Path(args.gt_camera_npz) if args.gt_camera_npz else None,
+                device,
+                image_size_hw,
+                image_paths,
+            )
+        )
+        return refs
+    if eval_dataset == "eth3d":
+        if not args.gt_camera_npz:
+            raise ValueError("--eval_dataset eth3d needs --gt_camera_npz so Sim(3) is estimated from matching cameras")
+        ply_path = resolve_eth3d_gt_ply(args, scene_dir)
+        refs = load_gt_pointcloud_reference(ply_path, device, alignment="sim3")
+        refs.update(
+            load_gt_camera_npz_reference(
+                Path(args.gt_camera_npz) if args.gt_camera_npz else None,
+                device,
+                image_size_hw,
+                image_paths,
+            )
+        )
+        return refs
+    if eval_dataset == "re10k":
+        if not args.gt_camera_npz:
+            raise ValueError("--eval_dataset re10k needs --gt_camera_npz converted from the official RE10K test cameras")
+        return load_gt_camera_npz_reference(Path(args.gt_camera_npz), device, image_size_hw, image_paths)
+    if eval_dataset == "scannet1500":
+        if not args.gt_camera_npz:
+            raise ValueError("--eval_dataset scannet1500 needs --gt_camera_npz with extrinsic/intrinsic/image_paths")
+        if not args.pairs_file:
+            raise ValueError("--eval_dataset scannet1500 needs --pairs_file with the official pair list")
+        return load_gt_camera_npz_reference(Path(args.gt_camera_npz), device, image_size_hw, image_paths)
+    raise ValueError(f"Unsupported --eval_dataset {eval_dataset}")
+
+
 def process_scene(
     model: torch.nn.Module | None,
     scene_dir: Path,
@@ -1850,6 +2296,8 @@ def process_scene(
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     eval_tasks = parse_eval_tasks(args.eval_tasks)
+    eval_dataset = infer_paper_eval_dataset(eval_tasks, args.eval_dataset)
+    validate_paper_eval_dataset(eval_tasks, eval_dataset)
     scene_seed = derive_scene_seed(args.seed, scene_dir.name)
 
     patch_tensor = None
@@ -1871,16 +2319,17 @@ def process_scene(
             device,
         )
         frame_indices = np.arange(len(image_paths), dtype=int)
-        gt_refs = load_co3d_gt_reference(
-            Path(args.gt_root),
+        gt_refs = load_paper_gt_reference(
+            args,
+            eval_dataset,
             scene_dir,
             image_paths,
             device,
             image_size_hw,
-            load_geometry=bool(eval_tasks & {"depth", "point"}),
+            needs_attack_geometry=False,
         )
         print(f"[eval_saved_npz] loaded predictions from {saved_npz}")
-        print(f"[gt] loaded CO3D real GT from {args.gt_root}")
+        print(f"[gt] loaded {eval_dataset} paper GT")
     else:
         frame_sampling_method = "random_without_replacement"
         if model is None:
@@ -1892,15 +2341,16 @@ def process_scene(
 
         clean_images = load_and_preprocess_images(image_paths).to(device)
         image_size_hw = tuple(clean_images.shape[-2:])
-        gt_refs = load_co3d_gt_reference(
-            Path(args.gt_root),
+        gt_refs = load_paper_gt_reference(
+            args,
+            eval_dataset,
             scene_dir,
             image_paths,
             device,
             image_size_hw,
-            load_geometry=(not args.eval_only_clean) or bool(eval_tasks & {"depth", "point"}),
+            needs_attack_geometry=(not args.eval_only_clean) or bool(eval_tasks & {"depth", "point"}),
         )
-        print(f"[gt] loaded CO3D real GT from {args.gt_root}")
+        print(f"[gt] loaded {eval_dataset} paper GT")
 
         if clean_npz is not None and not args.run_clean_forward:
             clean_preds = load_clean_reference(clean_npz, device, image_size_hw, frame_indices=frame_indices)
@@ -1917,10 +2367,11 @@ def process_scene(
             adv_preds = {k: v.detach().clone() for k, v in clean_preds.items()}
             print("[eval_only_clean] skipping attack; adv_* = clean_*")
         elif args.attack_type == "patch":
+            attack_reference = gt_refs if has_attack_reference_terms(gt_refs) else clean_preds
             adv_images, history, patch_tensor, patch_meta = patch_attack(
                 model=model,
                 images=clean_images,
-                reference_preds=gt_refs,
+                reference_preds=attack_reference,
                 dtype=dtype,
                 steps=args.steps,
                 alpha=args.patch_alpha if args.patch_alpha is not None else args.alpha,
@@ -1930,10 +2381,11 @@ def process_scene(
                 weights=weights,
             )
         else:
+            attack_reference = gt_refs if has_attack_reference_terms(gt_refs) else clean_preds
             adv_images, history = pgd_attack(
                 model=model,
                 images=clean_images,
-                clean_preds=gt_refs,
+                clean_preds=attack_reference,
                 dtype=dtype,
                 steps=args.steps,
                 eps=args.eps,
@@ -1966,6 +2418,7 @@ def process_scene(
     else:
         metrics, eval_records = evaluate_prediction_pair(
             model=model,
+            image_paths=image_paths,
             clean_images=clean_images,
             adv_images=adv_images,
             clean_preds=clean_preds,
@@ -2001,6 +2454,7 @@ def process_scene(
         "weights": weights,
         "mode": "eval_saved_npz" if args.eval_saved_npz else ("attack_only" if args.attack_only else "attack_and_eval"),
         "eval_tasks": sorted(eval_tasks),
+        "eval_dataset": eval_dataset,
         "frame_sampling": {
             "method": frame_sampling_method,
             "seed": int(args.seed),
@@ -2160,6 +2614,8 @@ def aggregate_dataset_metrics(summaries: list[dict]) -> dict:
 def main() -> None:
     args = parse_args()
     eval_tasks = parse_eval_tasks(args.eval_tasks)
+    eval_dataset = infer_paper_eval_dataset(eval_tasks, args.eval_dataset)
+    validate_paper_eval_dataset(eval_tasks, eval_dataset)
     set_random_seeds(args.seed)
     if args.scene_dir is None and args.scenes_root is None:
         raise ValueError("Provide either --scene_dir for one scene or --scenes_root for batch mode.")
@@ -2186,7 +2642,7 @@ def main() -> None:
         else torch.float16
     )
     print(f"[cfg] device={device} dtype={dtype}")
-    print(f"[eval] tasks={','.join(sorted(eval_tasks))}")
+    print(f"[eval] tasks={','.join(sorted(eval_tasks))} dataset={eval_dataset}")
 
     needs_model = not args.eval_saved_npz or ("tracking" in eval_tasks and not args.skip_matching_eval)
     model = None
