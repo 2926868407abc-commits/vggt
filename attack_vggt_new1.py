@@ -34,9 +34,7 @@ import torch
 from PIL import Image
 from torchvision.transforms.functional import to_pil_image
 
-from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
-from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
 
 
@@ -69,6 +67,7 @@ EVALUATION_PROTOCOL = {
     ),
     "dataset_note": "This script loads CO3D GT; use DTU/ETH3D/ScanNet loaders for exact paper dataset splits.",
 }
+EVAL_TASKS = ("camera", "depth", "point", "tracking")
 
 try:
     import cv2
@@ -86,6 +85,29 @@ def require_cv2():
             "Install opencv-python or run in an environment that provides cv2."
         ) from CV2_IMPORT_ERROR
     return cv2
+
+
+def unproject_depth_map_to_point_map(*args, **kwargs):
+    from vggt.utils.geometry import unproject_depth_map_to_point_map as unproject
+
+    return unproject(*args, **kwargs)
+
+
+def parse_eval_tasks(value: str | list[str] | tuple[str, ...] | None) -> set[str]:
+    if value is None:
+        return set(EVAL_TASKS)
+    if isinstance(value, str):
+        parts = [part.strip().lower() for part in value.replace(";", ",").split(",") if part.strip()]
+    else:
+        parts = [str(part).strip().lower() for part in value if str(part).strip()]
+    if not parts or "all" in parts:
+        return set(EVAL_TASKS)
+
+    tasks = set(parts)
+    unknown = sorted(tasks.difference(EVAL_TASKS))
+    if unknown:
+        raise ValueError(f"Unknown eval task(s): {unknown}. Choose from: {', '.join(EVAL_TASKS)}")
+    return tasks
 
 
 def find_images(scene_dir: Path) -> list[str]:
@@ -131,7 +153,7 @@ def set_random_seeds(seed: int) -> None:
 
 
 def forward_vggt(
-    model: VGGT,
+    model: torch.nn.Module,
     images: torch.Tensor,
     dtype: torch.dtype,
     query_points: torch.Tensor | None = None,
@@ -141,7 +163,9 @@ def forward_vggt(
     return {k: v for k, v in preds.items() if torch.is_tensor(v)}
 
 
-def load_model(args: argparse.Namespace, device: torch.device) -> VGGT:
+def load_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
+    from vggt.models.vggt import VGGT
+
     ckpt_path = Path(args.ckpt)
     if ckpt_path.is_file():
         model = VGGT()
@@ -208,6 +232,77 @@ def load_clean_reference(
     if not refs:
         raise ValueError(f"No usable clean VGGT outputs found in {npz_path}")
     return refs
+
+
+def ensure_prediction_batch(array: np.ndarray, unbatched_ndim: int) -> np.ndarray:
+    if array.ndim == unbatched_ndim:
+        return array[None]
+    return array
+
+
+def load_prefixed_predictions_from_npz(
+    npz_path: Path,
+    prefix: str,
+    device: torch.device,
+    image_size_hw: tuple[int, int],
+) -> dict[str, torch.Tensor]:
+    data = np.load(npz_path)
+    refs: dict[str, torch.Tensor] = {}
+
+    def get(name: str) -> np.ndarray | None:
+        key = f"{prefix}{name}"
+        return data[key] if key in data else None
+
+    pose_enc = get("pose_enc")
+    extrinsic = get("extrinsic")
+    intrinsic = get("intrinsic")
+    if pose_enc is not None:
+        refs["pose_enc"] = torch.from_numpy(ensure_prediction_batch(pose_enc, 2).astype(np.float32)).to(device)
+    elif extrinsic is not None and intrinsic is not None:
+        extrinsic_t = torch.from_numpy(ensure_prediction_batch(extrinsic, 3).astype(np.float32)).to(device)
+        intrinsic_t = torch.from_numpy(ensure_prediction_batch(intrinsic, 3).astype(np.float32)).to(device)
+        refs["extrinsic"] = extrinsic_t
+        refs["intrinsic"] = intrinsic_t
+        refs["pose_enc"] = extri_intri_to_pose_encoding(extrinsic_t, intrinsic_t, image_size_hw)
+
+    depth = get("depth")
+    if depth is not None:
+        refs["depth"] = torch.from_numpy(ensure_prediction_batch(depth, 4).astype(np.float32)).to(device)
+    depth_conf = get("depth_conf")
+    if depth_conf is not None:
+        refs["depth_conf"] = torch.from_numpy(ensure_prediction_batch(depth_conf, 3).astype(np.float32)).to(device)
+
+    world_points = get("world_points")
+    if world_points is not None:
+        refs["world_points"] = torch.from_numpy(ensure_prediction_batch(world_points, 4).astype(np.float32)).to(device)
+    world_points_conf = get("world_points_conf")
+    if world_points_conf is not None:
+        refs["world_points_conf"] = torch.from_numpy(ensure_prediction_batch(world_points_conf, 3).astype(np.float32)).to(device)
+
+    track = get("track")
+    if track is not None:
+        refs["track"] = torch.from_numpy(ensure_prediction_batch(track, 3).astype(np.float32)).to(device)
+    vis = get("vis")
+    if vis is not None:
+        refs["vis"] = torch.from_numpy(ensure_prediction_batch(vis, 2).astype(np.float32)).to(device)
+    conf = get("conf")
+    if conf is not None:
+        refs["conf"] = torch.from_numpy(ensure_prediction_batch(conf, 2).astype(np.float32)).to(device)
+
+    if not refs:
+        raise ValueError(f"No {prefix} prediction tensors found in {npz_path}")
+    return refs
+
+
+def load_saved_attack_images(npz_path: Path, device: torch.device) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    data = np.load(npz_path)
+    clean_images = None
+    adv_images = None
+    if "clean_images" in data:
+        clean_images = torch.from_numpy(data["clean_images"].astype(np.float32)).to(device)
+    if "adv_images" in data:
+        adv_images = torch.from_numpy(data["adv_images"].astype(np.float32)).to(device)
+    return clean_images, adv_images
 
 
 def read_clean_image_names(npz_path: Path | None) -> list[str] | None:
@@ -352,12 +447,35 @@ def preprocess_gt_like_vggt_input(
     return depth.astype(np.float32), mask.astype(bool), intrinsics.astype(np.float32)
 
 
+def preprocess_intrinsics_like_vggt_input(
+    intrinsics: np.ndarray,
+    source_hw: tuple[int, int],
+    target_hw: tuple[int, int],
+) -> np.ndarray:
+    target_h, target_w = target_hw
+    orig_h, orig_w = source_hw
+    new_w = target_w
+    new_h = round(orig_h * (new_w / orig_w) / 14) * 14
+    scale = new_w / orig_w
+
+    intrinsics = intrinsics.copy()
+    intrinsics[:2, :] *= scale
+    if new_h > target_h:
+        start_y = (new_h - target_h) // 2
+        intrinsics[1, 2] -= start_y
+    elif new_h < target_h:
+        pad_top = (target_h - new_h) // 2
+        intrinsics[1, 2] += pad_top
+    return intrinsics.astype(np.float32)
+
+
 def load_co3d_gt_reference(
     gt_root: Path,
     scene_dir: Path,
     image_paths: list[str],
     device: torch.device,
     image_size_hw: tuple[int, int],
+    load_geometry: bool = True,
 ) -> dict[str, torch.Tensor]:
     category, sequence_name = parse_flat_scene_name(scene_dir)
     annotations = load_co3d_category_annotations(gt_root, category)
@@ -386,36 +504,47 @@ def load_co3d_gt_reference(
         extrinsic = co3d_viewpoint_to_opencv_extrinsic(anno["viewpoint"])
         intrinsic = co3d_ndc_intrinsics_to_pixels(anno["viewpoint"], (int(image_height), int(image_width)))
 
-        depth_rel = anno["depth"]["path"]
-        mask_rel = anno["depth"].get("mask_path") or anno.get("mask", {}).get("path")
-        depth_path = resolve_co3d_asset(gt_root, category, depth_rel)
-        mask_path = resolve_co3d_asset(gt_root, category, mask_rel)
-        depth = read_co3d_depth(depth_path, anno["depth"].get("scale_adjustment"))
-        cv = require_cv2()
-        mask = cv.imread(str(mask_path), cv.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise FileNotFoundError(f"Could not read depth mask: {mask_path}")
-        mask = mask > 128
+        if load_geometry:
+            depth_rel = anno["depth"]["path"]
+            mask_rel = anno["depth"].get("mask_path") or anno.get("mask", {}).get("path")
+            depth_path = resolve_co3d_asset(gt_root, category, depth_rel)
+            mask_path = resolve_co3d_asset(gt_root, category, mask_rel)
+            depth = read_co3d_depth(depth_path, anno["depth"].get("scale_adjustment"))
+            cv = require_cv2()
+            mask = cv.imread(str(mask_path), cv.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise FileNotFoundError(f"Could not read depth mask: {mask_path}")
+            mask = mask > 128
 
-        depth, mask, intrinsic = preprocess_gt_like_vggt_input(depth, mask, intrinsic, image_size_hw)
-        world = unproject_depth_map_to_point_map(depth[None, ..., None], extrinsic[None], intrinsic[None])[0]
-
-        depths.append(depth)
-        masks.append(mask)
+            depth, mask, intrinsic = preprocess_gt_like_vggt_input(depth, mask, intrinsic, image_size_hw)
+            world = unproject_depth_map_to_point_map(depth[None, ..., None], extrinsic[None], intrinsic[None])[0]
+            depths.append(depth)
+            masks.append(mask)
+            world_points.append(world)
+        else:
+            intrinsic = preprocess_intrinsics_like_vggt_input(
+                intrinsic,
+                (int(image_height), int(image_width)),
+                image_size_hw,
+            )
         extrinsics.append(extrinsic)
         intrinsics.append(intrinsic)
-        world_points.append(world)
 
     extrinsics_t = torch.from_numpy(np.stack(extrinsics).astype(np.float32)).to(device).unsqueeze(0)
     intrinsics_t = torch.from_numpy(np.stack(intrinsics).astype(np.float32)).to(device).unsqueeze(0)
     refs = {
         "pose_enc": extri_intri_to_pose_encoding(extrinsics_t, intrinsics_t, image_size_hw),
-        "depth": torch.from_numpy(np.stack(depths).astype(np.float32)).to(device).unsqueeze(0)[..., None],
-        "world_points": torch.from_numpy(np.stack(world_points).astype(np.float32)).to(device).unsqueeze(0),
-        "point_mask": torch.from_numpy(np.stack(masks).astype(bool)).to(device).unsqueeze(0),
         "extrinsic": extrinsics_t,
         "intrinsic": intrinsics_t,
     }
+    if load_geometry:
+        refs.update(
+            {
+                "depth": torch.from_numpy(np.stack(depths).astype(np.float32)).to(device).unsqueeze(0)[..., None],
+                "world_points": torch.from_numpy(np.stack(world_points).astype(np.float32)).to(device).unsqueeze(0),
+                "point_mask": torch.from_numpy(np.stack(masks).astype(bool)).to(device).unsqueeze(0),
+            }
+        )
     return refs
 
 
@@ -469,7 +598,7 @@ def attack_loss(
 
 
 def pgd_attack(
-    model: VGGT,
+    model: torch.nn.Module,
     images: torch.Tensor,
     clean_preds: dict[str, torch.Tensor],
     dtype: torch.dtype,
@@ -552,7 +681,7 @@ def apply_adversarial_patch(
 
 
 def patch_attack(
-    model: VGGT,
+    model: torch.nn.Module,
     images: torch.Tensor,
     reference_preds: dict[str, torch.Tensor],
     dtype: torch.dtype,
@@ -909,7 +1038,13 @@ def chamfer_metrics(
     }
 
 
-def vggt_paper_metrics(
+def reference_point_mask(reference: dict[str, torch.Tensor]) -> np.ndarray | None:
+    if "point_mask" not in reference:
+        return None
+    return reference["point_mask"].detach().cpu().numpy()[0].astype(bool)
+
+
+def depth_paper_metrics(
     reference: dict[str, torch.Tensor],
     pred: dict[str, torch.Tensor],
     image_size_hw: tuple[int, int],
@@ -917,13 +1052,9 @@ def vggt_paper_metrics(
     device: torch.device,
 ) -> dict[str, float | str]:
     metrics: dict[str, float | str] = {}
-    metrics.update(camera_paper_metrics(reference, pred, image_size_hw))
-
     reference_np = tensor_to_numpy(reference, image_size_hw)
     pred_np = tensor_to_numpy(pred, image_size_hw)
-    reference_mask = None
-    if "point_mask" in reference:
-        reference_mask = reference["point_mask"].detach().cpu().numpy()[0].astype(bool)
+    reference_mask = reference_point_mask(reference)
 
     if all(k in reference_np for k in ("depth", "extrinsic", "intrinsic")) and all(
         k in pred_np for k in ("depth", "extrinsic", "intrinsic")
@@ -968,6 +1099,22 @@ def vggt_paper_metrics(
             )
         else:
             metrics["depth_align_sim3_status"] = "skipped_insufficient_correspondences"
+    else:
+        metrics["depth_status"] = "skipped_missing_depth_or_camera"
+    return metrics
+
+
+def point_paper_metrics(
+    reference: dict[str, torch.Tensor],
+    pred: dict[str, torch.Tensor],
+    image_size_hw: tuple[int, int],
+    max_points: int,
+    device: torch.device,
+) -> dict[str, float | str]:
+    metrics: dict[str, float | str] = {}
+    reference_np = tensor_to_numpy(reference, image_size_hw)
+    pred_np = tensor_to_numpy(pred, image_size_hw)
+    reference_mask = reference_point_mask(reference)
 
     if "world_points" in reference_np and "world_points" in pred_np:
         wp_sim3 = estimate_sim3_from_paired_pointmaps(
@@ -992,8 +1139,30 @@ def vggt_paper_metrics(
             )
         else:
             metrics["point_status"] = "skipped_insufficient_correspondences"
+    else:
+        metrics["point_status"] = "skipped_missing_pointmap"
+    return metrics
 
-    metrics["tracking_image_matching"] = "not_computed"
+
+def vggt_paper_metrics(
+    reference: dict[str, torch.Tensor],
+    pred: dict[str, torch.Tensor],
+    image_size_hw: tuple[int, int],
+    max_points: int,
+    device: torch.device,
+    eval_tasks: set[str] | None = None,
+) -> dict[str, float | str]:
+    tasks = eval_tasks or {"camera", "depth", "point"}
+    metrics: dict[str, float | str] = {}
+    if "camera" in tasks:
+        metrics.update(camera_paper_metrics(reference, pred, image_size_hw))
+    if "depth" in tasks:
+        metrics.update(depth_paper_metrics(reference, pred, image_size_hw, max_points, device))
+    if "point" in tasks:
+        metrics.update(point_paper_metrics(reference, pred, image_size_hw, max_points, device))
+
+    if "tracking" in tasks:
+        metrics["tracking_image_matching"] = "not_computed"
     return metrics
 
 
@@ -1003,31 +1172,37 @@ def vggt_paper_records(
     image_size_hw: tuple[int, int],
     max_points: int,
     device: torch.device,
+    eval_tasks: set[str] | None = None,
 ) -> dict:
-    metrics = vggt_paper_metrics(reference, pred, image_size_hw, max_points, device)
+    tasks = eval_tasks or {"camera", "depth", "point"}
+    metrics = vggt_paper_metrics(reference, pred, image_size_hw, max_points, device, eval_tasks=tasks)
     depth_keys = [
         f"depth_align_{align}_{name}"
         for align in ("none", "sim3")
         for name in ("accuracy", "completeness", "overall")
     ]
-    return {
-        "camera_pair_errors": camera_pair_error_records(reference, pred, image_size_hw),
-        "depth_scene_metrics": {
+    records: dict = {}
+    if "camera" in tasks:
+        records["camera_pair_errors"] = camera_pair_error_records(reference, pred, image_size_hw)
+    if "depth" in tasks:
+        records["depth_scene_metrics"] = {
             key: metrics[key]
             for key in depth_keys
             if key in metrics
-        },
-        "point_scene_metrics": {
+        }
+    if "point" in tasks:
+        records["point_scene_metrics"] = {
             key: metrics[key]
             for key in ("point_accuracy", "point_completeness", "point_overall")
             if key in metrics
-        },
-        "tracking_image_matching_pair_errors": {
+        }
+    if "tracking" in tasks:
+        records["tracking_image_matching_pair_errors"] = {
             "rotation_deg": [],
             "translation_deg": [],
             "status": "not_computed",
-        },
-    }
+        }
+    return records
 
 
 def relative_pose_from_extrinsics_np(extri_i: np.ndarray, extri_j: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1145,7 +1320,7 @@ def build_pair_indices(num_frames: int, max_pairs: int) -> list[tuple[int, int]]
 
 
 def tracking_image_matching_records(
-    model: VGGT,
+    model: torch.nn.Module,
     images: torch.Tensor,
     reference: dict[str, torch.Tensor],
     dtype: torch.dtype,
@@ -1487,6 +1662,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save_adv_images", action="store_true", help="Save adversarial input frames.")
     parser.add_argument(
+        "--eval_tasks",
+        default="all",
+        help="Comma-separated eval tasks to run: camera,depth,point,tracking, or all.",
+    )
+    parser.add_argument(
+        "--attack_only",
+        action="store_true",
+        help="Run the attack and save outputs, but skip clean/attack evaluation metrics.",
+    )
+    parser.add_argument(
+        "--eval_saved_npz",
+        default=None,
+        help="Skip the attack and evaluate a saved pgd_vggt_outputs.npz from a previous run.",
+    )
+    parser.add_argument(
         "--run_clean_forward",
         action="store_true",
         help="Ignore --clean_npz and run a clean VGGT forward as the reference.",
@@ -1500,88 +1690,36 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def process_scene(
-    model: VGGT,
-    scene_dir: Path,
-    out_dir: Path,
-    clean_npz: Path | None,
+def set_tracking_eval_status(records: dict, metrics: dict, status: str) -> None:
+    records["tracking_image_matching_pair_errors"] = {
+        "rotation_deg": [],
+        "translation_deg": [],
+        "status": status,
+    }
+    metrics["tracking_image_matching"] = status
+
+
+def evaluate_prediction_pair(
+    *,
+    model: torch.nn.Module | None,
+    clean_images: torch.Tensor,
+    adv_images: torch.Tensor,
+    clean_preds: dict[str, torch.Tensor],
+    adv_preds: dict[str, torch.Tensor],
+    gt_refs: dict[str, torch.Tensor],
+    image_size_hw: tuple[int, int],
     args: argparse.Namespace,
     device: torch.device,
     dtype: torch.dtype,
-) -> dict:
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    scene_seed = derive_scene_seed(args.seed, scene_dir.name)
-    image_paths, frame_indices = align_image_paths_to_clean(scene_dir, clean_npz, args.max_frames, scene_seed)
-    if not image_paths:
-        raise ValueError(f"No images found under {scene_dir}")
-
-    clean_images = load_and_preprocess_images(image_paths).to(device)
-    image_size_hw = tuple(clean_images.shape[-2:])
-    gt_refs = load_co3d_gt_reference(Path(args.gt_root), scene_dir, image_paths, device, image_size_hw)
-    print(f"[gt] loaded CO3D real GT from {args.gt_root}")
-
-    if clean_npz is not None and not args.run_clean_forward:
-        clean_preds = load_clean_reference(clean_npz, device, image_size_hw, frame_indices=frame_indices)
-        print(f"[clean] loaded reference outputs from {clean_npz}")
-    else:
-        t0 = time.time()
-        with torch.no_grad():
-            clean_preds_full = forward_vggt(model, clean_images, dtype)
-        clean_preds = detach_predictions(clean_preds_full)
-        print(f"[clean] forward reference done in {time.time() - t0:.2f}s")
-
-    weights = {
-        "depth": args.depth_weight,
-        "pose": args.pose_weight,
-        "points": args.points_weight,
-    }
-    patch_tensor = None
-    patch_meta = None
-    history: list[dict[str, float]] = []
-    if args.eval_only_clean:
-        # Skip the attack entirely; reuse clean images/predictions in place of adv ones
-        # so that downstream eval/save logic stays identical.
-        adv_images = clean_images.detach().clone()
-        adv_preds = {k: v.detach().clone() for k, v in clean_preds.items()}
-        print("[eval_only_clean] skipping attack; adv_* = clean_*")
-    elif args.attack_type == "patch":
-        adv_images, history, patch_tensor, patch_meta = patch_attack(
-            model=model,
-            images=clean_images,
-            reference_preds=gt_refs,
-            dtype=dtype,
-            steps=args.steps,
-            alpha=args.patch_alpha if args.patch_alpha is not None else args.alpha,
-            patch_size=args.patch_size,
-            patch_x=args.patch_x,
-            patch_y=args.patch_y,
-            weights=weights,
-        )
-    else:
-        adv_images, history = pgd_attack(
-            model=model,
-            images=clean_images,
-            clean_preds=gt_refs,
-            dtype=dtype,
-            steps=args.steps,
-            eps=args.eps,
-            alpha=args.alpha,
-            random_start=not args.no_random_start,
-            weights=weights,
-        )
-
-    if not args.eval_only_clean:
-        track_query = clean_preds["track"][:, 0] if "track" in clean_preds else None
-        with torch.no_grad():
-            adv_preds_full = forward_vggt(model, adv_images, dtype, query_points=track_query)
-        adv_preds = detach_predictions(adv_preds_full)
+    eval_tasks: set[str],
+) -> tuple[dict, dict]:
     clean_gt_metrics = vggt_paper_metrics(
         gt_refs,
         clean_preds,
         image_size_hw,
         max_points=args.metric_max_points,
         device=device,
+        eval_tasks=eval_tasks,
     )
     adv_gt_metrics = vggt_paper_metrics(
         gt_refs,
@@ -1589,6 +1727,7 @@ def process_scene(
         image_size_hw,
         max_points=args.metric_max_points,
         device=device,
+        eval_tasks=eval_tasks,
     )
     clean_gt_records = vggt_paper_records(
         gt_refs,
@@ -1596,6 +1735,7 @@ def process_scene(
         image_size_hw,
         max_points=args.metric_max_points,
         device=device,
+        eval_tasks=eval_tasks,
     )
     adv_gt_records = vggt_paper_records(
         gt_refs,
@@ -1603,6 +1743,7 @@ def process_scene(
         image_size_hw,
         max_points=args.metric_max_points,
         device=device,
+        eval_tasks=eval_tasks,
     )
     clean_adv_metrics = compare_predictions(clean_preds, adv_preds, clean_images, adv_images)
     clean_adv_records = vggt_paper_records(
@@ -1611,76 +1752,234 @@ def process_scene(
         image_size_hw,
         max_points=args.metric_max_points,
         device=device,
+        eval_tasks=eval_tasks,
     )
 
-    if args.skip_matching_eval:
-        clean_gt_records["tracking_image_matching_pair_errors"]["status"] = "skipped_by_user"
-        adv_gt_records["tracking_image_matching_pair_errors"]["status"] = "skipped_by_user"
-        clean_gt_metrics["tracking_image_matching"] = "skipped_by_user"
-        adv_gt_metrics["tracking_image_matching"] = "skipped_by_user"
+    if "tracking" in eval_tasks:
+        if args.skip_matching_eval:
+            set_tracking_eval_status(clean_gt_records, clean_gt_metrics, "skipped_by_user")
+            set_tracking_eval_status(adv_gt_records, adv_gt_metrics, "skipped_by_user")
+        elif model is None:
+            set_tracking_eval_status(clean_gt_records, clean_gt_metrics, "skipped_missing_model")
+            set_tracking_eval_status(adv_gt_records, adv_gt_metrics, "skipped_missing_model")
+        else:
+            print("\n[tracking/image matching: clean vs real GT]")
+            clean_matching_records = tracking_image_matching_records(
+                model=model,
+                images=clean_images,
+                reference=gt_refs,
+                dtype=dtype,
+                max_keypoints=args.matching_max_keypoints,
+                detection_threshold=args.matching_det_thresh,
+                ransac_thresh=args.matching_ransac_thresh,
+                min_inliers=args.matching_min_inliers,
+                min_visibility=args.matching_min_vis,
+                min_confidence=args.matching_min_conf,
+                max_pairs=args.matching_max_pairs,
+            )
+            clean_gt_records["tracking_image_matching_pair_errors"] = clean_matching_records
+            add_tracking_matching_metrics(clean_gt_metrics, clean_matching_records)
+
+            print("\n[tracking/image matching: pgd vs real GT]")
+            adv_matching_records = tracking_image_matching_records(
+                model=model,
+                images=adv_images,
+                reference=gt_refs,
+                dtype=dtype,
+                max_keypoints=args.matching_max_keypoints,
+                detection_threshold=args.matching_det_thresh,
+                ransac_thresh=args.matching_ransac_thresh,
+                min_inliers=args.matching_min_inliers,
+                min_visibility=args.matching_min_vis,
+                min_confidence=args.matching_min_conf,
+                max_pairs=args.matching_max_pairs,
+            )
+            adv_gt_records["tracking_image_matching_pair_errors"] = adv_matching_records
+            add_tracking_matching_metrics(adv_gt_metrics, adv_matching_records)
+
+    metrics = {
+        "clean_vs_gt": clean_gt_metrics,
+        "pgd_vs_gt": adv_gt_metrics,
+        "clean_vs_pgd": clean_adv_metrics,
+    }
+    records = {
+        "clean_vs_gt": clean_gt_records,
+        "pgd_vs_gt": adv_gt_records,
+        "clean_vs_pgd": clean_adv_records,
+    }
+    return metrics, records
+
+
+def print_metric_group(title: str, metrics: dict) -> None:
+    print(f"\n[{title}]")
+    if not metrics:
+        print("  skipped")
+        return
+    for key, value in metrics.items():
+        if isinstance(value, float):
+            print(f"  {key}: {value:.6f}")
+        else:
+            print(f"  {key}: {value}")
+
+
+def load_saved_scene_predictions(
+    scene_dir: Path,
+    npz_path: Path,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[list[str], torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor], tuple[int, int]]:
+    scene_seed = derive_scene_seed(args.seed, scene_dir.name)
+    image_paths, _ = align_image_paths_to_clean(scene_dir, npz_path, 0, scene_seed)
+    clean_images, adv_images = load_saved_attack_images(npz_path, device)
+    if clean_images is None or adv_images is None:
+        raise ValueError(f"{npz_path} must contain clean_images and adv_images for saved evaluation")
+    image_size_hw = tuple(clean_images.shape[-2:])
+    clean_preds = load_prefixed_predictions_from_npz(npz_path, "clean_", device, image_size_hw)
+    adv_preds = load_prefixed_predictions_from_npz(npz_path, "adv_", device, image_size_hw)
+    return image_paths, clean_images, adv_images, clean_preds, adv_preds, image_size_hw
+
+
+def process_scene(
+    model: torch.nn.Module | None,
+    scene_dir: Path,
+    out_dir: Path,
+    clean_npz: Path | None,
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    eval_tasks = parse_eval_tasks(args.eval_tasks)
+    scene_seed = derive_scene_seed(args.seed, scene_dir.name)
+
+    patch_tensor = None
+    patch_meta = None
+    history: list[dict[str, float]] = []
+    weights = {
+        "depth": args.depth_weight,
+        "pose": args.pose_weight,
+        "points": args.points_weight,
+    }
+
+    if args.eval_saved_npz:
+        frame_sampling_method = "saved_npz_image_paths"
+        saved_npz = Path(args.eval_saved_npz)
+        image_paths, clean_images, adv_images, clean_preds, adv_preds, image_size_hw = load_saved_scene_predictions(
+            scene_dir,
+            saved_npz,
+            args,
+            device,
+        )
+        frame_indices = np.arange(len(image_paths), dtype=int)
+        gt_refs = load_co3d_gt_reference(
+            Path(args.gt_root),
+            scene_dir,
+            image_paths,
+            device,
+            image_size_hw,
+            load_geometry=bool(eval_tasks & {"depth", "point"}),
+        )
+        print(f"[eval_saved_npz] loaded predictions from {saved_npz}")
+        print(f"[gt] loaded CO3D real GT from {args.gt_root}")
     else:
-        print("\n[tracking/image matching: clean vs real GT]")
-        clean_matching_records = tracking_image_matching_records(
-            model=model,
-            images=clean_images,
-            reference=gt_refs,
-            dtype=dtype,
-            max_keypoints=args.matching_max_keypoints,
-            detection_threshold=args.matching_det_thresh,
-            ransac_thresh=args.matching_ransac_thresh,
-            min_inliers=args.matching_min_inliers,
-            min_visibility=args.matching_min_vis,
-            min_confidence=args.matching_min_conf,
-            max_pairs=args.matching_max_pairs,
+        frame_sampling_method = "random_without_replacement"
+        if model is None:
+            raise ValueError("A model is required unless --eval_saved_npz is used without tracking eval.")
+
+        image_paths, frame_indices = align_image_paths_to_clean(scene_dir, clean_npz, args.max_frames, scene_seed)
+        if not image_paths:
+            raise ValueError(f"No images found under {scene_dir}")
+
+        clean_images = load_and_preprocess_images(image_paths).to(device)
+        image_size_hw = tuple(clean_images.shape[-2:])
+        gt_refs = load_co3d_gt_reference(
+            Path(args.gt_root),
+            scene_dir,
+            image_paths,
+            device,
+            image_size_hw,
+            load_geometry=(not args.eval_only_clean) or bool(eval_tasks & {"depth", "point"}),
         )
-        clean_gt_records["tracking_image_matching_pair_errors"] = clean_matching_records
-        add_tracking_matching_metrics(clean_gt_metrics, clean_matching_records)
+        print(f"[gt] loaded CO3D real GT from {args.gt_root}")
 
-        print("\n[tracking/image matching: pgd vs real GT]")
-        adv_matching_records = tracking_image_matching_records(
-            model=model,
-            images=adv_images,
-            reference=gt_refs,
-            dtype=dtype,
-            max_keypoints=args.matching_max_keypoints,
-            detection_threshold=args.matching_det_thresh,
-            ransac_thresh=args.matching_ransac_thresh,
-            min_inliers=args.matching_min_inliers,
-            min_visibility=args.matching_min_vis,
-            min_confidence=args.matching_min_conf,
-            max_pairs=args.matching_max_pairs,
+        if clean_npz is not None and not args.run_clean_forward:
+            clean_preds = load_clean_reference(clean_npz, device, image_size_hw, frame_indices=frame_indices)
+            print(f"[clean] loaded reference outputs from {clean_npz}")
+        else:
+            t0 = time.time()
+            with torch.no_grad():
+                clean_preds_full = forward_vggt(model, clean_images, dtype)
+            clean_preds = detach_predictions(clean_preds_full)
+            print(f"[clean] forward reference done in {time.time() - t0:.2f}s")
+
+        if args.eval_only_clean:
+            adv_images = clean_images.detach().clone()
+            adv_preds = {k: v.detach().clone() for k, v in clean_preds.items()}
+            print("[eval_only_clean] skipping attack; adv_* = clean_*")
+        elif args.attack_type == "patch":
+            adv_images, history, patch_tensor, patch_meta = patch_attack(
+                model=model,
+                images=clean_images,
+                reference_preds=gt_refs,
+                dtype=dtype,
+                steps=args.steps,
+                alpha=args.patch_alpha if args.patch_alpha is not None else args.alpha,
+                patch_size=args.patch_size,
+                patch_x=args.patch_x,
+                patch_y=args.patch_y,
+                weights=weights,
+            )
+        else:
+            adv_images, history = pgd_attack(
+                model=model,
+                images=clean_images,
+                clean_preds=gt_refs,
+                dtype=dtype,
+                steps=args.steps,
+                eps=args.eps,
+                alpha=args.alpha,
+                random_start=not args.no_random_start,
+                weights=weights,
+            )
+
+        if not args.eval_only_clean:
+            track_query = clean_preds["track"][:, 0] if "track" in clean_preds else None
+            with torch.no_grad():
+                adv_preds_full = forward_vggt(model, adv_images, dtype, query_points=track_query)
+            adv_preds = detach_predictions(adv_preds_full)
+
+        clean_np = tensor_to_numpy(clean_preds, image_size_hw)
+        adv_np = tensor_to_numpy(adv_preds, image_size_hw)
+        np.savez_compressed(
+            out_dir / "pgd_vggt_outputs.npz",
+            image_paths=np.array([Path(p).name for p in image_paths]),
+            clean_images=clean_images.detach().cpu().numpy().astype(np.float16),
+            adv_images=adv_images.detach().cpu().numpy().astype(np.float16),
+            **{f"clean_{k}": v for k, v in clean_np.items()},
+            **{f"adv_{k}": v for k, v in adv_np.items()},
         )
-        adv_gt_records["tracking_image_matching_pair_errors"] = adv_matching_records
-        add_tracking_matching_metrics(adv_gt_metrics, adv_matching_records)
 
-    print("\n[clean vs real GT]")
-    for key, value in clean_gt_metrics.items():
-        if isinstance(value, float):
-            print(f"  {key}: {value:.6f}")
-        else:
-            print(f"  {key}: {value}")
-
-    print("\n[pgd vs real GT]")
-    for key, value in adv_gt_metrics.items():
-        if isinstance(value, float):
-            print(f"  {key}: {value:.6f}")
-        else:
-            print(f"  {key}: {value}")
-
-    print("\n[clean vs pgd]")
-    for key, value in clean_adv_metrics.items():
-        print(f"  {key}: {value:.6f}")
-
-    clean_np = tensor_to_numpy(clean_preds, image_size_hw)
-    adv_np = tensor_to_numpy(adv_preds, image_size_hw)
-    np.savez_compressed(
-        out_dir / "pgd_vggt_outputs.npz",
-        image_paths=np.array([Path(p).name for p in image_paths]),
-        clean_images=clean_images.detach().cpu().numpy().astype(np.float16),
-        adv_images=adv_images.detach().cpu().numpy().astype(np.float16),
-        **{f"clean_{k}": v for k, v in clean_np.items()},
-        **{f"adv_{k}": v for k, v in adv_np.items()},
-    )
+    if args.attack_only and not args.eval_saved_npz:
+        metrics = {"clean_vs_gt": {}, "pgd_vs_gt": {}, "clean_vs_pgd": {}}
+        eval_records = {"clean_vs_gt": {}, "pgd_vs_gt": {}, "clean_vs_pgd": {}}
+        print("\n[attack_only] saved adversarial outputs; skipped evaluation")
+    else:
+        metrics, eval_records = evaluate_prediction_pair(
+            model=model,
+            clean_images=clean_images,
+            adv_images=adv_images,
+            clean_preds=clean_preds,
+            adv_preds=adv_preds,
+            gt_refs=gt_refs,
+            image_size_hw=image_size_hw,
+            args=args,
+            device=device,
+            dtype=dtype,
+            eval_tasks=eval_tasks,
+        )
+        print_metric_group("clean vs real GT", metrics["clean_vs_gt"])
+        print_metric_group("pgd vs real GT", metrics["pgd_vs_gt"])
+        print_metric_group("clean vs pgd", metrics["clean_vs_pgd"])
 
     if "__" in scene_dir.name:
         scene_category, scene_sequence = scene_dir.name.split("__", 1)
@@ -1700,33 +1999,28 @@ def process_scene(
         "patch": patch_meta,
         "random_start": not args.no_random_start,
         "weights": weights,
+        "mode": "eval_saved_npz" if args.eval_saved_npz else ("attack_only" if args.attack_only else "attack_and_eval"),
+        "eval_tasks": sorted(eval_tasks),
         "frame_sampling": {
-            "method": "random_without_replacement",
+            "method": frame_sampling_method,
             "seed": int(args.seed),
             "scene_seed": int(scene_seed),
             "frame_indices": frame_indices.astype(int).tolist(),
         },
         "evaluation_protocol": EVALUATION_PROTOCOL,
-        "metrics": {
-            "clean_vs_gt": clean_gt_metrics,
-            "pgd_vs_gt": adv_gt_metrics,
-            "clean_vs_pgd": clean_adv_metrics,
-        },
-        "eval_records": {
-            "clean_vs_gt": clean_gt_records,
-            "pgd_vs_gt": adv_gt_records,
-            "clean_vs_pgd": clean_adv_records,
-        },
+        "metrics": metrics,
+        "eval_records": eval_records,
         "history": history,
         "image_paths": [str(p) for p in image_paths],
     }
     with open(out_dir / "pgd_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    save_delta_preview(clean_images, adv_images, out_dir)
-    save_patch_image(patch_tensor, out_dir)
-    if args.save_adv_images:
-        save_adv_images(adv_images, image_paths, out_dir)
+    if not args.eval_saved_npz:
+        save_delta_preview(clean_images, adv_images, out_dir)
+        save_patch_image(patch_tensor, out_dir)
+        if args.save_adv_images:
+            save_adv_images(adv_images, image_paths, out_dir)
 
     print(f"\n[done] saved -> {out_dir}")
     return summary
@@ -1865,12 +2159,24 @@ def aggregate_dataset_metrics(summaries: list[dict]) -> dict:
 
 def main() -> None:
     args = parse_args()
+    eval_tasks = parse_eval_tasks(args.eval_tasks)
     set_random_seeds(args.seed)
     if args.scene_dir is None and args.scenes_root is None:
         raise ValueError("Provide either --scene_dir for one scene or --scenes_root for batch mode.")
     if args.scene_dir is not None and args.scenes_root is not None:
         raise ValueError("Use either --scene_dir or --scenes_root, not both.")
-    if args.scenes_root is not None and args.clean_output_root is None and not args.run_clean_forward:
+    if args.eval_saved_npz and args.scenes_root is not None:
+        raise ValueError("--eval_saved_npz is single-scene mode; use --scene_dir and run it once per saved attack output.")
+    if args.eval_saved_npz and args.attack_only:
+        raise ValueError("--attack_only and --eval_saved_npz are mutually exclusive.")
+    if args.attack_only and args.eval_only_clean:
+        raise ValueError("--attack_only and --eval_only_clean are mutually exclusive.")
+    if (
+        args.scenes_root is not None
+        and args.clean_output_root is None
+        and not args.run_clean_forward
+        and not args.eval_saved_npz
+    ):
         raise ValueError("Batch mode needs --clean_output_root unless --run_clean_forward is set.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1880,11 +2186,15 @@ def main() -> None:
         else torch.float16
     )
     print(f"[cfg] device={device} dtype={dtype}")
-    print(f"[model] loading {args.ckpt}")
+    print(f"[eval] tasks={','.join(sorted(eval_tasks))}")
 
-    model = load_model(args, device)
-    for param in model.parameters():
-        param.requires_grad_(False)
+    needs_model = not args.eval_saved_npz or ("tracking" in eval_tasks and not args.skip_matching_eval)
+    model = None
+    if needs_model:
+        print(f"[model] loading {args.ckpt}")
+        model = load_model(args, device)
+        for param in model.parameters():
+            param.requires_grad_(False)
 
     if args.scene_dir is not None:
         scene_dir = Path(args.scene_dir)
