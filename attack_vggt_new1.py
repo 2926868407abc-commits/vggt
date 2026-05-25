@@ -439,6 +439,15 @@ def resolve_dtu_gt_ply(args: argparse.Namespace, scene_dir: Path) -> Path:
     raise FileNotFoundError(f"Could not locate DTU GT point cloud. Tried: {[str(p) for p in candidates]}")
 
 
+def resolve_dtu_scan_id(args: argparse.Namespace, scene_dir: Path) -> int:
+    if args.scan_id is not None:
+        return int(args.scan_id)
+    digits = "".join(ch for ch in scene_dir.name if ch.isdigit())
+    if digits:
+        return int(digits)
+    raise ValueError("--eval_dataset dtu needs --scan_id unless the scene directory name contains the scan id")
+
+
 def resolve_eth3d_gt_ply(args: argparse.Namespace, scene_dir: Path) -> Path:
     if args.gt_pointcloud:
         return Path(args.gt_pointcloud)
@@ -467,6 +476,81 @@ def load_gt_pointcloud_reference(
         "gt_point_cloud": torch.from_numpy(points.astype(np.float32)),
         "pointcloud_alignment": alignment,
         "gt_point_cloud_path": str(ply_path),
+    }
+
+
+def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    if voxel_size <= 0 or len(points) == 0:
+        return points
+    voxels = np.floor(points / voxel_size).astype(np.int64)
+    _, indices = np.unique(voxels, axis=0, return_index=True)
+    return points[np.sort(indices)]
+
+
+def dtu_official_chamfer_metrics(
+    pred_points: np.ndarray,
+    reference: dict,
+    prefix: str,
+    device: torch.device,
+) -> dict[str, float | str]:
+    try:
+        from scipy.io import loadmat
+        from scipy.spatial import cKDTree
+    except Exception as exc:
+        return {f"{prefix}_status": f"skipped_missing_scipy_for_dtu_official_eval: {exc}"}
+
+    eval_root = Path(str(reference["dtu_eval_root"]))
+    scan_id = int(reference["dtu_scan_id"])
+    patch = float(reference.get("dtu_patch_size", 60.0))
+    max_dist = float(reference.get("dtu_max_dist", 20.0))
+    downsample = float(reference.get("dtu_downsample", 0.2))
+
+    obs_path = eval_root / "ObsMask" / f"ObsMask{scan_id}_10.mat"
+    plane_path = eval_root / "ObsMask" / f"Plane{scan_id}.mat"
+    stl_path = eval_root / "Points" / "stl" / f"stl{scan_id:03d}_total.ply"
+    if not obs_path.exists():
+        return {f"{prefix}_status": f"missing_dtu_obsmask:{obs_path}"}
+    if not stl_path.exists():
+        return {f"{prefix}_status": f"missing_dtu_stl:{stl_path}"}
+
+    pred = pred_points.reshape(-1, 3).astype(np.float32)
+    pred = pred[np.isfinite(pred).all(axis=1)]
+    pred = voxel_downsample(pred, downsample)
+
+    obs = loadmat(obs_path)
+    obs_mask = obs["ObsMask"].astype(bool)
+    bb = obs["BB"].astype(np.float32)
+    res = float(np.asarray(obs["Res"]).reshape(-1)[0])
+
+    inbound = ((pred >= bb[:1] - patch) & (pred < bb[1:] + patch * 2)).sum(axis=-1) == 3
+    pred_in = pred[inbound]
+    grid = np.rint((pred_in - bb[:1]) / res).astype(np.int32)
+    grid_inbound = ((grid >= 0) & (grid < np.asarray(obs_mask.shape)[None])).sum(axis=-1) == 3
+    grid_valid = grid[grid_inbound]
+    pred_valid = pred_in[grid_inbound]
+    pred_valid = pred_valid[obs_mask[grid_valid[:, 0], grid_valid[:, 1], grid_valid[:, 2]]]
+    if len(pred_valid) == 0:
+        return {f"{prefix}_status": "skipped_no_pred_points_inside_dtu_obsmask"}
+
+    stl = read_ply_xyz(stl_path).astype(np.float32)
+    if plane_path.exists():
+        plane = loadmat(plane_path)["P"].reshape(-1).astype(np.float32)
+        stl_h = np.concatenate([stl, np.ones((len(stl), 1), dtype=np.float32)], axis=1)
+        stl = stl[(stl_h @ plane) > 0]
+
+    d2s = cKDTree(stl).query(pred_valid, k=1, workers=-1)[0]
+    s2d = cKDTree(pred_valid).query(stl, k=1, workers=-1)[0]
+    acc_values = d2s[d2s < max_dist]
+    comp_values = s2d[s2d < max_dist]
+    if len(acc_values) == 0 or len(comp_values) == 0:
+        return {f"{prefix}_status": "skipped_no_dtu_distances_under_max_dist"}
+    acc = float(acc_values.mean())
+    comp = float(comp_values.mean())
+    return {
+        f"{prefix}_accuracy": acc,
+        f"{prefix}_completeness": comp,
+        f"{prefix}_overall": float((acc + comp) * 0.5),
+        f"{prefix}_dtu_pred_points": float(len(pred_valid)),
     }
 
 
@@ -1341,6 +1425,9 @@ def depth_paper_metrics(
         pred_depth_points = unproject_depth_map_to_point_map(
             pred_np["depth"][0], pred_np["extrinsic"][0], pred_np["intrinsic"][0]
         )
+        if "dtu_eval_root" in reference:
+            metrics.update(dtu_official_chamfer_metrics(pred_depth_points, reference, "depth_align_none", device))
+            return metrics
         alignment = str(reference.get("pointcloud_alignment", "none"))
         sim3 = None
         if alignment == "sim3":
@@ -1983,6 +2070,9 @@ def parse_args() -> argparse.Namespace:
         help="Explicit DTU/ETH3D GT point cloud PLY. Overrides auto lookup under --gt_root.",
     )
     parser.add_argument("--scan_id", type=int, default=None, help="DTU scan id for locating stlXXX_total.ply.")
+    parser.add_argument("--dtu_downsample", type=float, default=0.2, help="DTU official eval-style prediction downsample density.")
+    parser.add_argument("--dtu_patch_size", type=float, default=60.0, help="DTU official ObsMask patch size.")
+    parser.add_argument("--dtu_max_dist", type=float, default=20.0, help="DTU official max distance threshold.")
     parser.add_argument(
         "--gt_camera_npz",
         default=None,
@@ -2044,8 +2134,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_adv_images", action="store_true", help="Save adversarial input frames.")
     parser.add_argument(
         "--eval_tasks",
-        default="all",
-        help="Comma-separated eval tasks to run: camera,depth,point,tracking, or all.",
+        default="camera",
+        help=(
+            "Paper task to run. Use exactly one of camera,depth,point,tracking; "
+            "the corresponding dataset is enforced by --eval_dataset."
+        ),
     )
     parser.add_argument(
         "--attack_only",
@@ -2247,8 +2340,18 @@ def load_paper_gt_reference(
             load_geometry=needs_attack_geometry,
         )
     if eval_dataset == "dtu":
+        scan_id = resolve_dtu_scan_id(args, scene_dir)
         ply_path = resolve_dtu_gt_ply(args, scene_dir)
         refs = load_gt_pointcloud_reference(ply_path, device, alignment="none")
+        refs.update(
+            {
+                "dtu_eval_root": str(Path(args.gt_root)),
+                "dtu_scan_id": scan_id,
+                "dtu_downsample": args.dtu_downsample,
+                "dtu_patch_size": args.dtu_patch_size,
+                "dtu_max_dist": args.dtu_max_dist,
+            }
+        )
         refs.update(
             load_gt_camera_npz_reference(
                 Path(args.gt_camera_npz) if args.gt_camera_npz else None,
