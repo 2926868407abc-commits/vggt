@@ -222,29 +222,26 @@ def patch_attack(
 ) -> tuple[torch.Tensor, list[dict[str, float]], torch.Tensor, dict[str, int]]:
     base = images.detach()
     patch_x, patch_y, patch_h, patch_w = resolve_patch_box(image_hw, args.patch_size, args.patch_x, args.patch_y)
-    patch = torch.rand((1, 3, patch_h, patch_w), device=base.device, dtype=torch.float32)
-    patch.requires_grad_(True)
-    patch.retain_grad()
+    patch = torch.rand((1, 3, patch_h, patch_w), device=base.device, dtype=torch.float32, requires_grad=True)
+    patch_lr = args.patch_alpha if args.patch_alpha is not None else args.alpha
+    optimizer = torch.optim.Adam([patch], lr=patch_lr)
 
     history: list[dict[str, float]] = []
-    step_size = args.patch_alpha if args.patch_alpha is not None else args.alpha
     for step in range(args.steps):
+        optimizer.zero_grad(set_to_none=True)
         adv_images = apply_adversarial_patch(base, patch, patch_x, patch_y)
         adv_features = extract_features(model, adv_images, dtype, args.feature_layer)
         loss, terms = feature_l1_loss(adv_features, clean_features)
 
         model.zero_grad(set_to_none=True)
-        if patch.grad is not None:
-            patch.grad.zero_()
-        loss.backward()
+        (-loss).backward()
 
         with torch.no_grad():
-            grad = patch.grad
-            if grad is None:
+            if patch.grad is None:
                 raise RuntimeError("Patch gradient is None; check the forward graph.")
-            patch = (patch + step_size * grad.sign()).clamp(0.0, 1.0).detach()
-            patch.requires_grad_(True)
-            patch.retain_grad()
+        optimizer.step()
+        with torch.no_grad():
+            patch.clamp_(0.0, 1.0)
 
         terms["step"] = step + 1
         history.append(terms)
@@ -366,7 +363,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eps", type=float, default=8 / 255, help="Global L-infinity perturbation budget in [0, 1] pixels.")
     parser.add_argument("--alpha", type=float, default=1 / 255, help="Step size in [0, 1] pixels.")
     parser.add_argument("--patch_size", type=int, default=96, help="Square patch size in preprocessed input pixels.")
-    parser.add_argument("--patch_alpha", type=float, default=None, help="Patch step size; defaults to --alpha.")
+    parser.add_argument("--patch_alpha", type=float, default=None, help="Patch optimizer learning rate; defaults to --alpha.")
     parser.add_argument("--patch_x", type=int, default=-1, help="Patch left coordinate; -1 centers the patch.")
     parser.add_argument("--patch_y", type=int, default=-1, help="Patch top coordinate; -1 centers the patch.")
     parser.add_argument("--no_random_start", action="store_true", help="Start global PGD from the clean images.")
@@ -434,6 +431,8 @@ def process_scene(
         "steps": args.steps,
         "eps": args.eps,
         "alpha": args.alpha,
+        "patch_optimizer": "adam" if args.attack_type == "patch" else None,
+        "patch_lr": (args.patch_alpha if args.patch_alpha is not None else args.alpha) if args.attack_type == "patch" else None,
         "patch": patch_meta,
         "random_start": not args.no_random_start,
         "mode": "label_free_feature_attack_saved_for_recons_eval",
