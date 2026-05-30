@@ -14,7 +14,7 @@ import glob
 import hashlib
 import json
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +63,17 @@ def autocast_context(device: torch.device, dtype: torch.dtype):
     if device.type != "cuda":
         return nullcontext()
     return torch.cuda.amp.autocast(dtype=dtype)
+
+
+@contextmanager
+def temporary_training(module: torch.nn.Module, enabled: bool):
+    old_mode = module.training
+    if enabled:
+        module.train()
+    try:
+        yield
+    finally:
+        module.train(old_mode)
 
 
 def load_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
@@ -119,9 +130,10 @@ def extract_features(
     images: torch.Tensor,
     dtype: torch.dtype,
     feature_layer: str,
+    activation_checkpoint: bool = False,
 ) -> list[torch.Tensor]:
     images_b = images if images.ndim == 5 else images[None]
-    with autocast_context(images.device, dtype):
+    with temporary_training(model.aggregator, activation_checkpoint), autocast_context(images.device, dtype):
         tokens_list, _ = model.aggregator(images_b)
     return select_feature_tokens(tokens_list, feature_layer)
 
@@ -157,7 +169,7 @@ def pgd_attack(
     history: list[dict[str, float]] = []
     for step in range(args.steps):
         adv_images.requires_grad_(True)
-        adv_features = extract_features(model, adv_images, dtype, args.feature_layer)
+        adv_features = extract_features(model, adv_images, dtype, args.feature_layer, args.activation_checkpoint)
         loss, terms = feature_l1_loss(adv_features, clean_features)
 
         model.zero_grad(set_to_none=True)
@@ -230,7 +242,7 @@ def patch_attack(
     for step in range(args.steps):
         optimizer.zero_grad(set_to_none=True)
         adv_images = apply_adversarial_patch(base, patch, patch_x, patch_y)
-        adv_features = extract_features(model, adv_images, dtype, args.feature_layer)
+        adv_features = extract_features(model, adv_images, dtype, args.feature_layer, args.activation_checkpoint)
         loss, terms = feature_l1_loss(adv_features, clean_features)
 
         model.zero_grad(set_to_none=True)
@@ -366,6 +378,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch_alpha", type=float, default=None, help="Patch optimizer learning rate; defaults to --alpha.")
     parser.add_argument("--patch_x", type=int, default=-1, help="Patch left coordinate; -1 centers the patch.")
     parser.add_argument("--patch_y", type=int, default=-1, help="Patch top coordinate; -1 centers the patch.")
+    parser.add_argument(
+        "--activation_checkpoint",
+        action="store_true",
+        help="Use VGGT aggregator activation checkpointing during attack optimization to reduce memory.",
+    )
     parser.add_argument("--no_random_start", action="store_true", help="Start global PGD from the clean images.")
     parser.add_argument("--save_adv_images", action="store_true", help="Save adversarial input frames as PNGs.")
     parser.add_argument("--save_debug_pair", action="store_true", help="Save a debug npz with clean and attacked VGGT outputs.")
@@ -433,6 +450,7 @@ def process_scene(
         "alpha": args.alpha,
         "patch_optimizer": "adam" if args.attack_type == "patch" else None,
         "patch_lr": (args.patch_alpha if args.patch_alpha is not None else args.alpha) if args.attack_type == "patch" else None,
+        "activation_checkpoint": args.activation_checkpoint,
         "patch": patch_meta,
         "random_start": not args.no_random_start,
         "mode": "label_free_feature_attack_saved_for_recons_eval",
@@ -458,7 +476,10 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     print(f"[cfg] device={device} dtype={dtype}")
-    print(f"[cfg] attack={args.attack_type} feature_layer={args.feature_layer} dataset={args.dataset}")
+    print(
+        f"[cfg] attack={args.attack_type} feature_layer={args.feature_layer} "
+        f"activation_checkpoint={args.activation_checkpoint} dataset={args.dataset}"
+    )
     print(f"[model] loading {args.ckpt}")
     model = load_model(args, device)
     for param in model.parameters():

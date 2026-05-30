@@ -9,6 +9,7 @@ CKPT="${CKPT:-$VGGT_ROOT/checkpoints/VGGT-1B}"
 
 NYU_SCENES="${NYU_SCENES:-$VGGT_ROOT/data/nyu_v2_recons_eval_scenes}"
 BONN_RAW="${BONN_RAW:-$RECONS_ROOT/data/bonn}"
+BONN_DATASET="${BONN_DATASET:-$BONN_RAW/rgbd_bonn_dataset}"
 BONN_SCENES="${BONN_SCENES:-$VGGT_ROOT/data/bonn_monodepth_scenes}"
 TUM_ROOT="${TUM_ROOT:-$RECONS_ROOT/data/tum}"
 NRGBD_RAW="${NRGBD_RAW:-$RECONS_ROOT/data/nrgbd}"
@@ -55,9 +56,12 @@ printf 'RECONS_ROOT=%s\n\n' "$RECONS_ROOT"
 echo '== Environments =='
 check_file "$VGGT_PY" "VGGT python"
 check_file "$RECONS_PY" "recons_eval python"
-check_file "$CKPT" "VGGT checkpoint file"
-if [[ ! -f "$CKPT" && -d "$CKPT" ]]; then
+if [[ -f "$CKPT" ]]; then
+  ok "VGGT checkpoint file: $CKPT"
+elif [[ -d "$CKPT" ]]; then
   ok "VGGT checkpoint directory: $CKPT"
+else
+  missing_item "VGGT checkpoint path: $CKPT"
 fi
 
 echo
@@ -106,10 +110,11 @@ check_dir "$RECONS_ROOT/data/nyu-v2/val/nyu_depths" "NYU recons_eval GT depths"
 echo
 echo '== Bonn =='
 check_dir "$BONN_RAW" "Bonn raw/prepared root"
-if compgen -G "$BONN_RAW/rgbd_bonn_*/rgb_110/*.png" >/dev/null; then
-  ok "Bonn rgb_110 frames exist under $BONN_RAW"
+check_dir "$BONN_DATASET" "Bonn rgbd_bonn_dataset root"
+if compgen -G "$BONN_DATASET/rgbd_bonn_*/rgb_110/*.png" >/dev/null; then
+  ok "Bonn rgb_110 frames exist under $BONN_DATASET"
 else
-  warn "Bonn rgb_110 frames not found under $BONN_RAW; full bash can only prepare scenes if this raw data exists"
+  warn "Bonn rgb_110 frames not found under $BONN_DATASET; run datasets/preprocess/prepare_bonn.py or prepare_bonn.sh first"
 fi
 if [[ -d "$BONN_SCENES" ]]; then
   ok "Bonn VGGT scene root: $BONN_SCENES"

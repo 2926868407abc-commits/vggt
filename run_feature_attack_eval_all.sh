@@ -17,6 +17,7 @@ FORCE_ATTACK="${FORCE_ATTACK:-0}"
 
 NYU_SCENES="${NYU_SCENES:-$VGGT_ROOT/data/nyu_v2_recons_eval_scenes}"
 BONN_SCENES="${BONN_SCENES:-$VGGT_ROOT/data/bonn_monodepth_scenes}"
+BONN_DATASET="${BONN_DATASET:-$RECONS_ROOT/data/bonn/rgbd_bonn_dataset}"
 TUM_ROOT="${TUM_ROOT:-$RECONS_ROOT/data/tum}"
 NRGBD_SCENES="${NRGBD_SCENES:-$VGGT_ROOT/data/nrgbd_sparse_mv_recon_scenes}"
 
@@ -31,6 +32,13 @@ require_file() {
   fi
 }
 
+require_path() {
+  if [[ ! -e "$1" ]]; then
+    echo "Missing path: $1" >&2
+    exit 1
+  fi
+}
+
 require_dir() {
   if [[ ! -d "$1" ]]; then
     echo "Missing directory: $1" >&2
@@ -41,15 +49,54 @@ require_dir() {
 run_attack() {
   local out_dir="$1"
   shift
-  if [[ "$FORCE_ATTACK" != "1" && -f "$out_dir/attack_batch_summary.json" ]]; then
-    log "skip existing attack: $out_dir"
+  local attack_args=("$@")
+  local scenes_root=""
+  local scene_pattern="*"
+  local scene_dir=""
+  local i=0
+  while [[ "$i" -lt "${#attack_args[@]}" ]]; do
+    case "${attack_args[$i]}" in
+      --scene_dir)
+        i=$((i + 1))
+        scene_dir="${attack_args[$i]:-}"
+        ;;
+      --scenes_root)
+        i=$((i + 1))
+        scenes_root="${attack_args[$i]:-}"
+        ;;
+      --scene_pattern)
+        i=$((i + 1))
+        scene_pattern="${attack_args[$i]:-}"
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  local expected=0
+  if [[ -n "$scene_dir" ]]; then
+    expected=1
+  elif [[ -n "$scenes_root" ]]; then
+    expected=$(find "$scenes_root" -maxdepth 1 -type d -name "$scene_pattern" 2>/dev/null | wc -l)
+  fi
+
+  local completed=0
+  if [[ -d "$out_dir" ]]; then
+    completed=$(find "$out_dir" -name vggt_outputs.npz 2>/dev/null | wc -l)
+  fi
+
+  if [[ "$FORCE_ATTACK" != "1" && "$expected" -gt 0 && "$completed" -eq "$expected" ]]; then
+    log "skip existing attack: $out_dir ($completed/$expected outputs)"
     return
   fi
-  log "run attack -> $out_dir"
+  if [[ "$completed" -gt 0 ]]; then
+    log "rerun attack -> $out_dir ($completed/$expected outputs present)"
+  else
+    log "run attack -> $out_dir"
+  fi
   mkdir -p "$out_dir"
   (
     cd "$VGGT_ROOT"
-    "$VGGT_PY" attack_vggt_new1.py "$@" \
+    "$VGGT_PY" attack_vggt_new1.py "${attack_args[@]}" \
       --output_dir "$out_dir" \
       --ckpt "$CKPT" \
       --steps "$STEPS" \
@@ -77,7 +124,7 @@ prepare_bonn_scenes_if_needed() {
     return
   fi
   log "prepare Bonn one-frame VGGT scenes -> $BONN_SCENES"
-  BONN_ROOT="$RECONS_ROOT/data/bonn" BONN_SCENES="$BONN_SCENES" "$RECONS_PY" - <<'PY'
+  BONN_ROOT="$BONN_DATASET" BONN_SCENES="$BONN_SCENES" "$RECONS_PY" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -483,6 +530,7 @@ require_file "$VGGT_PY"
 require_file "$RECONS_PY"
 require_file "$VGGT_ROOT/attack_vggt_new1.py"
 require_dir "$RECONS_ROOT"
+require_path "$CKPT"
 require_dir "$NYU_SCENES"
 grep -q "torch.optim.Adam" "$VGGT_ROOT/attack_vggt_new1.py" || {
   echo "attack_vggt_new1.py does not look like the Adam-patch version." >&2
@@ -543,7 +591,8 @@ run_attack "$VGGT_ROOT/outputs_attack/tum_feature_global_l3" \
   --scene_pattern "rgbd_dataset_freiburg3_*" \
   --max_frames 90 \
   --eps "$GLOBAL_EPS" \
-  --alpha "$GLOBAL_ALPHA"
+  --alpha "$GLOBAL_ALPHA" \
+  --activation_checkpoint
 run_attack "$VGGT_ROOT/outputs_attack/tum_feature_patch_adam_l3" \
   --dataset tum-dynamics \
   --attack_type patch \
@@ -554,7 +603,8 @@ run_attack "$VGGT_ROOT/outputs_attack/tum_feature_patch_adam_l3" \
   --patch_alpha "$PATCH_LR" \
   --patch_size "$PATCH_SIZE" \
   --patch_x -1 \
-  --patch_y -1
+  --patch_y -1 \
+  --activation_checkpoint
 
 log "Neural-RGBD sparse attacks"
 run_attack "$VGGT_ROOT/outputs_attack/nrgbd_sparse_feature_global_l3" \
