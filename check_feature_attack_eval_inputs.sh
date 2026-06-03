@@ -67,12 +67,14 @@ fi
 echo
 echo '== Core Code =='
 check_file "$VGGT_ROOT/attack_vggt_new1.py" "VGGT attack script"
+check_file "$VGGT_ROOT/attack_vggt_vla_style.py" "VLA-style universal patch script"
 if [[ -f "$VGGT_ROOT/attack_vggt_new1.py" ]]; then
   grep -q "torch.optim.Adam" "$VGGT_ROOT/attack_vggt_new1.py" \
     && ok "patch attack uses Adam optimizer" \
     || warn "attack script does not contain torch.optim.Adam; patch may still be old PGD-style"
 fi
 check_file "$VGGT_ROOT/run_feature_attack_eval_all.sh" "full attack/eval bash"
+check_file "$VGGT_ROOT/run_vla_style_feature_attack_eval_all.sh" "VLA-style attack/eval bash"
 check_file "$RECONS_ROOT/monodepth/eval.py" "monodepth eval"
 check_file "$RECONS_ROOT/datasets/preprocess/prepare_tum.py" "TUM prepare.py"
 check_file "$RECONS_ROOT/datasets/seq-id-maps/NRGBD_mv-recon_seq-id-map-kf500.json" "NRGBD sparse seq-id map"
