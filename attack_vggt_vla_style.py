@@ -202,6 +202,29 @@ def load_patch_metadata(path: str) -> dict:
         return json.load(f)
 
 
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def scheduled_lr(
+    base_lr: float,
+    update_idx_zero_based: int,
+    total_updates: int,
+    warmup_updates: int,
+    scheduler: str,
+) -> float:
+    if scheduler == "none":
+        return base_lr
+    if warmup_updates > 0 and update_idx_zero_based < warmup_updates:
+        return base_lr * float(update_idx_zero_based + 1) / float(warmup_updates)
+    if scheduler == "cosine":
+        decay_updates = max(1, total_updates - warmup_updates)
+        progress = min(1.0, max(0.0, (update_idx_zero_based - warmup_updates) / decay_updates))
+        return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+    raise ValueError(f"Unknown scheduler: {scheduler}")
+
+
 def train_universal_patch(
     model: torch.nn.Module,
     train_scenes: list[Path],
@@ -231,6 +254,7 @@ def train_universal_patch(
         history_path.unlink()
 
     total_updates = args.iterations * args.inner_loop
+    warmup_updates = args.warmup_iterations * args.inner_loop
     update_idx = 0
     last_terms: dict[str, float] | None = None
     started = time.time()
@@ -271,6 +295,14 @@ def train_universal_patch(
 
             for inner_step in range(args.inner_loop):
                 optimizer.zero_grad(set_to_none=True)
+                current_lr = scheduled_lr(
+                    args.patch_lr,
+                    update_idx,
+                    total_updates,
+                    warmup_updates,
+                    args.scheduler,
+                )
+                set_optimizer_lr(optimizer, current_lr)
                 feature_l1_values = []
                 geometry_records = []
                 for scene_item in scene_batch:
@@ -321,6 +353,7 @@ def train_universal_patch(
                     "iteration": iteration + 1,
                     "inner_step": inner_step + 1,
                     "update": update_idx,
+                    "lr": current_lr,
                     "scenes": [item["scene_dir"].name for item in scene_batch],
                     "geometries": geometry_records,
                     **terms,
@@ -342,6 +375,9 @@ def train_universal_patch(
         "feature_layer": args.feature_layer,
         "optimizer": "adamw",
         "patch_lr": args.patch_lr,
+        "scheduler": args.scheduler,
+        "warmup_iterations": args.warmup_iterations,
+        "warmup_updates": warmup_updates,
         "patch_shape": list(patch.shape),
         "patch_area_ratio_requested": args.patch_area_ratio,
         "reference_image_hw": list(first_hw),
@@ -376,6 +412,8 @@ def train_universal_patch(
             "inner_loop": 50,
             "max_iterations": 2000,
             "random_shear_rotation": True,
+            "cosine_scheduler": True,
+            "warmup_iterations": 20,
         },
         "official_implementation_alignment": {
             "random_training_position": not args.fixed_training_position,
@@ -602,10 +640,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scenes_per_iteration",
         type=int,
-        default=8,
+        default=6,
         help="Scenes accumulated per outer iteration; use 1 for expensive multi-frame scenes.",
     )
     parser.add_argument("--patch_lr", type=float, default=0.001, help="AdamW learning rate.")
+    parser.add_argument("--scheduler", choices=("cosine", "none"), default="cosine")
+    parser.add_argument("--warmup_iterations", type=int, default=20)
     parser.add_argument("--patch_area_ratio", type=float, default=0.05, help="Patch area ratio when --patch_size is not set.")
     parser.add_argument("--patch_size", type=int, default=0, help="Explicit square patch size; 0 derives it from area ratio.")
     parser.add_argument("--patch_x", type=int, default=-1, help="Fixed patch left coordinate; -1 centers the patch.")

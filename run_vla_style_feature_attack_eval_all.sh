@@ -12,6 +12,8 @@ ITERATIONS="${ITERATIONS:-2000}"
 INNER_LOOP="${INNER_LOOP:-50}"
 PATCH_LR="${PATCH_LR:-0.001}"
 PATCH_AREA_RATIO="${PATCH_AREA_RATIO:-0.05}"
+SCHEDULER="${SCHEDULER:-cosine}"
+WARMUP_ITERATIONS="${WARMUP_ITERATIONS:-20}"
 
 # The paper specifies random shear/rotation but not their exact ranges.
 # These values follow the authors' official implementation.
@@ -101,6 +103,8 @@ run_vla_attack() {
       --inner_loop "$INNER_LOOP" \
       --patch_lr "$PATCH_LR" \
       --patch_area_ratio "$PATCH_AREA_RATIO" \
+      --scheduler "$SCHEDULER" \
+      --warmup_iterations "$WARMUP_ITERATIONS" \
       --rotation_degrees "$ROTATION_DEGREES" \
       --shear "$SHEAR" \
       --geometry_prob "$GEOMETRY_PROB" \
@@ -122,6 +126,7 @@ require_dir "$NRGBD_SCENES"
 log "VLA-style universal patch settings"
 echo "iterations=$ITERATIONS inner_loop=$INNER_LOOP total_updates=$((ITERATIONS * INNER_LOOP))"
 echo "patch_lr=$PATCH_LR patch_area_ratio=$PATCH_AREA_RATIO feature_layer=$FEATURE_LAYER"
+echo "scheduler=$SCHEDULER warmup_iterations=$WARMUP_ITERATIONS"
 echo "rotation_degrees=$ROTATION_DEGREES shear=$SHEAR geometry_prob=$GEOMETRY_PROB"
 echo "training_position=random"
 echo "evaluation_position_nyu=($NYU_PATCH_X,$NYU_PATCH_Y), where -1 centers the patch"
