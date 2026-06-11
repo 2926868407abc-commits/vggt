@@ -59,15 +59,50 @@ def load_scene_images(
     max_frames: int,
     seed: int,
     device: torch.device,
+    frame_indices_override: list[int] | None = None,
 ) -> tuple[torch.Tensor, list[str], np.ndarray]:
     from vggt.utils.load_fn import load_and_preprocess_images
 
-    scene_seed = derive_scene_seed(seed, scene_dir.name)
-    image_paths, frame_indices = subsample(find_images(scene_dir), max_frames, scene_seed)
+    all_images = find_images(scene_dir)
+    if frame_indices_override is not None:
+        frame_indices = np.asarray(frame_indices_override, dtype=int)
+        image_paths = [all_images[int(idx)] for idx in frame_indices]
+    else:
+        scene_seed = derive_scene_seed(seed, scene_dir.name)
+        image_paths, frame_indices = subsample(all_images, max_frames, scene_seed)
     if not image_paths:
         raise ValueError(f"No images found under {scene_dir}")
     images = load_and_preprocess_images(image_paths).to(device)
     return images, image_paths, frame_indices
+
+
+def load_frame_manifest(path: str | None) -> dict[str, list[int]]:
+    if not path:
+        return {}
+    with Path(path).open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+    result: dict[str, list[int]] = {}
+    for seq, value in raw.items():
+        if isinstance(value, dict):
+            indices = value.get("frame_indices")
+        else:
+            indices = value
+        if indices is None:
+            raise ValueError(f"No frame_indices found for {seq} in {path}")
+        result[seq] = [int(idx) for idx in indices]
+    return result
+
+
+def train_max_frames(args: argparse.Namespace) -> int:
+    return args.train_max_frames if args.train_max_frames is not None else args.max_frames
+
+
+def eval_max_frames(args: argparse.Namespace) -> int:
+    return args.eval_max_frames if args.eval_max_frames is not None else args.max_frames
+
+
+def manifest_indices(args: argparse.Namespace, scene_name: str) -> list[int] | None:
+    return getattr(args, "frame_manifest_data", {}).get(scene_name)
 
 
 def resolve_universal_patch_size(images: torch.Tensor, args: argparse.Namespace) -> int:
@@ -234,7 +269,7 @@ def train_universal_patch(
     output_dir: Path,
 ) -> tuple[torch.Tensor, dict]:
     rng = np.random.default_rng(args.seed)
-    first_images, _, _ = load_scene_images(train_scenes[0], args.max_frames, args.seed, device)
+    first_images, _, _ = load_scene_images(train_scenes[0], train_max_frames(args), args.seed, device)
     patch_size = resolve_universal_patch_size(first_images, args)
     first_hw = tuple(int(value) for value in first_images.shape[-2:])
     del first_images
@@ -266,7 +301,7 @@ def train_universal_patch(
             scene_batch = []
             for scene_idx in scene_indices:
                 scene_dir = train_scenes[int(scene_idx)]
-                images, _, _ = load_scene_images(scene_dir, args.max_frames, args.seed, device)
+                images, _, _ = load_scene_images(scene_dir, train_max_frames(args), args.seed, device)
                 image_hw = tuple(int(value) for value in images.shape[-2:])
                 _, _, patch_h, patch_w = resolve_patch_box(
                     image_hw,
@@ -382,6 +417,9 @@ def train_universal_patch(
         "patch_area_ratio_requested": args.patch_area_ratio,
         "reference_image_hw": list(first_hw),
         "actual_patch_area_ratio_on_reference": (patch_size * patch_size) / (first_hw[0] * first_hw[1]),
+        "max_frames": args.max_frames,
+        "train_max_frames": train_max_frames(args),
+        "eval_max_frames": eval_max_frames(args),
         "iterations": args.iterations,
         "inner_loop": args.inner_loop,
         "scenes_per_iteration": args.scenes_per_iteration,
@@ -528,7 +566,13 @@ def evaluate_scene(
     patch_metadata: dict,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
-    images, image_paths, frame_indices = load_scene_images(scene_dir, args.max_frames, args.seed, device)
+    images, image_paths, frame_indices = load_scene_images(
+        scene_dir,
+        eval_max_frames(args),
+        args.seed,
+        device,
+        manifest_indices(args, scene_dir.name),
+    )
     image_hw = tuple(int(value) for value in images.shape[-2:])
     patch_size = int(patch.shape[-1])
     patch_x, patch_y, patch_h, patch_w = resolve_patch_box(
@@ -586,8 +630,12 @@ def evaluate_scene(
         "scene": str(scene_dir),
         "dataset": args.dataset,
         "n_frames": len(image_paths),
+        "max_frames": args.max_frames,
+        "train_max_frames": train_max_frames(args),
+        "eval_max_frames": eval_max_frames(args),
         "image_paths": [str(path) for path in image_paths],
         "frame_indices": frame_indices.astype(int).tolist(),
+        "frame_manifest": args.frame_manifest,
         "ckpt": args.ckpt,
         "mode": "vla_attacker_style_universal_feature_patch",
         "attack_target": "feature_l1_clean_vs_adversarial",
@@ -632,6 +680,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt", default="facebook/VGGT-1B", help="Hugging Face model id or local checkpoint path.")
     parser.add_argument("--local_files_only", action="store_true", help="Load Hugging Face checkpoint from local cache only.")
     parser.add_argument("--max_frames", type=int, default=10, help="Maximum frames per scene; 0 keeps all frames.")
+    parser.add_argument("--train_max_frames", type=int, default=None, help="Maximum frames per training scene; defaults to --max_frames.")
+    parser.add_argument("--eval_max_frames", type=int, default=None, help="Maximum frames per evaluation scene; defaults to --max_frames.")
+    parser.add_argument("--frame_manifest", default=None, help="Optional JSON mapping eval scene names to exact frame indices.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--feature_layer", default="aggregator_final", help="Feature layer used by the attack objective.")
 
@@ -687,6 +738,7 @@ def main() -> None:
     eval_scenes = list_scene_dirs(eval_scenes_root, eval_scene_pattern)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    args.frame_manifest_data = load_frame_manifest(args.frame_manifest)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -697,7 +749,8 @@ def main() -> None:
     print(
         f"[cfg] dataset={args.dataset} feature_layer={args.feature_layer} "
         f"train_scenes={len(train_scenes)} eval_scenes={len(eval_scenes)} "
-        f"activation_checkpoint={args.activation_checkpoint}"
+        f"train_max_frames={train_max_frames(args)} eval_max_frames={eval_max_frames(args)} "
+        f"frame_manifest={args.frame_manifest} activation_checkpoint={args.activation_checkpoint}"
     )
     print(f"[model] loading {args.ckpt}")
     model = load_model(args, device)
