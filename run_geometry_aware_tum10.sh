@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VGGT_ROOT="${VGGT_ROOT:-/mnt/data/wangqq/vggt}"
+RECONS_ROOT="${RECONS_ROOT:-/mnt/data/wangqq/recons_eval}"
+VGGT_PY="${VGGT_PY:-/mnt/data/wangqq/conda_envs/vggt/bin/python3}"
+RECONS_PY="${RECONS_PY:-/mnt/data/wangqq/conda_envs/recons_eval/bin/python3}"
+CKPT="${CKPT:-$VGGT_ROOT/checkpoints/VGGT-1B}"
+
+TUM_ROOT="${TUM_ROOT:-$RECONS_ROOT/data/tum}"
+TUM10_FRAME_SCENES="${TUM10_FRAME_SCENES:-$VGGT_ROOT/data/tum_dynamics_10frame_individual_scenes}"
+TUM10_FRAME_MANIFEST="${TUM10_FRAME_MANIFEST:-$TUM10_FRAME_SCENES/tum10_frame_manifest.json}"
+TUM_FRAME_COUNT="${TUM_FRAME_COUNT:-10}"
+
+OUT_BASE="${OUT_BASE:-$VGGT_ROOT/outputs_attack_geometry_aware_tum10}"
+TUM_CLEAN_OUT="$OUT_BASE/tum10_clean_uniform_l3"
+TUM_GEOM_OUT="$OUT_BASE/tum10_gt_geometry_planar_feature_l3"
+
+TUM_CLEAN_MODEL="vggt_tum10_clean_uniform_l3_geomrun"
+TUM_GEOM_MODEL="vggt_tum10_gt_geometry_planar_feature_l3"
+
+ITERATIONS="${ITERATIONS:-200}"
+INNER_LOOP="${INNER_LOOP:-10}"
+SCENES_PER_ITERATION="${SCENES_PER_ITERATION:-1}"
+PATCH_LR="${PATCH_LR:-0.001}"
+TEXTURE_SIZE="${TEXTURE_SIZE:-128}"
+FEATURE_LAYER="${FEATURE_LAYER:-aggregator_final}"
+SEED="${SEED:-0}"
+
+PLANE_WIDTH="${PLANE_WIDTH:-0.6}"
+PLANE_HEIGHT="${PLANE_HEIGHT:-0.6}"
+PLANE_DISTANCE="${PLANE_DISTANCE:-2.0}"
+PLANE_CENTER_X="${PLANE_CENTER_X:-0.0}"
+PLANE_CENTER_Y="${PLANE_CENTER_Y:-0.0}"
+
+FORCE_PREPARE_TUM10="${FORCE_PREPARE_TUM10:-0}"
+FORCE_CLEAN="${FORCE_CLEAN:-0}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_APPLY="${FORCE_APPLY:-0}"
+RUN_EVAL="${RUN_EVAL:-1}"
+
+log() {
+  printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+require_file() {
+  [[ -f "$1" ]] || { echo "Missing file: $1" >&2; exit 1; }
+}
+
+require_dir() {
+  [[ -d "$1" ]] || { echo "Missing directory: $1" >&2; exit 1; }
+}
+
+log "check paths"
+require_file "$VGGT_PY"
+require_file "$RECONS_PY"
+require_file "$VGGT_ROOT/attack_vggt_geometry_tum10.py"
+require_file "$VGGT_ROOT/scripts/prepare_tum10_frame_scenes_for_vla.py"
+require_file "$VGGT_ROOT/scripts/run_vggt_clean_tum10_uniform.py"
+require_file "$VGGT_ROOT/scripts/eval_vggt_tum_pose_for_recons_eval_tum10.py"
+require_dir "$TUM_ROOT"
+[[ -e "$CKPT" ]] || { echo "Missing checkpoint: $CKPT" >&2; exit 1; }
+
+log "settings"
+echo "iterations=$ITERATIONS inner_loop=$INNER_LOOP scenes_per_iteration=$SCENES_PER_ITERATION"
+echo "texture_size=$TEXTURE_SIZE patch_lr=$PATCH_LR feature_layer=$FEATURE_LAYER"
+echo "plane_width=$PLANE_WIDTH plane_height=$PLANE_HEIGHT plane_distance=$PLANE_DISTANCE"
+echo "plane_center=($PLANE_CENTER_X,$PLANE_CENTER_Y)"
+
+log "prepare TUM images links"
+for seq_dir in "$TUM_ROOT"/rgbd_dataset_freiburg3_*; do
+  if [[ -d "$seq_dir/rgb_90" ]]; then
+    ln -sfn rgb_90 "$seq_dir/images"
+  fi
+done
+
+log "prepare uniform TUM-10 manifest"
+prepare_args=()
+if [[ "$FORCE_PREPARE_TUM10" == "1" ]]; then
+  prepare_args=(--overwrite)
+fi
+"$VGGT_PY" "$VGGT_ROOT/scripts/prepare_tum10_frame_scenes_for_vla.py" \
+  --tum_root "$TUM_ROOT" \
+  --out_root "$TUM10_FRAME_SCENES" \
+  --frame_count "$TUM_FRAME_COUNT" \
+  "${prepare_args[@]}"
+
+log "run clean VGGT on TUM-10 uniform frames"
+clean_args=()
+if [[ "$FORCE_CLEAN" != "1" ]]; then
+  clean_args=(--skip_existing)
+fi
+"$VGGT_PY" "$VGGT_ROOT/scripts/run_vggt_clean_tum10_uniform.py" \
+  --tum_root "$TUM_ROOT" \
+  --output_root "$TUM_CLEAN_OUT" \
+  --frame_manifest "$TUM10_FRAME_MANIFEST" \
+  --ckpt "$CKPT" \
+  --seed "$SEED" \
+  "${clean_args[@]}"
+
+log "run GT-geometry-aware planar patch attack"
+patch_args=()
+if [[ "$FORCE_TRAIN" != "1" && -f "$TUM_GEOM_OUT/geometry_patch/geometry_patch_texture.npz" ]]; then
+  patch_args=(--texture_path "$TUM_GEOM_OUT/geometry_patch/geometry_patch_texture.npz")
+  log "reuse geometry patch -> ${patch_args[1]}"
+fi
+apply_args=()
+if [[ "$FORCE_APPLY" != "1" && "$FORCE_TRAIN" != "1" ]]; then
+  apply_args=(--skip_existing_outputs)
+fi
+"$VGGT_PY" "$VGGT_ROOT/attack_vggt_geometry_tum10.py" \
+  --tum_root "$TUM_ROOT" \
+  --output_dir "$TUM_GEOM_OUT" \
+  --frame_manifest "$TUM10_FRAME_MANIFEST" \
+  --ckpt "$CKPT" \
+  --texture_size "$TEXTURE_SIZE" \
+  --iterations "$ITERATIONS" \
+  --inner_loop "$INNER_LOOP" \
+  --scenes_per_iteration "$SCENES_PER_ITERATION" \
+  --patch_lr "$PATCH_LR" \
+  --feature_layer "$FEATURE_LAYER" \
+  --plane_width "$PLANE_WIDTH" \
+  --plane_height "$PLANE_HEIGHT" \
+  --plane_distance "$PLANE_DISTANCE" \
+  --plane_center_x "$PLANE_CENTER_X" \
+  --plane_center_y "$PLANE_CENTER_Y" \
+  --seed "$SEED" \
+  "${patch_args[@]}" \
+  "${apply_args[@]}"
+
+if [[ "$RUN_EVAL" != "1" ]]; then
+  log "skip recons_eval because RUN_EVAL=$RUN_EVAL"
+  exit 0
+fi
+
+log "evaluate TUM-10 clean and geometry-aware attack"
+"$RECONS_PY" "$VGGT_ROOT/scripts/eval_vggt_tum_pose_for_recons_eval_tum10.py" \
+  --vggt_output_root "$TUM_CLEAN_OUT" \
+  --model_name "$TUM_CLEAN_MODEL" \
+  --recons_root "$RECONS_ROOT" \
+  --overwrite
+"$RECONS_PY" "$VGGT_ROOT/scripts/eval_vggt_tum_pose_for_recons_eval_tum10.py" \
+  --vggt_output_root "$TUM_GEOM_OUT" \
+  --model_name "$TUM_GEOM_MODEL" \
+  --recons_root "$RECONS_ROOT" \
+  --overwrite
+
+log "all done"
+echo "TUM clean:    $RECONS_ROOT/outputs/relpose-distance/tum10-metric-$TUM_CLEAN_MODEL.csv"
+echo "TUM geometry: $RECONS_ROOT/outputs/relpose-distance/tum10-metric-$TUM_GEOM_MODEL.csv"
