@@ -14,10 +14,11 @@ TUM_FRAME_COUNT="${TUM_FRAME_COUNT:-10}"
 
 OUT_BASE="${OUT_BASE:-$VGGT_ROOT/outputs_attack_geometry_aware_tum10}"
 TUM_CLEAN_OUT="$OUT_BASE/tum10_clean_uniform_l3"
-TUM_GEOM_OUT="$OUT_BASE/tum10_gt_geometry_planar_feature_l3"
+TUM_GEOM_RUN_NAME="${TUM_GEOM_RUN_NAME:-tum10_gt_geometry_full_feature_l3}"
+TUM_GEOM_OUT="$OUT_BASE/$TUM_GEOM_RUN_NAME"
 
 TUM_CLEAN_MODEL="vggt_tum10_clean_uniform_l3_geomrun"
-TUM_GEOM_MODEL="vggt_tum10_gt_geometry_planar_feature_l3"
+TUM_GEOM_MODEL="${TUM_GEOM_MODEL:-vggt_tum10_gt_geometry_full_feature_l3}"
 
 ITERATIONS="${ITERATIONS:-200}"
 INNER_LOOP="${INNER_LOOP:-10}"
@@ -32,6 +33,22 @@ PLANE_HEIGHT="${PLANE_HEIGHT:-0.6}"
 PLANE_DISTANCE="${PLANE_DISTANCE:-2.0}"
 PLANE_CENTER_X="${PLANE_CENTER_X:-0.0}"
 PLANE_CENTER_Y="${PLANE_CENTER_Y:-0.0}"
+PLANE_MODE="${PLANE_MODE:-auto_depth_surface}"
+USE_DEPTH_VISIBILITY="${USE_DEPTH_VISIBILITY:-1}"
+OPTIMIZE_GEOMETRY="${OPTIMIZE_GEOMETRY:-1}"
+SURFACE_CANDIDATE_GRID="${SURFACE_CANDIDATE_GRID:-4}"
+SURFACE_SEARCH_MARGIN="${SURFACE_SEARCH_MARGIN:-0.18}"
+GEOMETRY_SIZE_SCALES="${GEOMETRY_SIZE_SCALES:-0.8,1.0,1.2}"
+GEOMETRY_ROLL_DEGREES="${GEOMETRY_ROLL_DEGREES:--15,0,15}"
+VISIBILITY_DEPTH_MARGIN="${VISIBILITY_DEPTH_MARGIN:-0.05}"
+
+PHYSICAL_EOT="${PHYSICAL_EOT:-1}"
+PRINT_MIN="${PRINT_MIN:-0.0}"
+PRINT_MAX="${PRINT_MAX:-1.0}"
+EOT_BRIGHTNESS="${EOT_BRIGHTNESS:-0.15}"
+EOT_CONTRAST="${EOT_CONTRAST:-0.15}"
+EOT_GAMMA="${EOT_GAMMA:-0.10}"
+EOT_NOISE_STD="${EOT_NOISE_STD:-0.01}"
 
 FORCE_PREPARE_TUM10="${FORCE_PREPARE_TUM10:-0}"
 FORCE_CLEAN="${FORCE_CLEAN:-0}"
@@ -66,6 +83,9 @@ echo "iterations=$ITERATIONS inner_loop=$INNER_LOOP scenes_per_iteration=$SCENES
 echo "texture_size=$TEXTURE_SIZE patch_lr=$PATCH_LR feature_layer=$FEATURE_LAYER"
 echo "plane_width=$PLANE_WIDTH plane_height=$PLANE_HEIGHT plane_distance=$PLANE_DISTANCE"
 echo "plane_center=($PLANE_CENTER_X,$PLANE_CENTER_Y)"
+echo "plane_mode=$PLANE_MODE use_depth_visibility=$USE_DEPTH_VISIBILITY optimize_geometry=$OPTIMIZE_GEOMETRY"
+echo "surface_candidate_grid=$SURFACE_CANDIDATE_GRID geometry_size_scales=$GEOMETRY_SIZE_SCALES geometry_roll_degrees=$GEOMETRY_ROLL_DEGREES"
+echo "physical_eot=$PHYSICAL_EOT print=[$PRINT_MIN,$PRINT_MAX] brightness=$EOT_BRIGHTNESS contrast=$EOT_CONTRAST gamma=$EOT_GAMMA noise_std=$EOT_NOISE_STD"
 
 log "prepare TUM images links"
 for seq_dir in "$TUM_ROOT"/rgbd_dataset_freiburg3_*; do
@@ -108,6 +128,16 @@ apply_args=()
 if [[ "$FORCE_APPLY" != "1" && "$FORCE_TRAIN" != "1" ]]; then
   apply_args=(--skip_existing_outputs)
 fi
+geometry_args=(--plane_mode "$PLANE_MODE")
+if [[ "$USE_DEPTH_VISIBILITY" == "1" ]]; then
+  geometry_args+=(--use_depth_visibility)
+fi
+if [[ "$OPTIMIZE_GEOMETRY" == "1" ]]; then
+  geometry_args+=(--optimize_geometry)
+fi
+if [[ "$PHYSICAL_EOT" == "1" ]]; then
+  geometry_args+=(--physical_eot)
+fi
 "$VGGT_PY" "$VGGT_ROOT/attack_vggt_geometry_tum10.py" \
   --tum_root "$TUM_ROOT" \
   --output_dir "$TUM_GEOM_OUT" \
@@ -124,7 +154,19 @@ fi
   --plane_distance "$PLANE_DISTANCE" \
   --plane_center_x "$PLANE_CENTER_X" \
   --plane_center_y "$PLANE_CENTER_Y" \
+  --surface_candidate_grid "$SURFACE_CANDIDATE_GRID" \
+  --surface_search_margin "$SURFACE_SEARCH_MARGIN" \
+  --geometry_size_scales "$GEOMETRY_SIZE_SCALES" \
+  --geometry_roll_degrees "$GEOMETRY_ROLL_DEGREES" \
+  --visibility_depth_margin "$VISIBILITY_DEPTH_MARGIN" \
+  --print_min "$PRINT_MIN" \
+  --print_max "$PRINT_MAX" \
+  --eot_brightness "$EOT_BRIGHTNESS" \
+  --eot_contrast "$EOT_CONTRAST" \
+  --eot_gamma "$EOT_GAMMA" \
+  --eot_noise_std "$EOT_NOISE_STD" \
   --seed "$SEED" \
+  "${geometry_args[@]}" \
   "${patch_args[@]}" \
   "${apply_args[@]}"
 
