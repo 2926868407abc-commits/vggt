@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import copy
 import json
 import math
 import sys
@@ -112,6 +113,25 @@ def preprocess_projection_params(image_path: str, tensor_hw: tuple[int, int]) ->
         "tensor_w": float(tensor_w),
         "tensor_h": float(tensor_h),
     }
+
+
+def tensor_projection_params(tensor_hw: tuple[int, int]) -> dict[str, float]:
+    tensor_h, tensor_w = tensor_hw
+    return {
+        "orig_w": float(tensor_w),
+        "orig_h": float(tensor_h),
+        "scale_x": 1.0,
+        "scale_y": 1.0,
+        "crop_y": 0.0,
+        "tensor_w": float(tensor_w),
+        "tensor_h": float(tensor_h),
+    }
+
+
+def projection_params_for_frame(args: argparse.Namespace, image_path: str, tensor_hw: tuple[int, int]) -> dict[str, float]:
+    if getattr(args, "_intrinsics_in_tensor_space", False):
+        return tensor_projection_params(tensor_hw)
+    return preprocess_projection_params(image_path, tensor_hw)
 
 
 def parse_float_list(value: str) -> list[float]:
@@ -224,7 +244,7 @@ def load_depth_maps(
     tensor_hw: tuple[int, int],
     args: argparse.Namespace,
 ) -> list[np.ndarray | None]:
-    if not args.use_depth_visibility and args.plane_mode != "auto_depth_surface":
+    if not args.use_depth_visibility and args.plane_mode not in ("auto_depth_surface", "fused_depth_surface"):
         return [None for _ in image_paths]
     depth_paths = match_depth_paths(seq_dir, image_paths, frame_indices, args)
     return [
@@ -362,6 +382,401 @@ def build_plane_world_from_camera_axes(
     return (first_c2w @ corners_h.T).T[:, :3]
 
 
+def build_plane_world_from_world_axes(
+    center_world: np.ndarray,
+    axis_u_world: np.ndarray,
+    axis_v_world: np.ndarray,
+    width: float,
+    height: float,
+) -> np.ndarray:
+    axis_u_world = axis_u_world / np.linalg.norm(axis_u_world)
+    axis_v_world = axis_v_world / np.linalg.norm(axis_v_world)
+    return np.asarray(
+        [
+            center_world - axis_u_world * width / 2 - axis_v_world * height / 2,
+            center_world + axis_u_world * width / 2 - axis_v_world * height / 2,
+            center_world + axis_u_world * width / 2 + axis_v_world * height / 2,
+            center_world - axis_u_world * width / 2 + axis_v_world * height / 2,
+        ],
+        dtype=np.float64,
+    )
+
+
+def depth_map_to_world_points(
+    depth_map: np.ndarray | None,
+    c2w: np.ndarray,
+    image_path: str,
+    tensor_hw: tuple[int, int],
+    intrinsics: np.ndarray,
+    args: argparse.Namespace,
+    stride: int,
+) -> np.ndarray:
+    if depth_map is None:
+        return np.empty((0, 3), dtype=np.float64)
+    tensor_h, tensor_w = tensor_hw
+    ys, xs = np.meshgrid(
+        np.arange(0, tensor_h, max(1, stride), dtype=np.float64),
+        np.arange(0, tensor_w, max(1, stride), dtype=np.float64),
+        indexing="ij",
+    )
+    xy = np.stack([xs.reshape(-1), ys.reshape(-1)], axis=1)
+    depths = depth_map[ys.astype(int).reshape(-1), xs.astype(int).reshape(-1)].astype(np.float64)
+    valid = (depths > args.depth_min_m) & (depths < args.depth_max_m)
+    if not bool(valid.any()):
+        return np.empty((0, 3), dtype=np.float64)
+    proj = projection_params_for_frame(args, image_path, tensor_hw)
+    points_cam = unproject_tensor_xy(xy[valid], depths[valid], intrinsics, proj)
+    points_h = np.concatenate([points_cam, np.ones((points_cam.shape[0], 1), dtype=np.float64)], axis=1)
+    return (c2w @ points_h.T).T[:, :3]
+
+
+def fused_depth_point_cloud(
+    c2w: np.ndarray,
+    image_paths: list[str],
+    tensor_hw: tuple[int, int],
+    intrinsics: np.ndarray,
+    args: argparse.Namespace,
+    depth_maps: list[np.ndarray | None],
+) -> np.ndarray:
+    clouds = [
+        depth_map_to_world_points(depth, pose, image_path, tensor_hw, intrinsics, args, args.fused_point_stride)
+        for depth, pose, image_path in zip(depth_maps, c2w, image_paths)
+    ]
+    clouds = [cloud for cloud in clouds if cloud.size > 0]
+    if not clouds:
+        return np.empty((0, 3), dtype=np.float64)
+    points = np.concatenate(clouds, axis=0)
+    if points.shape[0] > args.fused_max_points:
+        rng = np.random.default_rng(args.seed)
+        keep = rng.choice(points.shape[0], size=args.fused_max_points, replace=False)
+        points = points[keep]
+    return points
+
+
+def extrinsics_to_c2w(extrinsics: np.ndarray) -> np.ndarray:
+    c2w_list = []
+    for extrinsic in extrinsics:
+        w2c = np.eye(4, dtype=np.float64)
+        w2c[:3, :4] = np.asarray(extrinsic, dtype=np.float64)
+        c2w_list.append(np.linalg.inv(w2c))
+    return np.stack(c2w_list, axis=0)
+
+
+def load_clean_vggt_geometry(
+    seq_name: str,
+    tensor_hw: tuple[int, int],
+    args: argparse.Namespace,
+) -> dict | None:
+    if not args.clean_vggt_output_root:
+        return None
+    npz_path = Path(args.clean_vggt_output_root) / seq_name / "vggt_outputs.npz"
+    if not npz_path.exists():
+        return None
+    with np.load(npz_path) as data:
+        if "extrinsic" not in data or "intrinsic" not in data:
+            return None
+        c2w = extrinsics_to_c2w(np.asarray(data["extrinsic"]))
+        intrinsics = np.asarray(data["intrinsic"], dtype=np.float64)
+        if intrinsics.ndim == 2:
+            intrinsics = np.repeat(intrinsics[None], c2w.shape[0], axis=0)
+
+        point_keys = ("point_map", "point_cloud_unproj")
+        point_map = None
+        for key in point_keys:
+            if key in data:
+                point_map = np.asarray(data[key], dtype=np.float64)
+                break
+        if point_map is None:
+            return None
+
+        if point_map.ndim == 4 and point_map.shape[-1] == 3:
+            points = point_map.reshape(-1, 3)
+        else:
+            return None
+        valid = np.isfinite(points).all(axis=1)
+
+        if "point_conf" in data:
+            conf = np.asarray(data["point_conf"]).reshape(-1)
+            valid &= np.isfinite(conf)
+            if args.vggt_point_conf_percentile > 0 and valid.any():
+                threshold = np.percentile(conf[valid], args.vggt_point_conf_percentile)
+                valid &= conf >= threshold
+
+        points = points[valid]
+        if points.shape[0] > args.fused_max_points:
+            rng = np.random.default_rng(args.seed)
+            keep = rng.choice(points.shape[0], size=args.fused_max_points, replace=False)
+            points = points[keep]
+
+        depth_maps = None
+        if "depth" in data:
+            depth = np.asarray(data["depth"], dtype=np.float32)
+            if depth.ndim == 4 and depth.shape[-1] == 1:
+                depth = depth[..., 0]
+            if depth.ndim == 3:
+                depth_maps = [depth[idx] for idx in range(depth.shape[0])]
+
+    tensor_h, tensor_w = tensor_hw
+    if intrinsics.shape[1:] != (3, 3):
+        return None
+    if c2w.shape[0] != intrinsics.shape[0]:
+        return None
+    return {
+        "c2w": c2w,
+        "intrinsics": intrinsics,
+        "points": points,
+        "depth_maps": depth_maps,
+        "source": str(npz_path),
+        "tensor_hw": [tensor_h, tensor_w],
+    }
+
+
+def estimate_world_surface_axes(
+    points: np.ndarray,
+    center_world: np.ndarray,
+    first_c2w: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict] | None:
+    if points.shape[0] < 6:
+        return None
+    diff = points - center_world[None, :]
+    distances = np.linalg.norm(diff, axis=1)
+    radius_mask = distances <= args.fused_normal_radius
+    if int(radius_mask.sum()) < args.fused_min_neighbors:
+        neighbor_count = min(max(args.fused_min_neighbors, 6), points.shape[0])
+        nearest = np.argpartition(distances, neighbor_count - 1)[:neighbor_count]
+        neighbors = points[nearest]
+    else:
+        neighbors = points[radius_mask]
+        if neighbors.shape[0] > args.fused_max_neighbors:
+            nearest = np.argsort(np.linalg.norm(neighbors - center_world[None, :], axis=1))[: args.fused_max_neighbors]
+            neighbors = neighbors[nearest]
+
+    centered = neighbors - neighbors.mean(axis=0, keepdims=True)
+    cov = centered.T @ centered / max(1, neighbors.shape[0] - 1)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)
+    normal = eigvecs[:, order[0]]
+    axis_u = eigvecs[:, order[2]]
+    axis_v = eigvecs[:, order[1]]
+
+    camera_center = first_c2w[:3, 3]
+    if np.dot(normal, camera_center - center_world) < 0:
+        normal = -normal
+        axis_v = -axis_v
+    if np.linalg.norm(np.cross(axis_u, axis_v)) < 1e-8:
+        return None
+    axis_u = axis_u / np.linalg.norm(axis_u)
+    axis_v = np.cross(normal, axis_u)
+    axis_v = axis_v / np.linalg.norm(axis_v)
+    residual = float(eigvals[order[0]] / max(float(eigvals.sum()), 1e-12))
+    return axis_u, axis_v, normal, {
+        "neighbor_count": int(neighbors.shape[0]),
+        "pca_eigenvalues": eigvals[order].astype(float).tolist(),
+        "plane_residual_ratio": residual,
+    }
+
+
+def choose_fused_depth_surface_plane(
+    c2w: np.ndarray,
+    image_paths: list[str],
+    tensor_hw: tuple[int, int],
+    texture_size: int,
+    intrinsics: np.ndarray,
+    args: argparse.Namespace,
+    depth_maps: list[np.ndarray | None],
+) -> tuple[np.ndarray, dict]:
+    points = fused_depth_point_cloud(c2w, image_paths, tensor_hw, intrinsics, args, depth_maps)
+    if points.shape[0] == 0:
+        patch_world, meta = build_fixed_patch_plane_world(c2w[0], args)
+        meta["placement_mode"] = "fixed_fallback_no_fused_points"
+        return patch_world, meta
+
+    rng = np.random.default_rng(args.seed)
+    candidate_count = min(args.fused_surface_candidates, points.shape[0])
+    candidate_ids = rng.choice(points.shape[0], size=candidate_count, replace=False)
+
+    size_scales = [1.0]
+    roll_degrees = [0.0]
+    if args.optimize_geometry:
+        size_scales = parse_float_list(args.geometry_size_scales)
+        roll_degrees = parse_float_list(args.geometry_roll_degrees)
+
+    best: tuple[float, np.ndarray, dict] | None = None
+    tried = 0
+    old_depth_maps = getattr(args, "_active_depth_maps", None)
+    args._active_depth_maps = depth_maps
+    try:
+        for point_id in candidate_ids:
+            center_world = points[int(point_id)]
+            axes = estimate_world_surface_axes(points, center_world, c2w[0], args)
+            if axes is None:
+                continue
+            axis_u, axis_v, normal, pca_meta = axes
+            if pca_meta["plane_residual_ratio"] > args.fused_max_plane_residual:
+                continue
+            for scale in size_scales:
+                for roll in roll_degrees:
+                    tried += 1
+                    rolled_u, rolled_v = rotate_axes(axis_u, axis_v, roll)
+                    patch_world = build_plane_world_from_world_axes(
+                        center_world,
+                        rolled_u,
+                        rolled_v,
+                        args.plane_width * scale,
+                        args.plane_height * scale,
+                    )
+                    _, _, geom_meta = build_geometry_arrays_for_plane(
+                        patch_world,
+                        c2w,
+                        image_paths,
+                        tensor_hw,
+                        texture_size,
+                        intrinsics,
+                        args,
+                    )
+                    score = geometry_score(geom_meta)
+                    if best is None or score > best[0]:
+                        center_first_cam_h = np.linalg.inv(c2w[0]) @ np.asarray(
+                            [center_world[0], center_world[1], center_world[2], 1.0],
+                            dtype=np.float64,
+                        )
+                        placement = {
+                            "placement_mode": "fused_depth_surface",
+                            "score": score,
+                            "candidate_count": int(candidate_count),
+                            "tried_geometry_count": tried,
+                            "fused_point_count": int(points.shape[0]),
+                            "center_world": center_world.astype(float).tolist(),
+                            "center_first_camera": center_first_cam_h[:3].astype(float).tolist(),
+                            "surface_normal_world": normal.astype(float).tolist(),
+                            "width_m": args.plane_width * scale,
+                            "height_m": args.plane_height * scale,
+                            "size_scale": float(scale),
+                            "roll_degrees": float(roll),
+                            "optimize_geometry": bool(args.optimize_geometry),
+                            "fused_point_stride": int(args.fused_point_stride),
+                            "fused_normal_radius": float(args.fused_normal_radius),
+                            **pca_meta,
+                        }
+                        geom_meta.update(placement)
+                        best = (score, patch_world, geom_meta)
+    finally:
+        args._active_depth_maps = old_depth_maps
+
+    if best is None:
+        patch_world, meta = build_fixed_patch_plane_world(c2w[0], args)
+        meta["placement_mode"] = "fixed_fallback_no_valid_fused_surface"
+        meta["fused_point_count"] = int(points.shape[0])
+        meta["candidate_count"] = int(candidate_count)
+        meta["tried_geometry_count"] = tried
+        return patch_world, meta
+    best[2]["tried_geometry_count"] = tried
+    return best[1], best[2]
+
+
+def choose_vggt_pointmap_surface_plane(
+    c2w: np.ndarray,
+    image_paths: list[str],
+    tensor_hw: tuple[int, int],
+    texture_size: int,
+    intrinsics: np.ndarray,
+    args: argparse.Namespace,
+    depth_maps: list[np.ndarray | None],
+) -> tuple[np.ndarray, dict]:
+    points = getattr(args, "_active_vggt_points", None)
+    source = getattr(args, "_active_vggt_geometry_source", None)
+    if points is None or points.shape[0] == 0:
+        patch_world, meta = build_fixed_patch_plane_world(c2w[0], args)
+        meta["placement_mode"] = "fixed_fallback_no_vggt_pointmap"
+        return patch_world, meta
+
+    rng = np.random.default_rng(args.seed)
+    candidate_count = min(args.fused_surface_candidates, points.shape[0])
+    candidate_ids = rng.choice(points.shape[0], size=candidate_count, replace=False)
+
+    size_scales = [1.0]
+    roll_degrees = [0.0]
+    if args.optimize_geometry:
+        size_scales = parse_float_list(args.geometry_size_scales)
+        roll_degrees = parse_float_list(args.geometry_roll_degrees)
+
+    best: tuple[float, np.ndarray, dict] | None = None
+    tried = 0
+    old_depth_maps = getattr(args, "_active_depth_maps", None)
+    args._active_depth_maps = depth_maps
+    try:
+        for point_id in candidate_ids:
+            center_world = points[int(point_id)]
+            axes = estimate_world_surface_axes(points, center_world, c2w[0], args)
+            if axes is None:
+                continue
+            axis_u, axis_v, normal, pca_meta = axes
+            if pca_meta["plane_residual_ratio"] > args.fused_max_plane_residual:
+                continue
+            for scale in size_scales:
+                for roll in roll_degrees:
+                    tried += 1
+                    rolled_u, rolled_v = rotate_axes(axis_u, axis_v, roll)
+                    patch_world = build_plane_world_from_world_axes(
+                        center_world,
+                        rolled_u,
+                        rolled_v,
+                        args.plane_width * scale,
+                        args.plane_height * scale,
+                    )
+                    _, _, geom_meta = build_geometry_arrays_for_plane(
+                        patch_world,
+                        c2w,
+                        image_paths,
+                        tensor_hw,
+                        texture_size,
+                        intrinsics,
+                        args,
+                    )
+                    score = geometry_score(geom_meta)
+                    if best is None or score > best[0]:
+                        center_first_cam_h = np.linalg.inv(c2w[0]) @ np.asarray(
+                            [center_world[0], center_world[1], center_world[2], 1.0],
+                            dtype=np.float64,
+                        )
+                        placement = {
+                            "placement_mode": "vggt_pointmap_surface",
+                            "geometry_source": "clean_vggt_pointmap",
+                            "clean_vggt_output": source,
+                            "score": score,
+                            "candidate_count": int(candidate_count),
+                            "tried_geometry_count": tried,
+                            "vggt_point_count": int(points.shape[0]),
+                            "center_world": center_world.astype(float).tolist(),
+                            "center_first_camera": center_first_cam_h[:3].astype(float).tolist(),
+                            "surface_normal_world": normal.astype(float).tolist(),
+                            "width_m": args.plane_width * scale,
+                            "height_m": args.plane_height * scale,
+                            "size_scale": float(scale),
+                            "roll_degrees": float(roll),
+                            "optimize_geometry": bool(args.optimize_geometry),
+                            "vggt_point_conf_percentile": float(args.vggt_point_conf_percentile),
+                            **pca_meta,
+                        }
+                        geom_meta.update(placement)
+                        best = (score, patch_world, geom_meta)
+    finally:
+        args._active_depth_maps = old_depth_maps
+
+    if best is None:
+        patch_world, meta = build_fixed_patch_plane_world(c2w[0], args)
+        meta["placement_mode"] = "fixed_fallback_no_valid_vggt_surface"
+        meta["geometry_source"] = "clean_vggt_pointmap"
+        meta["clean_vggt_output"] = source
+        meta["vggt_point_count"] = int(points.shape[0])
+        meta["candidate_count"] = int(candidate_count)
+        meta["tried_geometry_count"] = tried
+        return patch_world, meta
+    best[2]["tried_geometry_count"] = tried
+    return best[1], best[2]
+
+
 def plane_depth_map(
     corners_cam: np.ndarray,
     intrinsics: np.ndarray,
@@ -432,11 +847,12 @@ def build_geometry_arrays_for_plane(
     projected_corners = []
     depth_maps = getattr(args, "_active_depth_maps", None)
     for frame_idx, pose in enumerate(c2w):
+        frame_intrinsics = intrinsics[frame_idx] if np.asarray(intrinsics).ndim == 3 else intrinsics
         w2c = np.linalg.inv(pose)
         corners_h = np.concatenate([patch_world, np.ones((4, 1), dtype=np.float64)], axis=1)
         corners_cam = (w2c @ corners_h.T).T[:, :3]
-        proj = preprocess_projection_params(image_paths[frame_idx], tensor_hw)
-        dst, corner_valid = camera_to_tensor_xy(corners_cam, intrinsics, proj)
+        proj = projection_params_for_frame(args, image_paths[frame_idx], tensor_hw)
+        dst, corner_valid = camera_to_tensor_xy(corners_cam, frame_intrinsics, proj)
         projected_corners.append(dst.astype(float).tolist())
 
         if not bool(corner_valid.all()):
@@ -466,7 +882,7 @@ def build_geometry_arrays_for_plane(
         raw_inside = inside.reshape(tensor_h, tensor_w)
         mask_bool = raw_inside
         if args.use_depth_visibility and depth_maps is not None and depth_maps[frame_idx] is not None:
-            patch_depth, depth_valid = plane_depth_map(corners_cam, intrinsics, proj, tensor_hw)
+            patch_depth, depth_valid = plane_depth_map(corners_cam, frame_intrinsics, proj, tensor_hw)
             scene_depth = depth_maps[frame_idx]
             scene_valid = (scene_depth > args.depth_min_m) & (scene_depth < args.depth_max_m)
             visible = depth_valid & scene_valid & (patch_depth <= scene_depth + args.visibility_depth_margin)
@@ -516,7 +932,7 @@ def choose_auto_depth_surface_plane(
         meta["placement_mode"] = "fixed_fallback_no_depth"
         return patch_world, meta
 
-    proj = preprocess_projection_params(image_paths[0], tensor_hw)
+    proj = projection_params_for_frame(args, image_paths[0], tensor_hw)
     tensor_h, tensor_w = tensor_hw
     margin_x = args.surface_search_margin * tensor_w
     margin_y = args.surface_search_margin * tensor_h
@@ -612,9 +1028,45 @@ def choose_patch_plane_world(
     args: argparse.Namespace,
     depth_maps: list[np.ndarray | None],
 ) -> tuple[np.ndarray, dict]:
-    if args.plane_mode == "auto_depth_surface":
-        return choose_auto_depth_surface_plane(c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps)
-    return build_fixed_patch_plane_world(c2w[0], args)
+    cache = getattr(args, "_plane_world_cache", None)
+    if cache is None:
+        cache = {}
+        args._plane_world_cache = cache
+    cache_key = (
+        args.plane_mode,
+        tuple(image_paths),
+        texture_size,
+        args.plane_width,
+        args.plane_height,
+        args.plane_distance,
+        args.plane_center_x,
+        args.plane_center_y,
+        args.use_depth_visibility,
+        args.optimize_geometry,
+        args.geometry_size_scales,
+        args.geometry_roll_degrees,
+        args.fused_point_stride,
+        args.fused_surface_candidates,
+        args.fused_normal_radius,
+        args.fused_max_plane_residual,
+        args.clean_vggt_output_root,
+        args.vggt_point_conf_percentile,
+    )
+    if cache_key in cache:
+        patch_world, meta = cache[cache_key]
+        return patch_world.copy(), copy.deepcopy(meta)
+
+    if args.plane_mode == "vggt_pointmap_surface":
+        result = choose_vggt_pointmap_surface_plane(c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps)
+    elif args.plane_mode == "fused_depth_surface":
+        result = choose_fused_depth_surface_plane(c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps)
+    elif args.plane_mode == "auto_depth_surface":
+        result = choose_auto_depth_surface_plane(c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps)
+    else:
+        result = build_fixed_patch_plane_world(c2w[0], args)
+
+    cache[cache_key] = (result[0].copy(), copy.deepcopy(result[1]))
+    return result
 
 
 def build_geometry_grids(
@@ -714,17 +1166,39 @@ def load_tum_sequence(
     images = load_and_preprocess_images(image_paths).to(device)
     tensor_hw = tuple(int(v) for v in images.shape[-2:])
     c2w = tum_rows_to_c2w(read_tum_rows(seq_dir / gt_name), frame_indices)
-    depth_maps = load_depth_maps(seq_dir, image_paths, frame_indices, tensor_hw, args)
-    grids, masks, geom_meta = build_geometry_grids(
-        c2w,
-        image_paths,
-        tensor_hw,
-        texture_size,
-        intrinsics,
-        args,
-        device,
-        depth_maps,
-    )
+    local_intrinsics = intrinsics
+    old_vggt_points = getattr(args, "_active_vggt_points", None)
+    old_vggt_source = getattr(args, "_active_vggt_geometry_source", None)
+    old_tensor_intrinsics = getattr(args, "_intrinsics_in_tensor_space", False)
+    args._active_vggt_points = None
+    args._active_vggt_geometry_source = None
+    args._intrinsics_in_tensor_space = False
+    try:
+        depth_maps = load_depth_maps(seq_dir, image_paths, frame_indices, tensor_hw, args)
+        if args.plane_mode == "vggt_pointmap_surface":
+            clean_geometry = load_clean_vggt_geometry(seq_dir.name, tensor_hw, args)
+            if clean_geometry is not None:
+                c2w = clean_geometry["c2w"]
+                local_intrinsics = clean_geometry["intrinsics"]
+                args._active_vggt_points = clean_geometry["points"]
+                args._active_vggt_geometry_source = clean_geometry["source"]
+                args._intrinsics_in_tensor_space = True
+                if args.use_depth_visibility and clean_geometry["depth_maps"] is not None:
+                    depth_maps = clean_geometry["depth_maps"]
+        grids, masks, geom_meta = build_geometry_grids(
+            c2w,
+            image_paths,
+            tensor_hw,
+            texture_size,
+            local_intrinsics,
+            args,
+            device,
+            depth_maps,
+        )
+    finally:
+        args._active_vggt_points = old_vggt_points
+        args._active_vggt_geometry_source = old_vggt_source
+        args._intrinsics_in_tensor_space = old_tensor_intrinsics
     return {
         "seq": seq_dir.name,
         "seq_dir": seq_dir,
@@ -733,6 +1207,8 @@ def load_tum_sequence(
         "image_names": [Path(path).name for path in image_paths],
         "frame_indices": frame_indices,
         "c2w_gt": c2w,
+        "geometry_intrinsics": np.asarray(local_intrinsics).astype(float).tolist(),
+        "geometry_source": geom_meta.get("geometry_source", "tum_gt_geometry"),
         "depth_available": [depth is not None for depth in depth_maps],
         "grids": grids,
         "masks": masks,
@@ -899,6 +1375,8 @@ def train_geometry_patch(
         },
         "plane": {
             "mode": args.plane_mode,
+            "clean_vggt_output_root": args.clean_vggt_output_root,
+            "vggt_point_conf_percentile": args.vggt_point_conf_percentile,
             "center_first_camera": [args.plane_center_x, args.plane_center_y, args.plane_distance],
             "width_m": args.plane_width,
             "height_m": args.plane_height,
@@ -907,6 +1385,13 @@ def train_geometry_patch(
             "optimize_geometry": bool(args.optimize_geometry),
             "geometry_size_scales": args.geometry_size_scales,
             "geometry_roll_degrees": args.geometry_roll_degrees,
+            "fused_point_stride": args.fused_point_stride,
+            "fused_max_points": args.fused_max_points,
+            "fused_surface_candidates": args.fused_surface_candidates,
+            "fused_normal_radius": args.fused_normal_radius,
+            "fused_min_neighbors": args.fused_min_neighbors,
+            "fused_max_neighbors": args.fused_max_neighbors,
+            "fused_max_plane_residual": args.fused_max_plane_residual,
         },
         "intrinsics": intrinsics.astype(float).tolist(),
         "frame_manifest": args.frame_manifest,
@@ -1014,7 +1499,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fy", type=float, default=539.2)
     parser.add_argument("--cx", type=float, default=320.1)
     parser.add_argument("--cy", type=float, default=247.6)
-    parser.add_argument("--plane_mode", choices=("fixed", "auto_depth_surface"), default="fixed")
+    parser.add_argument(
+        "--plane_mode",
+        choices=("fixed", "auto_depth_surface", "fused_depth_surface", "vggt_pointmap_surface"),
+        default="fixed",
+    )
+    parser.add_argument("--clean_vggt_output_root", default=None)
+    parser.add_argument("--vggt_point_conf_percentile", type=float, default=40.0)
     parser.add_argument("--plane_width", type=float, default=0.6)
     parser.add_argument("--plane_height", type=float, default=0.6)
     parser.add_argument("--plane_distance", type=float, default=2.0)
@@ -1033,6 +1524,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--optimize_geometry", action="store_true")
     parser.add_argument("--geometry_size_scales", default="0.8,1.0,1.2")
     parser.add_argument("--geometry_roll_degrees", default="-15,0,15")
+    parser.add_argument("--fused_point_stride", type=int, default=28)
+    parser.add_argument("--fused_max_points", type=int, default=6000)
+    parser.add_argument("--fused_surface_candidates", type=int, default=64)
+    parser.add_argument("--fused_normal_radius", type=float, default=0.25)
+    parser.add_argument("--fused_min_neighbors", type=int, default=24)
+    parser.add_argument("--fused_max_neighbors", type=int, default=256)
+    parser.add_argument("--fused_max_plane_residual", type=float, default=0.08)
     parser.add_argument("--physical_eot", action="store_true")
     parser.add_argument("--print_min", type=float, default=0.0)
     parser.add_argument("--print_max", type=float, default=1.0)
@@ -1084,6 +1582,8 @@ def main() -> None:
             "frame_manifest": args.frame_manifest,
             "intrinsics": intrinsics.astype(float).tolist(),
             "plane_mode": args.plane_mode,
+            "clean_vggt_output_root": args.clean_vggt_output_root,
+            "vggt_point_conf_percentile": args.vggt_point_conf_percentile,
             "use_depth_visibility": bool(args.use_depth_visibility),
             "physical_eot": bool(args.physical_eot),
         }

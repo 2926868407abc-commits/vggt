@@ -4,8 +4,8 @@ set -Eeuo pipefail
 VGGT_ROOT="${VGGT_ROOT:-/mnt/data/wangqq/vggt}"
 VGGT_PY="${VGGT_PY:-/mnt/data/wangqq/conda_envs/vggt/bin/python3}"
 
-GEOMETRY_OUTPUT_ROOT="${GEOMETRY_OUTPUT_ROOT:-$VGGT_ROOT/outputs_attack_geometry_aware_tum10/tum10_gt_geometry_full_feature_l3}"
-VIS_OUT_DIR="${VIS_OUT_DIR:-$VGGT_ROOT/outputs_attack_geometry_aware_tum10/visualizations_full}"
+GEOMETRY_OUTPUT_ROOT="${GEOMETRY_OUTPUT_ROOT:-$VGGT_ROOT/outputs_attack_geometry_aware_tum10/tum10_vggt_pointmap_geometry_feature_l3}"
+VIS_OUT_DIR="${VIS_OUT_DIR:-$VGGT_ROOT/outputs_attack_geometry_aware_tum10/visualizations_vggt_pointmap}"
 VIS_SCENE_PATTERN="${VIS_SCENE_PATTERN:-rgbd_dataset_freiburg3_*}"
 VIS_FRAMES="${VIS_FRAMES:-all}"
 VIS_ALPHA="${VIS_ALPHA:-0.9}"

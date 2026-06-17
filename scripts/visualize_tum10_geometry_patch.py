@@ -205,7 +205,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--geometry_output_root",
-        default="/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/tum10_gt_geometry_full_feature_l3",
+        default="/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/tum10_vggt_pointmap_geometry_feature_l3",
         help="Directory containing geometry_patch/ and per-sequence attack_summary.json files.",
     )
     parser.add_argument(
