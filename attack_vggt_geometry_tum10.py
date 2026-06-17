@@ -9,7 +9,8 @@ This is a GT-geometry-consistent physical patch pipeline:
   intrinsics, then differentiably sampled into the VGGT input images
 * optional TUM depth visibility acts as a z-buffer for occlusion
 * optional geometry search chooses patch position, surface orientation, and size
-  by visible cross-view coverage before texture optimization
+  by visible cross-view coverage, or by a natural-sticker coverage range, before
+  texture optimization
 * optional physical EOT applies printable color clamping, lighting jitter, and
   camera noise during texture optimization
 * the objective is still label-free feature L1: maximize
@@ -635,7 +636,7 @@ def choose_fused_depth_surface_plane(
                         intrinsics,
                         args,
                     )
-                    score = geometry_score(geom_meta)
+                    score = geometry_score(geom_meta, args)
                     if best is None or score > best[0]:
                         center_first_cam_h = np.linalg.inv(c2w[0]) @ np.asarray(
                             [center_world[0], center_world[1], center_world[2], 1.0],
@@ -665,6 +666,11 @@ def choose_fused_depth_surface_plane(
         args._active_depth_maps = old_depth_maps
 
     if best is None:
+        if args.surface_score_mode == "natural":
+            raise RuntimeError(
+                "No fused-depth surface satisfied the natural sticker constraints. "
+                "Relax surface_coverage_min/max or surface_min_visible_frames."
+            )
         patch_world, meta = build_fixed_patch_plane_world(c2w[0], args)
         meta["placement_mode"] = "fixed_fallback_no_valid_fused_surface"
         meta["fused_point_count"] = int(points.shape[0])
@@ -734,7 +740,7 @@ def choose_vggt_pointmap_surface_plane(
                         intrinsics,
                         args,
                     )
-                    score = geometry_score(geom_meta)
+                    score = geometry_score(geom_meta, args)
                     if best is None or score > best[0]:
                         center_first_cam_h = np.linalg.inv(c2w[0]) @ np.asarray(
                             [center_world[0], center_world[1], center_world[2], 1.0],
@@ -765,6 +771,11 @@ def choose_vggt_pointmap_surface_plane(
         args._active_depth_maps = old_depth_maps
 
     if best is None:
+        if args.surface_score_mode == "natural":
+            raise RuntimeError(
+                "No clean-VGGT pointmap surface satisfied the natural sticker constraints. "
+                "Relax surface_coverage_min/max or surface_min_visible_frames."
+            )
         patch_world, meta = build_fixed_patch_plane_world(c2w[0], args)
         meta["placement_mode"] = "fixed_fallback_no_valid_vggt_surface"
         meta["geometry_source"] = "clean_vggt_pointmap"
@@ -910,10 +921,24 @@ def build_geometry_arrays_for_plane(
     return np.stack(grids, axis=0), np.stack(masks, axis=0), meta
 
 
-def geometry_score(meta: dict) -> float:
+def geometry_score(meta: dict, args: argparse.Namespace) -> float:
     coverages = np.asarray(meta["mask_coverage_per_frame"], dtype=np.float64)
     if coverages.size == 0:
-        return 0.0
+        return -float("inf")
+    visible_frames = int(np.count_nonzero(coverages > 1e-8))
+    visibility_ratio = float(meta.get("visibility_ratio_mean", 0.0))
+    mean_coverage = float(coverages.mean())
+
+    if args.surface_score_mode == "natural":
+        if mean_coverage < args.surface_coverage_min:
+            return -float("inf")
+        if args.surface_coverage_max > 0 and mean_coverage > args.surface_coverage_max:
+            return -float("inf")
+        if visible_frames < args.surface_min_visible_frames:
+            return -float("inf")
+        if visibility_ratio < args.surface_min_visibility_ratio:
+            return -float("inf")
+
     return float(coverages.mean() + 0.25 * coverages.min())
 
 
@@ -989,7 +1014,7 @@ def choose_auto_depth_surface_plane(
                             intrinsics,
                             args,
                         )
-                        score = geometry_score(geom_meta)
+                        score = geometry_score(geom_meta, args)
                         if best is None or score > best[0]:
                             placement = {
                                 "placement_mode": "auto_depth_surface",
@@ -1011,6 +1036,11 @@ def choose_auto_depth_surface_plane(
         args._active_depth_maps = old_depth_maps
 
     if best is None:
+        if args.surface_score_mode == "natural":
+            raise RuntimeError(
+                "No depth surface satisfied the natural sticker constraints. "
+                "Relax surface_coverage_min/max or surface_min_visible_frames."
+            )
         patch_world, meta = build_fixed_patch_plane_world(c2w[0], args)
         meta["placement_mode"] = "fixed_fallback_no_valid_surface"
         meta["candidate_count"] = tried
@@ -1392,6 +1422,11 @@ def train_geometry_patch(
             "fused_min_neighbors": args.fused_min_neighbors,
             "fused_max_neighbors": args.fused_max_neighbors,
             "fused_max_plane_residual": args.fused_max_plane_residual,
+            "surface_score_mode": args.surface_score_mode,
+            "surface_coverage_min": args.surface_coverage_min,
+            "surface_coverage_max": args.surface_coverage_max,
+            "surface_min_visible_frames": args.surface_min_visible_frames,
+            "surface_min_visibility_ratio": args.surface_min_visibility_ratio,
         },
         "intrinsics": intrinsics.astype(float).tolist(),
         "frame_manifest": args.frame_manifest,
@@ -1531,6 +1566,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fused_min_neighbors", type=int, default=24)
     parser.add_argument("--fused_max_neighbors", type=int, default=256)
     parser.add_argument("--fused_max_plane_residual", type=float, default=0.08)
+    parser.add_argument(
+        "--surface_score_mode",
+        choices=("coverage", "natural"),
+        default="coverage",
+        help="coverage keeps the old max-visible-area search; natural restricts candidates to a sticker-like coverage range.",
+    )
+    parser.add_argument("--surface_coverage_min", type=float, default=0.005)
+    parser.add_argument("--surface_coverage_max", type=float, default=0.06)
+    parser.add_argument("--surface_min_visible_frames", type=int, default=3)
+    parser.add_argument("--surface_min_visibility_ratio", type=float, default=0.5)
     parser.add_argument("--physical_eot", action="store_true")
     parser.add_argument("--print_min", type=float, default=0.0)
     parser.add_argument("--print_max", type=float, default=1.0)
