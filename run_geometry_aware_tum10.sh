@@ -156,8 +156,8 @@ fi
   --plane_center_y "$PLANE_CENTER_Y" \
   --surface_candidate_grid "$SURFACE_CANDIDATE_GRID" \
   --surface_search_margin "$SURFACE_SEARCH_MARGIN" \
-  --geometry_size_scales "$GEOMETRY_SIZE_SCALES" \
-  --geometry_roll_degrees "$GEOMETRY_ROLL_DEGREES" \
+  --geometry_size_scales="$GEOMETRY_SIZE_SCALES" \
+  --geometry_roll_degrees="$GEOMETRY_ROLL_DEGREES" \
   --visibility_depth_margin "$VISIBILITY_DEPTH_MARGIN" \
   --print_min "$PRINT_MIN" \
   --print_max "$PRINT_MAX" \
