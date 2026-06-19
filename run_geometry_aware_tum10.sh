@@ -54,6 +54,10 @@ SURFACE_COVERAGE_MIN="${SURFACE_COVERAGE_MIN:-0.005}"
 SURFACE_COVERAGE_MAX="${SURFACE_COVERAGE_MAX:-0.06}"
 SURFACE_MIN_VISIBLE_FRAMES="${SURFACE_MIN_VISIBLE_FRAMES:-3}"
 SURFACE_MIN_VISIBILITY_RATIO="${SURFACE_MIN_VISIBILITY_RATIO:-0.5}"
+SURFACE_ORIENTATION_FILTER="${SURFACE_ORIENTATION_FILTER:-none}"
+SURFACE_MAX_TILT_DEGREES="${SURFACE_MAX_TILT_DEGREES:-35}"
+SURFACE_MIN_CENTER_DEPTH="${SURFACE_MIN_CENTER_DEPTH:-0.0}"
+SURFACE_MAX_CENTER_DEPTH="${SURFACE_MAX_CENTER_DEPTH:-0.0}"
 
 PHYSICAL_EOT="${PHYSICAL_EOT:-1}"
 PRINT_MIN="${PRINT_MIN:-0.0}"
@@ -100,6 +104,7 @@ echo "plane_mode=$PLANE_MODE clean_vggt_output_root=$TUM_CLEAN_OUT use_depth_vis
 echo "surface_candidate_grid=$SURFACE_CANDIDATE_GRID geometry_size_scales=$GEOMETRY_SIZE_SCALES geometry_roll_degrees=$GEOMETRY_ROLL_DEGREES"
 echo "fused_point_stride=$FUSED_POINT_STRIDE fused_surface_candidates=$FUSED_SURFACE_CANDIDATES fused_normal_radius=$FUSED_NORMAL_RADIUS"
 echo "surface_score_mode=$SURFACE_SCORE_MODE coverage=[$SURFACE_COVERAGE_MIN,$SURFACE_COVERAGE_MAX] min_visible_frames=$SURFACE_MIN_VISIBLE_FRAMES min_visibility_ratio=$SURFACE_MIN_VISIBILITY_RATIO"
+echo "surface_orientation_filter=$SURFACE_ORIENTATION_FILTER max_tilt=$SURFACE_MAX_TILT_DEGREES center_depth=[$SURFACE_MIN_CENTER_DEPTH,$SURFACE_MAX_CENTER_DEPTH]"
 echo "physical_eot=$PHYSICAL_EOT print=[$PRINT_MIN,$PRINT_MAX] brightness=$EOT_BRIGHTNESS contrast=$EOT_CONTRAST gamma=$EOT_GAMMA noise_std=$EOT_NOISE_STD"
 
 log "prepare TUM images links"
@@ -187,6 +192,10 @@ fi
   --surface_coverage_max "$SURFACE_COVERAGE_MAX" \
   --surface_min_visible_frames "$SURFACE_MIN_VISIBLE_FRAMES" \
   --surface_min_visibility_ratio "$SURFACE_MIN_VISIBILITY_RATIO" \
+  --surface_orientation_filter "$SURFACE_ORIENTATION_FILTER" \
+  --surface_max_tilt_degrees "$SURFACE_MAX_TILT_DEGREES" \
+  --surface_min_center_depth "$SURFACE_MIN_CENTER_DEPTH" \
+  --surface_max_center_depth "$SURFACE_MAX_CENTER_DEPTH" \
   --visibility_depth_margin "$VISIBILITY_DEPTH_MARGIN" \
   --print_min "$PRINT_MIN" \
   --print_max "$PRINT_MAX" \

@@ -6,8 +6,8 @@ set -Eeuo pipefail
 # placement to small, visible, planar surfaces instead of maximizing raw area.
 
 export PLANE_MODE="${PLANE_MODE:-vggt_pointmap_surface}"
-export TUM_GEOM_RUN_NAME="${TUM_GEOM_RUN_NAME:-tum10_vggt_pointmap_natural_geometry_feature_l3}"
-export TUM_GEOM_MODEL="${TUM_GEOM_MODEL:-vggt_tum10_vggt_pointmap_natural_geometry_feature_l3}"
+export TUM_GEOM_RUN_NAME="${TUM_GEOM_RUN_NAME:-tum10_vggt_pointmap_natural_rigid_geometry_feature_l3}"
+export TUM_GEOM_MODEL="${TUM_GEOM_MODEL:-vggt_tum10_vggt_pointmap_natural_rigid_geometry_feature_l3}"
 
 # A 25 cm sticker is much closer to a physical patch than the previous 60 cm
 # debug plane. Size scales still allow the search to test nearby sizes.
@@ -20,9 +20,16 @@ export GEOMETRY_ROLL_DEGREES="${GEOMETRY_ROLL_DEGREES:--30,-15,0,15,30}"
 # an unnaturally large image area. Coverage is fraction of the VGGT input image.
 export SURFACE_SCORE_MODE="${SURFACE_SCORE_MODE:-natural}"
 export SURFACE_COVERAGE_MIN="${SURFACE_COVERAGE_MIN:-0.003}"
-export SURFACE_COVERAGE_MAX="${SURFACE_COVERAGE_MAX:-0.06}"
+export SURFACE_COVERAGE_MAX="${SURFACE_COVERAGE_MAX:-0.04}"
 export SURFACE_MIN_VISIBLE_FRAMES="${SURFACE_MIN_VISIBLE_FRAMES:-4}"
 export SURFACE_MIN_VISIBILITY_RATIO="${SURFACE_MIN_VISIBILITY_RATIO:-0.5}"
+export SURFACE_ORIENTATION_FILTER="${SURFACE_ORIENTATION_FILTER:-fronto}"
+export SURFACE_MAX_TILT_DEGREES="${SURFACE_MAX_TILT_DEGREES:-30}"
+
+# Keep the natural sticker away from nearby moving people. With fronto-facing
+# surfaces this prefers partitions, monitors, walls, and similar rigid objects.
+export SURFACE_MIN_CENTER_DEPTH="${SURFACE_MIN_CENTER_DEPTH:-1.6}"
+export SURFACE_MAX_CENTER_DEPTH="${SURFACE_MAX_CENTER_DEPTH:-4.0}"
 
 # Search more candidate surfaces because the natural filter rejects many planes.
 export FUSED_SURFACE_CANDIDATES="${FUSED_SURFACE_CANDIDATES:-256}"

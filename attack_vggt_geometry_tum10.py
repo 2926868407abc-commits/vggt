@@ -578,6 +578,76 @@ def estimate_world_surface_axes(
     }
 
 
+def surface_candidate_first_camera_meta(
+    center_first_camera: np.ndarray,
+    normal_first_camera: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[bool, dict]:
+    center_first_camera = np.asarray(center_first_camera, dtype=np.float64)
+    normal_first_camera = np.asarray(normal_first_camera, dtype=np.float64)
+    normal_norm = float(np.linalg.norm(normal_first_camera))
+    if normal_norm < 1e-8 or not np.all(np.isfinite(center_first_camera)):
+        return False, {}
+    normal_first_camera = normal_first_camera / normal_norm
+    depth = float(center_first_camera[2])
+
+    meta = {
+        "surface_center_depth_first_camera": depth,
+        "surface_normal_first_camera": normal_first_camera.astype(float).tolist(),
+        "surface_orientation_filter": args.surface_orientation_filter,
+        "surface_min_center_depth": args.surface_min_center_depth,
+        "surface_max_center_depth": args.surface_max_center_depth,
+        "surface_max_tilt_degrees": args.surface_max_tilt_degrees,
+    }
+
+    if args.surface_min_center_depth > 0 and depth < args.surface_min_center_depth:
+        return False, meta
+    if args.surface_max_center_depth > 0 and depth > args.surface_max_center_depth:
+        return False, meta
+
+    if args.surface_orientation_filter == "none":
+        return True, meta
+
+    min_cos = math.cos(math.radians(args.surface_max_tilt_degrees))
+    fronto = abs(float(normal_first_camera[2])) >= min_cos
+    tabletop = abs(float(normal_first_camera[1])) >= min_cos
+    side = abs(float(normal_first_camera[0])) >= min_cos
+    meta.update(
+        {
+            "surface_is_fronto": fronto,
+            "surface_is_tabletop": tabletop,
+            "surface_is_side": side,
+        }
+    )
+
+    if args.surface_orientation_filter == "fronto":
+        return fronto, meta
+    if args.surface_orientation_filter == "tabletop":
+        return tabletop, meta
+    if args.surface_orientation_filter == "side":
+        return side, meta
+    if args.surface_orientation_filter == "fronto_or_tabletop":
+        return fronto or tabletop, meta
+    if args.surface_orientation_filter == "axis_aligned":
+        return fronto or tabletop or side, meta
+    raise ValueError(f"Unknown surface_orientation_filter: {args.surface_orientation_filter}")
+
+
+def world_surface_candidate_first_camera_meta(
+    center_world: np.ndarray,
+    normal_world: np.ndarray,
+    first_c2w: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[bool, dict]:
+    world_to_first = np.linalg.inv(first_c2w)
+    center_h = world_to_first @ np.asarray(
+        [center_world[0], center_world[1], center_world[2], 1.0],
+        dtype=np.float64,
+    )
+    normal_first_camera = first_c2w[:3, :3].T @ np.asarray(normal_world, dtype=np.float64)
+    return surface_candidate_first_camera_meta(center_h[:3], normal_first_camera, args)
+
+
 def choose_fused_depth_surface_plane(
     c2w: np.ndarray,
     image_paths: list[str],
@@ -615,6 +685,11 @@ def choose_fused_depth_surface_plane(
                 continue
             axis_u, axis_v, normal, pca_meta = axes
             if pca_meta["plane_residual_ratio"] > args.fused_max_plane_residual:
+                continue
+            candidate_ok, candidate_meta = world_surface_candidate_first_camera_meta(
+                center_world, normal, c2w[0], args
+            )
+            if not candidate_ok:
                 continue
             for scale in size_scales:
                 for roll in roll_degrees:
@@ -658,6 +733,7 @@ def choose_fused_depth_surface_plane(
                             "optimize_geometry": bool(args.optimize_geometry),
                             "fused_point_stride": int(args.fused_point_stride),
                             "fused_normal_radius": float(args.fused_normal_radius),
+                            **candidate_meta,
                             **pca_meta,
                         }
                         geom_meta.update(placement)
@@ -720,6 +796,11 @@ def choose_vggt_pointmap_surface_plane(
             axis_u, axis_v, normal, pca_meta = axes
             if pca_meta["plane_residual_ratio"] > args.fused_max_plane_residual:
                 continue
+            candidate_ok, candidate_meta = world_surface_candidate_first_camera_meta(
+                center_world, normal, c2w[0], args
+            )
+            if not candidate_ok:
+                continue
             for scale in size_scales:
                 for roll in roll_degrees:
                     tried += 1
@@ -763,6 +844,7 @@ def choose_vggt_pointmap_surface_plane(
                             "roll_degrees": float(roll),
                             "optimize_geometry": bool(args.optimize_geometry),
                             "vggt_point_conf_percentile": float(args.vggt_point_conf_percentile),
+                            **candidate_meta,
                             **pca_meta,
                         }
                         geom_meta.update(placement)
@@ -993,6 +1075,9 @@ def choose_auto_depth_surface_plane(
                     intrinsics,
                     proj,
                 )
+                candidate_ok, candidate_meta = surface_candidate_first_camera_meta(center_cam, normal, args)
+                if not candidate_ok:
+                    continue
                 for scale in size_scales:
                     for roll in roll_degrees:
                         tried += 1
@@ -1029,6 +1114,7 @@ def choose_auto_depth_surface_plane(
                                 "size_scale": float(scale),
                                 "roll_degrees": float(roll),
                                 "optimize_geometry": bool(args.optimize_geometry),
+                                **candidate_meta,
                             }
                             geom_meta.update(placement)
                             best = (score, patch_world, geom_meta)
@@ -1427,6 +1513,10 @@ def train_geometry_patch(
             "surface_coverage_max": args.surface_coverage_max,
             "surface_min_visible_frames": args.surface_min_visible_frames,
             "surface_min_visibility_ratio": args.surface_min_visibility_ratio,
+            "surface_orientation_filter": args.surface_orientation_filter,
+            "surface_max_tilt_degrees": args.surface_max_tilt_degrees,
+            "surface_min_center_depth": args.surface_min_center_depth,
+            "surface_max_center_depth": args.surface_max_center_depth,
         },
         "intrinsics": intrinsics.astype(float).tolist(),
         "frame_manifest": args.frame_manifest,
@@ -1576,6 +1666,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--surface_coverage_max", type=float, default=0.06)
     parser.add_argument("--surface_min_visible_frames", type=int, default=3)
     parser.add_argument("--surface_min_visibility_ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--surface_orientation_filter",
+        choices=("none", "fronto", "tabletop", "side", "fronto_or_tabletop", "axis_aligned"),
+        default="none",
+    )
+    parser.add_argument("--surface_max_tilt_degrees", type=float, default=35.0)
+    parser.add_argument("--surface_min_center_depth", type=float, default=0.0)
+    parser.add_argument("--surface_max_center_depth", type=float, default=0.0)
     parser.add_argument("--physical_eot", action="store_true")
     parser.add_argument("--print_min", type=float, default=0.0)
     parser.add_argument("--print_max", type=float, default=1.0)
