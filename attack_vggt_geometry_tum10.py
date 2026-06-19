@@ -1564,6 +1564,11 @@ def evaluate_geometry_patch(
             device,
         )
         adv_images = apply_geometry_patch(item["images"], texture, item["grids"], item["masks"], args, training=False).detach()
+        visibility_mask_path = out_dir / "geometry_visibility_masks.npz"
+        np.savez_compressed(
+            visibility_mask_path,
+            masks=item["masks"].detach().float().cpu().numpy().astype(np.float16),
+        )
         with torch.no_grad():
             clean_features = extract_features(model, item["images"], dtype, args.feature_layer)
             adv_features = extract_features(model, adv_images, dtype, args.feature_layer)
@@ -1585,7 +1590,10 @@ def evaluate_geometry_patch(
             "geometry": item["geometry"],
             "depth_available": item["depth_available"],
             "geometry_patch_metadata": patch_metadata,
-            "outputs": {"attacked_vggt_outputs": "vggt_outputs.npz"},
+            "outputs": {
+                "attacked_vggt_outputs": "vggt_outputs.npz",
+                "visibility_masks": visibility_mask_path.name,
+            },
         }
         with (out_dir / "attack_summary.json").open("w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)

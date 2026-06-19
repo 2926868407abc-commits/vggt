@@ -87,6 +87,17 @@ def alpha_mask(mask: Image.Image, alpha: float) -> Image.Image:
     return Image.fromarray(arr, mode="L")
 
 
+def mask_array_to_image(mask: np.ndarray, image_size: tuple[int, int]) -> Image.Image:
+    mask = np.asarray(mask, dtype=np.float32)
+    if mask.ndim == 3:
+        mask = mask[0]
+    mask = np.clip(mask, 0.0, 1.0)
+    mask_image = Image.fromarray((mask * 255.0).astype(np.uint8), mode="L")
+    if mask_image.size != image_size:
+        mask_image = mask_image.resize(image_size, Image.Resampling.NEAREST)
+    return mask_image
+
+
 def draw_label(image: Image.Image, text: str) -> None:
     draw = ImageDraw.Draw(image)
     font = ImageFont.load_default()
@@ -97,9 +108,23 @@ def draw_label(image: Image.Image, text: str) -> None:
     draw.text((8 + pad, 8 + pad), text, fill=(255, 255, 255, 255), font=font)
 
 
-def composite_patch(base: Image.Image, texture: Image.Image, quad: np.ndarray, alpha: float, label: str) -> Image.Image:
+def composite_patch(
+    base: Image.Image,
+    texture: Image.Image,
+    quad: np.ndarray,
+    alpha: float,
+    label: str,
+    visibility_mask: np.ndarray | None = None,
+) -> Image.Image:
     out = base.convert("RGBA")
-    warped, mask = warp_texture_to_quad(texture, quad, out.size)
+    warped, quad_mask = warp_texture_to_quad(texture, quad, out.size)
+    mask = quad_mask
+    if visibility_mask is not None:
+        visible = mask_array_to_image(visibility_mask, out.size)
+        mask = Image.fromarray(
+            np.minimum(np.asarray(quad_mask, dtype=np.uint8), np.asarray(visible, dtype=np.uint8)),
+            mode="L",
+        )
     out = Image.composite(warped, out, alpha_mask(mask, alpha))
     draw = ImageDraw.Draw(out)
     points = [tuple(map(float, p)) for p in quad.tolist()]
@@ -174,6 +199,11 @@ def visualize_sequence(
     frame_indices = summary["frame_indices"]
     corners = summary["geometry"]["projected_corners"]
     coverages = summary["geometry"]["mask_coverage_per_frame"]
+    mask_path = seq_dir / summary.get("outputs", {}).get("visibility_masks", "geometry_visibility_masks.npz")
+    masks = None
+    if mask_path.exists():
+        with np.load(mask_path) as data:
+            masks = np.asarray(data["masks"], dtype=np.float32)
     selected = parse_frame_selection(frame_selection, len(image_paths))
 
     seq_out = out_root / seq_dir.name
@@ -188,7 +218,8 @@ def visualize_sequence(
         quad = np.asarray(corners[i], dtype=np.float64)
         label = f"{seq_dir.name} | frame={frame_indices[i]} | cov={coverages[i]:.4f}"
 
-        over = composite_patch(base, texture, quad, alpha, label)
+        visibility_mask = masks[i] if masks is not None else None
+        over = composite_patch(base, texture, quad, alpha, label, visibility_mask)
         outline = outline_only(base, quad, label)
         stem = f"{i:02d}_frame_{int(frame_indices[i]):06d}"
         over.save(overlay_dir / f"{stem}_patch.png")
