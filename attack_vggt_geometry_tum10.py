@@ -648,6 +648,15 @@ def world_surface_candidate_first_camera_meta(
     return surface_candidate_first_camera_meta(center_h[:3], normal_first_camera, args)
 
 
+def store_surface_candidates(args: argparse.Namespace, candidates: list[tuple[float, np.ndarray, dict]]) -> None:
+    candidates = sorted(candidates, key=lambda item: item[0], reverse=True)
+    keep = max(1, int(args.surface_strength_candidates))
+    args._last_patch_plane_candidates = [
+        (float(score), patch_world.copy(), copy.deepcopy(meta))
+        for score, patch_world, meta in candidates[:keep]
+    ]
+
+
 def choose_fused_depth_surface_plane(
     c2w: np.ndarray,
     image_paths: list[str],
@@ -674,6 +683,7 @@ def choose_fused_depth_surface_plane(
         roll_degrees = parse_float_list(args.geometry_roll_degrees)
 
     best: tuple[float, np.ndarray, dict] | None = None
+    candidates: list[tuple[float, np.ndarray, dict]] = []
     tried = 0
     old_depth_maps = getattr(args, "_active_depth_maps", None)
     args._active_depth_maps = depth_maps
@@ -712,36 +722,41 @@ def choose_fused_depth_surface_plane(
                         args,
                     )
                     score = geometry_score(geom_meta, args)
+                    if not np.isfinite(score):
+                        continue
+                    center_first_cam_h = np.linalg.inv(c2w[0]) @ np.asarray(
+                        [center_world[0], center_world[1], center_world[2], 1.0],
+                        dtype=np.float64,
+                    )
+                    placement = {
+                        "placement_mode": "fused_depth_surface",
+                        "score": score,
+                        "candidate_count": int(candidate_count),
+                        "tried_geometry_count": tried,
+                        "fused_point_count": int(points.shape[0]),
+                        "center_world": center_world.astype(float).tolist(),
+                        "center_first_camera": center_first_cam_h[:3].astype(float).tolist(),
+                        "surface_normal_world": normal.astype(float).tolist(),
+                        "width_m": args.plane_width * scale,
+                        "height_m": args.plane_height * scale,
+                        "size_scale": float(scale),
+                        "roll_degrees": float(roll),
+                        "optimize_geometry": bool(args.optimize_geometry),
+                        "fused_point_stride": int(args.fused_point_stride),
+                        "fused_normal_radius": float(args.fused_normal_radius),
+                        **candidate_meta,
+                        **pca_meta,
+                    }
+                    candidate_meta_full = copy.deepcopy(geom_meta)
+                    candidate_meta_full.update(placement)
+                    candidates.append((score, patch_world.copy(), candidate_meta_full))
                     if best is None or score > best[0]:
-                        center_first_cam_h = np.linalg.inv(c2w[0]) @ np.asarray(
-                            [center_world[0], center_world[1], center_world[2], 1.0],
-                            dtype=np.float64,
-                        )
-                        placement = {
-                            "placement_mode": "fused_depth_surface",
-                            "score": score,
-                            "candidate_count": int(candidate_count),
-                            "tried_geometry_count": tried,
-                            "fused_point_count": int(points.shape[0]),
-                            "center_world": center_world.astype(float).tolist(),
-                            "center_first_camera": center_first_cam_h[:3].astype(float).tolist(),
-                            "surface_normal_world": normal.astype(float).tolist(),
-                            "width_m": args.plane_width * scale,
-                            "height_m": args.plane_height * scale,
-                            "size_scale": float(scale),
-                            "roll_degrees": float(roll),
-                            "optimize_geometry": bool(args.optimize_geometry),
-                            "fused_point_stride": int(args.fused_point_stride),
-                            "fused_normal_radius": float(args.fused_normal_radius),
-                            **candidate_meta,
-                            **pca_meta,
-                        }
-                        geom_meta.update(placement)
-                        best = (score, patch_world, geom_meta)
+                        best = (score, patch_world, candidate_meta_full)
     finally:
         args._active_depth_maps = old_depth_maps
 
     if best is None:
+        store_surface_candidates(args, [])
         if args.surface_score_mode == "natural":
             raise RuntimeError(
                 "No fused-depth surface satisfied the natural sticker constraints. "
@@ -754,6 +769,7 @@ def choose_fused_depth_surface_plane(
         meta["tried_geometry_count"] = tried
         return patch_world, meta
     best[2]["tried_geometry_count"] = tried
+    store_surface_candidates(args, candidates)
     return best[1], best[2]
 
 
@@ -784,6 +800,7 @@ def choose_vggt_pointmap_surface_plane(
         roll_degrees = parse_float_list(args.geometry_roll_degrees)
 
     best: tuple[float, np.ndarray, dict] | None = None
+    candidates: list[tuple[float, np.ndarray, dict]] = []
     tried = 0
     old_depth_maps = getattr(args, "_active_depth_maps", None)
     args._active_depth_maps = depth_maps
@@ -822,37 +839,42 @@ def choose_vggt_pointmap_surface_plane(
                         args,
                     )
                     score = geometry_score(geom_meta, args)
+                    if not np.isfinite(score):
+                        continue
+                    center_first_cam_h = np.linalg.inv(c2w[0]) @ np.asarray(
+                        [center_world[0], center_world[1], center_world[2], 1.0],
+                        dtype=np.float64,
+                    )
+                    placement = {
+                        "placement_mode": "vggt_pointmap_surface",
+                        "geometry_source": "clean_vggt_pointmap",
+                        "clean_vggt_output": source,
+                        "score": score,
+                        "candidate_count": int(candidate_count),
+                        "tried_geometry_count": tried,
+                        "vggt_point_count": int(points.shape[0]),
+                        "center_world": center_world.astype(float).tolist(),
+                        "center_first_camera": center_first_cam_h[:3].astype(float).tolist(),
+                        "surface_normal_world": normal.astype(float).tolist(),
+                        "width_m": args.plane_width * scale,
+                        "height_m": args.plane_height * scale,
+                        "size_scale": float(scale),
+                        "roll_degrees": float(roll),
+                        "optimize_geometry": bool(args.optimize_geometry),
+                        "vggt_point_conf_percentile": float(args.vggt_point_conf_percentile),
+                        **candidate_meta,
+                        **pca_meta,
+                    }
+                    candidate_meta_full = copy.deepcopy(geom_meta)
+                    candidate_meta_full.update(placement)
+                    candidates.append((score, patch_world.copy(), candidate_meta_full))
                     if best is None or score > best[0]:
-                        center_first_cam_h = np.linalg.inv(c2w[0]) @ np.asarray(
-                            [center_world[0], center_world[1], center_world[2], 1.0],
-                            dtype=np.float64,
-                        )
-                        placement = {
-                            "placement_mode": "vggt_pointmap_surface",
-                            "geometry_source": "clean_vggt_pointmap",
-                            "clean_vggt_output": source,
-                            "score": score,
-                            "candidate_count": int(candidate_count),
-                            "tried_geometry_count": tried,
-                            "vggt_point_count": int(points.shape[0]),
-                            "center_world": center_world.astype(float).tolist(),
-                            "center_first_camera": center_first_cam_h[:3].astype(float).tolist(),
-                            "surface_normal_world": normal.astype(float).tolist(),
-                            "width_m": args.plane_width * scale,
-                            "height_m": args.plane_height * scale,
-                            "size_scale": float(scale),
-                            "roll_degrees": float(roll),
-                            "optimize_geometry": bool(args.optimize_geometry),
-                            "vggt_point_conf_percentile": float(args.vggt_point_conf_percentile),
-                            **candidate_meta,
-                            **pca_meta,
-                        }
-                        geom_meta.update(placement)
-                        best = (score, patch_world, geom_meta)
+                        best = (score, patch_world, candidate_meta_full)
     finally:
         args._active_depth_maps = old_depth_maps
 
     if best is None:
+        store_surface_candidates(args, [])
         if args.surface_score_mode == "natural":
             raise RuntimeError(
                 "No clean-VGGT pointmap surface satisfied the natural sticker constraints. "
@@ -867,6 +889,7 @@ def choose_vggt_pointmap_surface_plane(
         meta["tried_geometry_count"] = tried
         return patch_world, meta
     best[2]["tried_geometry_count"] = tried
+    store_surface_candidates(args, candidates)
     return best[1], best[2]
 
 
@@ -1100,28 +1123,33 @@ def choose_auto_depth_surface_plane(
                             args,
                         )
                         score = geometry_score(geom_meta, args)
+                        if not np.isfinite(score):
+                            continue
+                        placement = {
+                            "placement_mode": "auto_depth_surface",
+                            "score": score,
+                            "candidate_count": tried,
+                            "center_tensor_xy": [float(x), float(y)],
+                            "center_depth_m": depth,
+                            "center_first_camera": center_cam.astype(float).tolist(),
+                            "surface_normal_first_camera": normal.astype(float).tolist(),
+                            "width_m": args.plane_width * scale,
+                            "height_m": args.plane_height * scale,
+                            "size_scale": float(scale),
+                            "roll_degrees": float(roll),
+                            "optimize_geometry": bool(args.optimize_geometry),
+                            **candidate_meta,
+                        }
+                        candidate_meta_full = copy.deepcopy(geom_meta)
+                        candidate_meta_full.update(placement)
+                        candidates.append((score, patch_world.copy(), candidate_meta_full))
                         if best is None or score > best[0]:
-                            placement = {
-                                "placement_mode": "auto_depth_surface",
-                                "score": score,
-                                "candidate_count": tried,
-                                "center_tensor_xy": [float(x), float(y)],
-                                "center_depth_m": depth,
-                                "center_first_camera": center_cam.astype(float).tolist(),
-                                "surface_normal_first_camera": normal.astype(float).tolist(),
-                                "width_m": args.plane_width * scale,
-                                "height_m": args.plane_height * scale,
-                                "size_scale": float(scale),
-                                "roll_degrees": float(roll),
-                                "optimize_geometry": bool(args.optimize_geometry),
-                                **candidate_meta,
-                            }
-                            geom_meta.update(placement)
-                            best = (score, patch_world, geom_meta)
+                            best = (score, patch_world, candidate_meta_full)
     finally:
         args._active_depth_maps = old_depth_maps
 
     if best is None:
+        store_surface_candidates(args, [])
         if args.surface_score_mode == "natural":
             raise RuntimeError(
                 "No depth surface satisfied the natural sticker constraints. "
@@ -1132,6 +1160,7 @@ def choose_auto_depth_surface_plane(
         meta["candidate_count"] = tried
         return patch_world, meta
     best[2]["candidate_count"] = tried
+    store_surface_candidates(args, candidates)
     return best[1], best[2]
 
 
@@ -1167,11 +1196,41 @@ def choose_patch_plane_world(
         args.fused_max_plane_residual,
         args.clean_vggt_output_root,
         args.vggt_point_conf_percentile,
+        args.surface_score_mode,
+        args.surface_coverage_min,
+        args.surface_coverage_max,
+        args.surface_min_visible_frames,
+        args.surface_min_visibility_ratio,
+        args.surface_orientation_filter,
+        args.surface_max_tilt_degrees,
+        args.surface_min_center_depth,
+        args.surface_max_center_depth,
+        args.surface_strength_search,
+        args.surface_strength_candidates,
+        args.surface_strength_steps,
+        args.surface_strength_lr,
+        args.surface_strength_texture_init,
+        args.surface_strength_regularization_weight,
+        args.tv_weight,
+        args.printability_weight,
+        args.low_frequency_weight,
+        args.low_frequency_kernel,
+        args.texture_init,
     )
     if cache_key in cache:
-        patch_world, meta = cache[cache_key]
+        cached = cache[cache_key]
+        if len(cached) == 3:
+            patch_world, meta, candidates = cached
+            args._last_patch_plane_candidates = [
+                (float(score), candidate_patch.copy(), copy.deepcopy(candidate_meta))
+                for score, candidate_patch, candidate_meta in candidates
+            ]
+        else:
+            patch_world, meta = cached
+            args._last_patch_plane_candidates = [(float(meta.get("score", 0.0)), patch_world.copy(), copy.deepcopy(meta))]
         return patch_world.copy(), copy.deepcopy(meta)
 
+    args._last_patch_plane_candidates = []
     if args.plane_mode == "vggt_pointmap_surface":
         result = choose_vggt_pointmap_surface_plane(c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps)
     elif args.plane_mode == "fused_depth_surface":
@@ -1180,8 +1239,14 @@ def choose_patch_plane_world(
         result = choose_auto_depth_surface_plane(c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps)
     else:
         result = build_fixed_patch_plane_world(c2w[0], args)
+        args._last_patch_plane_candidates = [(0.0, result[0].copy(), copy.deepcopy(result[1]))]
 
-    cache[cache_key] = (result[0].copy(), copy.deepcopy(result[1]))
+    candidates = getattr(args, "_last_patch_plane_candidates", [])
+    cache[cache_key] = (
+        result[0].copy(),
+        copy.deepcopy(result[1]),
+        [(float(score), patch.copy(), copy.deepcopy(meta)) for score, patch, meta in candidates],
+    )
     return result
 
 
@@ -1194,6 +1259,10 @@ def build_geometry_grids(
     args: argparse.Namespace,
     device: torch.device,
     depth_maps: list[np.ndarray | None],
+    images: torch.Tensor | None = None,
+    clean_features: list[torch.Tensor] | None = None,
+    model: torch.nn.Module | None = None,
+    dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict]:
     patch_world, placement_meta = choose_patch_plane_world(
         c2w,
@@ -1204,6 +1273,53 @@ def build_geometry_grids(
         args,
         depth_maps,
     )
+    candidates = getattr(args, "_last_patch_plane_candidates", [])
+    if (
+        args.surface_strength_search
+        and model is not None
+        and dtype is not None
+        and images is not None
+        and clean_features is not None
+        and len(candidates) > 1
+    ):
+        strength_cache = getattr(args, "_strength_plane_cache", None)
+        if strength_cache is None:
+            strength_cache = {}
+            args._strength_plane_cache = strength_cache
+        strength_cache_key = (
+            tuple(image_paths),
+            texture_size,
+            args.surface_strength_candidates,
+            args.surface_strength_steps,
+            args.surface_strength_lr,
+            args.surface_strength_texture_init,
+            args.surface_strength_regularization_weight,
+            args.tv_weight,
+            args.printability_weight,
+            args.low_frequency_weight,
+            args.low_frequency_kernel,
+        )
+        if strength_cache_key in strength_cache:
+            patch_world, placement_meta = strength_cache[strength_cache_key]
+            patch_world = patch_world.copy()
+            placement_meta = copy.deepcopy(placement_meta)
+        else:
+            patch_world, placement_meta = select_candidate_by_feature_probe(
+                candidates,
+                images,
+                clean_features,
+                c2w,
+                image_paths,
+                tensor_hw,
+                texture_size,
+                intrinsics,
+                args,
+                depth_maps,
+                model,
+                dtype,
+                device,
+            )
+            strength_cache[strength_cache_key] = (patch_world.copy(), copy.deepcopy(placement_meta))
     old_depth_maps = getattr(args, "_active_depth_maps", None)
     args._active_depth_maps = depth_maps
     try:
@@ -1222,6 +1338,103 @@ def build_geometry_grids(
     grids_t = torch.from_numpy(grids).to(device)
     masks_t = torch.from_numpy(masks).to(device)
     return grids_t, masks_t, meta
+
+
+def select_candidate_by_feature_probe(
+    candidates: list[tuple[float, np.ndarray, dict]],
+    images: torch.Tensor,
+    clean_features: list[torch.Tensor],
+    c2w: np.ndarray,
+    image_paths: list[str],
+    tensor_hw: tuple[int, int],
+    texture_size: int,
+    intrinsics: np.ndarray,
+    args: argparse.Namespace,
+    depth_maps: list[np.ndarray | None],
+    model: torch.nn.Module,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[np.ndarray, dict]:
+    if not candidates:
+        raise RuntimeError("surface_strength_search requested but no candidate planes were available.")
+
+    best: tuple[float, np.ndarray, dict] | None = None
+    old_depth_maps = getattr(args, "_active_depth_maps", None)
+    args._active_depth_maps = depth_maps
+    try:
+        for rank, (geometry_score_value, patch_world, placement_meta) in enumerate(candidates, start=1):
+            grids_np, masks_np, meta = build_geometry_arrays_for_plane(
+                patch_world,
+                c2w,
+                image_paths,
+                tensor_hw,
+                texture_size,
+                intrinsics,
+                args,
+            )
+            meta.update(copy.deepcopy(placement_meta))
+            grids = torch.from_numpy(grids_np).to(device)
+            masks = torch.from_numpy(masks_np).to(device)
+
+            probe_texture = initialize_texture(
+                args,
+                device,
+                init=args.surface_strength_texture_init,
+                requires_grad=args.surface_strength_steps > 0,
+            )
+            optimizer = (
+                torch.optim.AdamW([probe_texture], lr=args.surface_strength_lr)
+                if args.surface_strength_steps > 0
+                else None
+            )
+            last_feature_l1 = None
+            last_reg = 0.0
+            for _ in range(max(1, args.surface_strength_steps)):
+                if optimizer is not None:
+                    optimizer.zero_grad(set_to_none=True)
+                adv_images = apply_geometry_patch(images, probe_texture, grids, masks, args, training=True)
+                adv_features = extract_features(
+                    model,
+                    adv_images,
+                    dtype,
+                    args.feature_layer,
+                    args.activation_checkpoint,
+                )
+                feature_loss, terms = feature_l1_loss(adv_features, clean_features)
+                reg_terms = patch_regularization_terms(probe_texture, args)
+                score_loss = feature_loss - args.surface_strength_regularization_weight * reg_terms["regularization_total"]
+                last_feature_l1 = float(terms["feature_l1"])
+                last_reg = float(reg_terms["regularization_total"].detach().cpu())
+                if optimizer is not None:
+                    (-score_loss).backward()
+                    optimizer.step()
+                    with torch.no_grad():
+                        probe_texture.clamp_(args.print_min, args.print_max)
+
+            final_score = float(last_feature_l1 if last_feature_l1 is not None else 0.0) - (
+                args.surface_strength_regularization_weight * last_reg
+            )
+            meta.update(
+                {
+                    "strength_search_enabled": True,
+                    "strength_candidate_rank": rank,
+                    "strength_candidate_count": len(candidates),
+                    "strength_geometry_score": float(geometry_score_value),
+                    "strength_probe_steps": int(args.surface_strength_steps),
+                    "strength_probe_texture_init": args.surface_strength_texture_init,
+                    "strength_probe_feature_l1": float(last_feature_l1 if last_feature_l1 is not None else 0.0),
+                    "strength_probe_regularization": float(last_reg),
+                    "strength_probe_score": final_score,
+                }
+            )
+            if best is None or final_score > best[0]:
+                best = (final_score, patch_world.copy(), meta)
+    finally:
+        args._active_depth_maps = old_depth_maps
+
+    if best is None:
+        raise RuntimeError("surface_strength_search did not produce a valid candidate.")
+    return best[1], best[2]
 
 
 def prepare_texture_for_render(texture: torch.Tensor, args: argparse.Namespace | None, training: bool) -> torch.Tensor:
@@ -1276,6 +1489,8 @@ def load_tum_sequence(
     texture_size: int,
     args: argparse.Namespace,
     device: torch.device,
+    model: torch.nn.Module | None = None,
+    dtype: torch.dtype | None = None,
 ) -> dict:
     all_images = find_images(seq_dir)
     image_paths = [all_images[int(idx)] for idx in frame_indices]
@@ -1289,6 +1504,13 @@ def load_tum_sequence(
     args._active_vggt_points = None
     args._active_vggt_geometry_source = None
     args._intrinsics_in_tensor_space = False
+    clean_features = None
+    if args.surface_strength_search and model is not None and dtype is not None:
+        with torch.no_grad():
+            clean_features = [
+                feature.detach()
+                for feature in extract_features(model, images, dtype, args.feature_layer)
+            ]
     try:
         depth_maps = load_depth_maps(seq_dir, image_paths, frame_indices, tensor_hw, args)
         if args.plane_mode == "vggt_pointmap_surface":
@@ -1310,6 +1532,10 @@ def load_tum_sequence(
             args,
             device,
             depth_maps,
+            images=images,
+            clean_features=clean_features,
+            model=model,
+            dtype=dtype,
         )
     finally:
         args._active_vggt_points = old_vggt_points
@@ -1330,12 +1556,91 @@ def load_tum_sequence(
         "masks": masks,
         "geometry": geom_meta,
         "tensor_hw": tensor_hw,
+        "clean_features": clean_features,
     }
 
 
 def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for group in optimizer.param_groups:
         group["lr"] = lr
+
+
+def initialize_texture(
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    init: str | None = None,
+    requires_grad: bool = True,
+) -> torch.Tensor:
+    init = init or args.texture_init
+    shape = (1, 3, args.texture_size, args.texture_size)
+    if init == "random":
+        texture = torch.rand(shape, device=device, dtype=torch.float32)
+    elif init == "gray":
+        texture = torch.full(shape, 0.5, device=device, dtype=torch.float32)
+    elif init == "white":
+        texture = torch.ones(shape, device=device, dtype=torch.float32)
+    elif init == "black":
+        texture = torch.zeros(shape, device=device, dtype=torch.float32)
+    elif init == "checker":
+        yy, xx = torch.meshgrid(
+            torch.arange(args.texture_size, device=device),
+            torch.arange(args.texture_size, device=device),
+            indexing="ij",
+        )
+        checker = ((xx // 16 + yy // 16) % 2).float()
+        texture = checker[None, None].repeat(1, 3, 1, 1)
+    else:
+        raise ValueError(f"Unknown texture_init: {init}")
+    texture = texture.clamp(args.print_min, args.print_max)
+    texture.requires_grad_(requires_grad)
+    return texture
+
+
+def total_variation_loss(texture: torch.Tensor) -> torch.Tensor:
+    dx = torch.abs(texture[..., :, 1:] - texture[..., :, :-1]).mean()
+    dy = torch.abs(texture[..., 1:, :] - texture[..., :-1, :]).mean()
+    return dx + dy
+
+
+def low_frequency_loss(texture: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    if kernel_size <= 1:
+        return texture.new_zeros(())
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    blurred = F.avg_pool2d(texture, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+    return F.mse_loss(texture, blurred)
+
+
+def printable_color_loss(texture: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    if args.printable_color_levels <= 1:
+        return texture.new_zeros(())
+    levels = torch.linspace(
+        args.print_min,
+        args.print_max,
+        int(args.printable_color_levels),
+        device=texture.device,
+        dtype=texture.dtype,
+    )
+    distances = torch.abs(texture.unsqueeze(-1) - levels.view(1, 1, 1, 1, -1))
+    return distances.min(dim=-1).values.mean()
+
+
+def patch_regularization_terms(texture: torch.Tensor, args: argparse.Namespace) -> dict[str, torch.Tensor]:
+    tv = total_variation_loss(texture)
+    low_freq = low_frequency_loss(texture, args.low_frequency_kernel)
+    printable = printable_color_loss(texture, args)
+    total = (
+        args.tv_weight * tv
+        + args.low_frequency_weight * low_freq
+        + args.printability_weight * printable
+    )
+    return {
+        "regularization_total": total,
+        "tv": tv,
+        "low_frequency": low_freq,
+        "printability": printable,
+    }
 
 
 def train_geometry_patch(
@@ -1349,13 +1654,8 @@ def train_geometry_patch(
     output_dir: Path,
 ) -> tuple[torch.Tensor, dict]:
     rng = np.random.default_rng(args.seed)
-    texture = torch.rand(
-        (1, 3, args.texture_size, args.texture_size),
-        device=device,
-        dtype=torch.float32,
-        requires_grad=True,
-    )
-    optimizer = torch.optim.AdamW([texture], lr=args.patch_lr)
+    texture = initialize_texture(args, device, requires_grad=not args.freeze_texture)
+    optimizer = None if args.freeze_texture else torch.optim.AdamW([texture], lr=args.patch_lr)
 
     patch_dir = output_dir / "geometry_patch"
     patch_dir.mkdir(parents=True, exist_ok=True)
@@ -1369,8 +1669,26 @@ def train_geometry_patch(
     started = time.time()
     last_loss = None
 
+    if args.freeze_texture:
+        last_loss = 0.0
+        with history_path.open("a", encoding="utf-8") as history_file:
+            history_file.write(
+                json.dumps(
+                    {
+                        "update": 0,
+                        "feature_l1": last_loss,
+                        "frozen_texture": True,
+                        "texture_init": args.texture_init,
+                    }
+                )
+                + "\n"
+            )
     with history_path.open("a", encoding="utf-8") as history_file:
+        if args.freeze_texture:
+            pass
         for iteration in range(args.iterations):
+            if args.freeze_texture:
+                break
             scene_indices = rng.choice(
                 len(scene_dirs),
                 size=min(args.scenes_per_iteration, len(scene_dirs)),
@@ -1387,15 +1705,19 @@ def train_geometry_patch(
                     args.texture_size,
                     args,
                     device,
+                    model=model,
+                    dtype=dtype,
                 )
-                with torch.no_grad():
-                    item["clean_features"] = [
-                        feature.detach()
-                        for feature in extract_features(model, item["images"], dtype, args.feature_layer)
-                    ]
+                if item["clean_features"] is None:
+                    with torch.no_grad():
+                        item["clean_features"] = [
+                            feature.detach()
+                            for feature in extract_features(model, item["images"], dtype, args.feature_layer)
+                        ]
                 batch.append(item)
 
             for inner_step in range(args.inner_loop):
+                assert optimizer is not None
                 optimizer.zero_grad(set_to_none=True)
                 current_lr = scheduled_lr(
                     args.patch_lr,
@@ -1406,6 +1728,10 @@ def train_geometry_patch(
                 )
                 set_optimizer_lr(optimizer, current_lr)
                 losses = []
+                reg_totals = []
+                tv_terms = []
+                low_freq_terms = []
+                printable_terms = []
                 coverages = []
                 for item in batch:
                     adv_images = apply_geometry_patch(
@@ -1424,8 +1750,14 @@ def train_geometry_patch(
                         args.activation_checkpoint,
                     )
                     loss, terms = feature_l1_loss(adv_features, item["clean_features"])
-                    (-loss / len(batch)).backward()
+                    reg_terms = patch_regularization_terms(texture, args)
+                    objective = -loss + reg_terms["regularization_total"]
+                    (objective / len(batch)).backward()
                     losses.append(terms["feature_l1"])
+                    reg_totals.append(float(reg_terms["regularization_total"].detach().cpu()))
+                    tv_terms.append(float(reg_terms["tv"].detach().cpu()))
+                    low_freq_terms.append(float(reg_terms["low_frequency"].detach().cpu()))
+                    printable_terms.append(float(reg_terms["printability"].detach().cpu()))
                     coverages.append(item["geometry"]["mask_coverage_mean"])
 
                 if texture.grad is None:
@@ -1442,6 +1774,10 @@ def train_geometry_patch(
                     "update": update_idx,
                     "lr": current_lr,
                     "feature_l1": last_loss,
+                    "regularization_total": float(np.mean(reg_totals)) if reg_totals else 0.0,
+                    "tv": float(np.mean(tv_terms)) if tv_terms else 0.0,
+                    "low_frequency": float(np.mean(low_freq_terms)) if low_freq_terms else 0.0,
+                    "printability": float(np.mean(printable_terms)) if printable_terms else 0.0,
                     "mask_coverage_mean": float(np.mean(coverages)),
                     "scenes": [item["seq"] for item in batch],
                 }
@@ -1450,6 +1786,7 @@ def train_geometry_patch(
                     print(
                         f"[train-geometry] update {update_idx:06d}/{total_updates:06d} "
                         f"scenes={len(batch)} feature_l1={last_loss:.6f} "
+                        f"reg={record['regularization_total']:.6f} "
                         f"coverage={record['mask_coverage_mean']:.6f}"
                     )
 
@@ -1465,6 +1802,8 @@ def train_geometry_patch(
         "attack_target": "feature_l1_clean_vs_adversarial",
         "feature_layer": args.feature_layer,
         "texture_shape": list(texture.shape),
+        "texture_init": args.texture_init,
+        "freeze_texture": bool(args.freeze_texture),
         "patch_lr": args.patch_lr,
         "scheduler": args.scheduler,
         "warmup_iterations": args.warmup_iterations,
@@ -1488,6 +1827,13 @@ def train_geometry_patch(
             "contrast": args.eot_contrast,
             "gamma": args.eot_gamma,
             "noise_std": args.eot_noise_std,
+        },
+        "regularization": {
+            "tv_weight": args.tv_weight,
+            "printability_weight": args.printability_weight,
+            "printable_color_levels": args.printable_color_levels,
+            "low_frequency_weight": args.low_frequency_weight,
+            "low_frequency_kernel": args.low_frequency_kernel,
         },
         "plane": {
             "mode": args.plane_mode,
@@ -1517,6 +1863,12 @@ def train_geometry_patch(
             "surface_max_tilt_degrees": args.surface_max_tilt_degrees,
             "surface_min_center_depth": args.surface_min_center_depth,
             "surface_max_center_depth": args.surface_max_center_depth,
+            "surface_strength_search": bool(args.surface_strength_search),
+            "surface_strength_candidates": args.surface_strength_candidates,
+            "surface_strength_steps": args.surface_strength_steps,
+            "surface_strength_lr": args.surface_strength_lr,
+            "surface_strength_texture_init": args.surface_strength_texture_init,
+            "surface_strength_regularization_weight": args.surface_strength_regularization_weight,
         },
         "intrinsics": intrinsics.astype(float).tolist(),
         "frame_manifest": args.frame_manifest,
@@ -1562,6 +1914,8 @@ def evaluate_geometry_patch(
             int(texture.shape[-1]),
             args,
             device,
+            model=model,
+            dtype=dtype,
         )
         adv_images = apply_geometry_patch(item["images"], texture, item["grids"], item["masks"], args, training=False).detach()
         visibility_mask_path = out_dir / "geometry_visibility_masks.npz"
@@ -1616,6 +1970,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gt_name", default="groundtruth_90.txt")
     parser.add_argument("--texture_path", default=None, help="Reuse an existing geometry_patch_texture.npz")
     parser.add_argument("--texture_size", type=int, default=128)
+    parser.add_argument("--texture_init", choices=("random", "gray", "white", "black", "checker"), default="random")
+    parser.add_argument("--freeze_texture", action="store_true")
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--inner_loop", type=int, default=10)
     parser.add_argument("--scenes_per_iteration", type=int, default=1)
@@ -1682,6 +2038,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--surface_max_tilt_degrees", type=float, default=35.0)
     parser.add_argument("--surface_min_center_depth", type=float, default=0.0)
     parser.add_argument("--surface_max_center_depth", type=float, default=0.0)
+    parser.add_argument("--surface_strength_search", action="store_true")
+    parser.add_argument("--surface_strength_candidates", type=int, default=1)
+    parser.add_argument("--surface_strength_steps", type=int, default=0)
+    parser.add_argument("--surface_strength_lr", type=float, default=0.002)
+    parser.add_argument("--surface_strength_texture_init", choices=("random", "gray", "white", "black", "checker"), default="random")
+    parser.add_argument("--surface_strength_regularization_weight", type=float, default=1.0)
+    parser.add_argument("--tv_weight", type=float, default=0.0)
+    parser.add_argument("--printability_weight", type=float, default=0.0)
+    parser.add_argument("--printable_color_levels", type=int, default=8)
+    parser.add_argument("--low_frequency_weight", type=float, default=0.0)
+    parser.add_argument("--low_frequency_kernel", type=int, default=9)
     parser.add_argument("--physical_eot", action="store_true")
     parser.add_argument("--print_min", type=float, default=0.0)
     parser.add_argument("--print_max", type=float, default=1.0)
@@ -1718,7 +2085,7 @@ def main() -> None:
         f"[cfg] device={device} dtype={dtype} scenes={len(scene_dirs)} "
         f"texture_size={args.texture_size} iterations={args.iterations} inner_loop={args.inner_loop} "
         f"plane_mode={args.plane_mode} depth_visibility={args.use_depth_visibility} "
-        f"physical_eot={args.physical_eot}"
+        f"physical_eot={args.physical_eot} strength_search={args.surface_strength_search}"
     )
 
     model = load_model(args, device)
@@ -1737,6 +2104,16 @@ def main() -> None:
             "vggt_point_conf_percentile": args.vggt_point_conf_percentile,
             "use_depth_visibility": bool(args.use_depth_visibility),
             "physical_eot": bool(args.physical_eot),
+            "surface_strength_search": bool(args.surface_strength_search),
+            "surface_strength_candidates": args.surface_strength_candidates,
+            "surface_strength_steps": args.surface_strength_steps,
+            "regularization": {
+                "tv_weight": args.tv_weight,
+                "printability_weight": args.printability_weight,
+                "printable_color_levels": args.printable_color_levels,
+                "low_frequency_weight": args.low_frequency_weight,
+                "low_frequency_kernel": args.low_frequency_kernel,
+            },
         }
         print(f"[patch] loaded geometry texture -> {args.texture_path}")
     else:

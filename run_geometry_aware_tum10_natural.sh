@@ -6,8 +6,8 @@ set -Eeuo pipefail
 # placement to small, visible, planar surfaces instead of maximizing raw area.
 
 export PLANE_MODE="${PLANE_MODE:-vggt_pointmap_surface}"
-export TUM_GEOM_RUN_NAME="${TUM_GEOM_RUN_NAME:-tum10_vggt_pointmap_natural_rigid_geometry_feature_l3}"
-export TUM_GEOM_MODEL="${TUM_GEOM_MODEL:-vggt_tum10_vggt_pointmap_natural_rigid_geometry_feature_l3}"
+export TUM_GEOM_RUN_NAME="${TUM_GEOM_RUN_NAME:-tum10_vggt_pointmap_natural_full_geometry_feature_l3}"
+export TUM_GEOM_MODEL="${TUM_GEOM_MODEL:-vggt_tum10_vggt_pointmap_natural_full_geometry_feature_l3}"
 
 # A 25 cm sticker is much closer to a physical patch than the previous 60 cm
 # debug plane. Size scales still allow the search to test nearby sizes.
@@ -33,5 +33,17 @@ export SURFACE_MAX_CENTER_DEPTH="${SURFACE_MAX_CENTER_DEPTH:-4.0}"
 
 # Search more candidate surfaces because the natural filter rejects many planes.
 export FUSED_SURFACE_CANDIDATES="${FUSED_SURFACE_CANDIDATES:-256}"
+export SURFACE_STRENGTH_SEARCH="${SURFACE_STRENGTH_SEARCH:-1}"
+export SURFACE_STRENGTH_CANDIDATES="${SURFACE_STRENGTH_CANDIDATES:-8}"
+export SURFACE_STRENGTH_STEPS="${SURFACE_STRENGTH_STEPS:-8}"
+export SURFACE_STRENGTH_LR="${SURFACE_STRENGTH_LR:-0.002}"
+export SURFACE_STRENGTH_TEXTURE_INIT="${SURFACE_STRENGTH_TEXTURE_INIT:-random}"
+
+# Physical-patch regularizers inspired by printable/natural patch attacks.
+export TV_WEIGHT="${TV_WEIGHT:-0.02}"
+export PRINTABILITY_WEIGHT="${PRINTABILITY_WEIGHT:-0.005}"
+export PRINTABLE_COLOR_LEVELS="${PRINTABLE_COLOR_LEVELS:-8}"
+export LOW_FREQUENCY_WEIGHT="${LOW_FREQUENCY_WEIGHT:-0.01}"
+export LOW_FREQUENCY_KERNEL="${LOW_FREQUENCY_KERNEL:-11}"
 
 exec bash "$(dirname "$0")/run_geometry_aware_tum10.sh"

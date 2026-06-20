@@ -25,6 +25,8 @@ INNER_LOOP="${INNER_LOOP:-10}"
 SCENES_PER_ITERATION="${SCENES_PER_ITERATION:-1}"
 PATCH_LR="${PATCH_LR:-0.001}"
 TEXTURE_SIZE="${TEXTURE_SIZE:-128}"
+TEXTURE_INIT="${TEXTURE_INIT:-random}"
+FREEZE_TEXTURE="${FREEZE_TEXTURE:-0}"
 FEATURE_LAYER="${FEATURE_LAYER:-aggregator_final}"
 SEED="${SEED:-0}"
 
@@ -58,6 +60,12 @@ SURFACE_ORIENTATION_FILTER="${SURFACE_ORIENTATION_FILTER:-none}"
 SURFACE_MAX_TILT_DEGREES="${SURFACE_MAX_TILT_DEGREES:-35}"
 SURFACE_MIN_CENTER_DEPTH="${SURFACE_MIN_CENTER_DEPTH:-0.0}"
 SURFACE_MAX_CENTER_DEPTH="${SURFACE_MAX_CENTER_DEPTH:-0.0}"
+SURFACE_STRENGTH_SEARCH="${SURFACE_STRENGTH_SEARCH:-0}"
+SURFACE_STRENGTH_CANDIDATES="${SURFACE_STRENGTH_CANDIDATES:-1}"
+SURFACE_STRENGTH_STEPS="${SURFACE_STRENGTH_STEPS:-0}"
+SURFACE_STRENGTH_LR="${SURFACE_STRENGTH_LR:-0.002}"
+SURFACE_STRENGTH_TEXTURE_INIT="${SURFACE_STRENGTH_TEXTURE_INIT:-random}"
+SURFACE_STRENGTH_REGULARIZATION_WEIGHT="${SURFACE_STRENGTH_REGULARIZATION_WEIGHT:-1.0}"
 
 PHYSICAL_EOT="${PHYSICAL_EOT:-1}"
 PRINT_MIN="${PRINT_MIN:-0.0}"
@@ -66,6 +74,11 @@ EOT_BRIGHTNESS="${EOT_BRIGHTNESS:-0.15}"
 EOT_CONTRAST="${EOT_CONTRAST:-0.15}"
 EOT_GAMMA="${EOT_GAMMA:-0.10}"
 EOT_NOISE_STD="${EOT_NOISE_STD:-0.01}"
+TV_WEIGHT="${TV_WEIGHT:-0.0}"
+PRINTABILITY_WEIGHT="${PRINTABILITY_WEIGHT:-0.0}"
+PRINTABLE_COLOR_LEVELS="${PRINTABLE_COLOR_LEVELS:-8}"
+LOW_FREQUENCY_WEIGHT="${LOW_FREQUENCY_WEIGHT:-0.0}"
+LOW_FREQUENCY_KERNEL="${LOW_FREQUENCY_KERNEL:-9}"
 
 FORCE_PREPARE_TUM10="${FORCE_PREPARE_TUM10:-0}"
 FORCE_CLEAN="${FORCE_CLEAN:-0}"
@@ -97,7 +110,7 @@ require_dir "$TUM_ROOT"
 
 log "settings"
 echo "iterations=$ITERATIONS inner_loop=$INNER_LOOP scenes_per_iteration=$SCENES_PER_ITERATION"
-echo "texture_size=$TEXTURE_SIZE patch_lr=$PATCH_LR feature_layer=$FEATURE_LAYER"
+echo "texture_size=$TEXTURE_SIZE texture_init=$TEXTURE_INIT freeze_texture=$FREEZE_TEXTURE patch_lr=$PATCH_LR feature_layer=$FEATURE_LAYER"
 echo "plane_width=$PLANE_WIDTH plane_height=$PLANE_HEIGHT plane_distance=$PLANE_DISTANCE"
 echo "plane_center=($PLANE_CENTER_X,$PLANE_CENTER_Y)"
 echo "plane_mode=$PLANE_MODE clean_vggt_output_root=$TUM_CLEAN_OUT use_depth_visibility=$USE_DEPTH_VISIBILITY optimize_geometry=$OPTIMIZE_GEOMETRY"
@@ -105,7 +118,9 @@ echo "surface_candidate_grid=$SURFACE_CANDIDATE_GRID geometry_size_scales=$GEOME
 echo "fused_point_stride=$FUSED_POINT_STRIDE fused_surface_candidates=$FUSED_SURFACE_CANDIDATES fused_normal_radius=$FUSED_NORMAL_RADIUS"
 echo "surface_score_mode=$SURFACE_SCORE_MODE coverage=[$SURFACE_COVERAGE_MIN,$SURFACE_COVERAGE_MAX] min_visible_frames=$SURFACE_MIN_VISIBLE_FRAMES min_visibility_ratio=$SURFACE_MIN_VISIBILITY_RATIO"
 echo "surface_orientation_filter=$SURFACE_ORIENTATION_FILTER max_tilt=$SURFACE_MAX_TILT_DEGREES center_depth=[$SURFACE_MIN_CENTER_DEPTH,$SURFACE_MAX_CENTER_DEPTH]"
+echo "surface_strength_search=$SURFACE_STRENGTH_SEARCH candidates=$SURFACE_STRENGTH_CANDIDATES steps=$SURFACE_STRENGTH_STEPS strength_lr=$SURFACE_STRENGTH_LR"
 echo "physical_eot=$PHYSICAL_EOT print=[$PRINT_MIN,$PRINT_MAX] brightness=$EOT_BRIGHTNESS contrast=$EOT_CONTRAST gamma=$EOT_GAMMA noise_std=$EOT_NOISE_STD"
+echo "regularization tv=$TV_WEIGHT printability=$PRINTABILITY_WEIGHT levels=$PRINTABLE_COLOR_LEVELS low_frequency=$LOW_FREQUENCY_WEIGHT kernel=$LOW_FREQUENCY_KERNEL"
 
 log "prepare TUM images links"
 for seq_dir in "$TUM_ROOT"/rgbd_dataset_freiburg3_*; do
@@ -158,12 +173,19 @@ fi
 if [[ "$PHYSICAL_EOT" == "1" ]]; then
   geometry_args+=(--physical_eot)
 fi
+if [[ "$SURFACE_STRENGTH_SEARCH" == "1" ]]; then
+  geometry_args+=(--surface_strength_search)
+fi
+if [[ "$FREEZE_TEXTURE" == "1" ]]; then
+  geometry_args+=(--freeze_texture)
+fi
 "$VGGT_PY" "$VGGT_ROOT/attack_vggt_geometry_tum10.py" \
   --tum_root "$TUM_ROOT" \
   --output_dir "$TUM_GEOM_OUT" \
   --frame_manifest "$TUM10_FRAME_MANIFEST" \
   --ckpt "$CKPT" \
   --texture_size "$TEXTURE_SIZE" \
+  --texture_init "$TEXTURE_INIT" \
   --iterations "$ITERATIONS" \
   --inner_loop "$INNER_LOOP" \
   --scenes_per_iteration "$SCENES_PER_ITERATION" \
@@ -196,6 +218,11 @@ fi
   --surface_max_tilt_degrees "$SURFACE_MAX_TILT_DEGREES" \
   --surface_min_center_depth "$SURFACE_MIN_CENTER_DEPTH" \
   --surface_max_center_depth "$SURFACE_MAX_CENTER_DEPTH" \
+  --surface_strength_candidates "$SURFACE_STRENGTH_CANDIDATES" \
+  --surface_strength_steps "$SURFACE_STRENGTH_STEPS" \
+  --surface_strength_lr "$SURFACE_STRENGTH_LR" \
+  --surface_strength_texture_init "$SURFACE_STRENGTH_TEXTURE_INIT" \
+  --surface_strength_regularization_weight "$SURFACE_STRENGTH_REGULARIZATION_WEIGHT" \
   --visibility_depth_margin "$VISIBILITY_DEPTH_MARGIN" \
   --print_min "$PRINT_MIN" \
   --print_max "$PRINT_MAX" \
@@ -203,6 +230,11 @@ fi
   --eot_contrast "$EOT_CONTRAST" \
   --eot_gamma "$EOT_GAMMA" \
   --eot_noise_std "$EOT_NOISE_STD" \
+  --tv_weight "$TV_WEIGHT" \
+  --printability_weight "$PRINTABILITY_WEIGHT" \
+  --printable_color_levels "$PRINTABLE_COLOR_LEVELS" \
+  --low_frequency_weight "$LOW_FREQUENCY_WEIGHT" \
+  --low_frequency_kernel "$LOW_FREQUENCY_KERNEL" \
   --seed "$SEED" \
   "${geometry_args[@]}" \
   "${patch_args[@]}" \
