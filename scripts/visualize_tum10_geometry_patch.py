@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 
 def preprocess_like_vggt(image_path: str, target_size: int = 518) -> Image.Image:
@@ -98,6 +98,27 @@ def mask_array_to_image(mask: np.ndarray, image_size: tuple[int, int]) -> Image.
     return mask_image
 
 
+def draw_visible_mask_outline(
+    image: Image.Image,
+    mask: Image.Image,
+    *,
+    fill_alpha: int = 0,
+    outline_width: int = 3,
+) -> Image.Image:
+    out = image.convert("RGBA")
+    mask = mask.convert("L")
+    if fill_alpha > 0:
+        fill = Image.new("RGBA", out.size, (255, 40, 40, fill_alpha))
+        out = Image.composite(fill, out, mask)
+
+    expanded = mask.filter(ImageFilter.MaxFilter(outline_width * 2 + 1))
+    contracted = mask.filter(ImageFilter.MinFilter(outline_width * 2 + 1))
+    boundary = np.asarray(expanded, dtype=np.int16) - np.asarray(contracted, dtype=np.int16)
+    boundary = Image.fromarray(np.clip(boundary, 0, 255).astype(np.uint8), mode="L")
+    red = Image.new("RGBA", out.size, (255, 40, 40, 255))
+    return Image.composite(red, out, boundary)
+
+
 def draw_label(image: Image.Image, text: str) -> None:
     draw = ImageDraw.Draw(image)
     font = ImageFont.load_default()
@@ -126,15 +147,29 @@ def composite_patch(
             mode="L",
         )
     out = Image.composite(warped, out, alpha_mask(mask, alpha))
-    draw = ImageDraw.Draw(out)
-    points = [tuple(map(float, p)) for p in quad.tolist()]
-    draw.line(points + [points[0]], fill=(255, 40, 40, 255), width=3)
+    if visibility_mask is not None:
+        out = draw_visible_mask_outline(out, mask, outline_width=2)
+    else:
+        draw = ImageDraw.Draw(out)
+        points = [tuple(map(float, p)) for p in quad.tolist()]
+        draw.line(points + [points[0]], fill=(255, 40, 40, 255), width=3)
     draw_label(out, label)
     return out.convert("RGB")
 
 
-def outline_only(base: Image.Image, quad: np.ndarray, label: str) -> Image.Image:
+def outline_only(
+    base: Image.Image,
+    quad: np.ndarray,
+    label: str,
+    visibility_mask: np.ndarray | None = None,
+) -> Image.Image:
     out = base.convert("RGBA")
+    if visibility_mask is not None:
+        visible = mask_array_to_image(visibility_mask, out.size)
+        out = draw_visible_mask_outline(out, visible, fill_alpha=55, outline_width=2)
+        draw_label(out, label)
+        return out.convert("RGB")
+
     overlay = Image.new("RGBA", out.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     points = [tuple(map(float, p)) for p in quad.tolist()]
@@ -220,7 +255,7 @@ def visualize_sequence(
 
         visibility_mask = masks[i] if masks is not None else None
         over = composite_patch(base, texture, quad, alpha, label, visibility_mask)
-        outline = outline_only(base, quad, label)
+        outline = outline_only(base, quad, label, visibility_mask)
         stem = f"{i:02d}_frame_{int(frame_indices[i]):06d}"
         over.save(overlay_dir / f"{stem}_patch.png")
         outline.save(outline_dir / f"{stem}_outline.png")

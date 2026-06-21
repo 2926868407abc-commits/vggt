@@ -960,6 +960,8 @@ def build_geometry_arrays_for_plane(
     coverages = []
     raw_coverages = []
     visibility_ratios = []
+    support_ratios = []
+    support_coverages = []
     projected_corners = []
     depth_maps = getattr(args, "_active_depth_maps", None)
     for frame_idx, pose in enumerate(c2w):
@@ -979,6 +981,8 @@ def build_geometry_arrays_for_plane(
             coverages.append(0.0)
             raw_coverages.append(0.0)
             visibility_ratios.append(0.0)
+            support_ratios.append(0.0)
+            support_coverages.append(0.0)
             continue
 
         h_mat = homography_from_points(src, dst)
@@ -997,12 +1001,27 @@ def build_geometry_arrays_for_plane(
         grid = grid.reshape(tensor_h, tensor_w, 2)
         raw_inside = inside.reshape(tensor_h, tensor_w)
         mask_bool = raw_inside
+        support_ratio = 1.0 if not args.surface_support_check else 0.0
+        support_coverage = float(raw_inside.mean()) if not args.surface_support_check else 0.0
         if args.use_depth_visibility and depth_maps is not None and depth_maps[frame_idx] is not None:
             patch_depth, depth_valid = plane_depth_map(corners_cam, frame_intrinsics, proj, tensor_hw)
             scene_depth = depth_maps[frame_idx]
             scene_valid = (scene_depth > args.depth_min_m) & (scene_depth < args.depth_max_m)
             visible = depth_valid & scene_valid & (patch_depth <= scene_depth + args.visibility_depth_margin)
             mask_bool = raw_inside & visible
+            if args.surface_support_check:
+                occluded_by_foreground = scene_valid & (
+                    scene_depth < patch_depth - args.visibility_depth_margin
+                )
+                evaluable = raw_inside & depth_valid & scene_valid & ~occluded_by_foreground
+                support_tolerance = np.maximum(
+                    args.surface_support_abs_tolerance,
+                    np.abs(patch_depth) * args.surface_support_rel_tolerance,
+                )
+                supported = evaluable & (np.abs(scene_depth - patch_depth) <= support_tolerance)
+                evaluable_count = int(evaluable.sum())
+                support_ratio = float(supported.sum() / evaluable_count) if evaluable_count > 0 else 0.0
+                support_coverage = float(supported.mean())
         mask = mask_bool.astype(np.float32).reshape(1, tensor_h, tensor_w)
         grids.append(grid)
         masks.append(mask)
@@ -1011,6 +1030,8 @@ def build_geometry_arrays_for_plane(
         raw_coverages.append(raw_coverage)
         coverages.append(visible_coverage)
         visibility_ratios.append(visible_coverage / raw_coverage if raw_coverage > 0 else 0.0)
+        support_ratios.append(support_ratio)
+        support_coverages.append(support_coverage)
 
     meta = {
         "plane_corners_world": patch_world.astype(float).tolist(),
@@ -1021,6 +1042,11 @@ def build_geometry_arrays_for_plane(
         "raw_projected_coverage_mean": float(np.mean(raw_coverages)),
         "visibility_ratio_per_frame": visibility_ratios,
         "visibility_ratio_mean": float(np.mean(visibility_ratios)),
+        "surface_support_ratio_per_frame": support_ratios,
+        "surface_support_ratio_mean": float(np.mean(support_ratios)),
+        "surface_support_coverage_per_frame": support_coverages,
+        "surface_support_coverage_mean": float(np.mean(support_coverages)),
+        "uses_surface_support_check": bool(args.surface_support_check),
         "uses_depth_visibility": bool(args.use_depth_visibility),
     }
     return np.stack(grids, axis=0), np.stack(masks, axis=0), meta
@@ -1032,6 +1058,7 @@ def geometry_score(meta: dict, args: argparse.Namespace) -> float:
         return -float("inf")
     visible_frames = int(np.count_nonzero(coverages > 1e-8))
     visibility_ratio = float(meta.get("visibility_ratio_mean", 0.0))
+    support_ratio = float(meta.get("surface_support_ratio_mean", 0.0))
     mean_coverage = float(coverages.mean())
 
     if args.surface_score_mode == "natural":
@@ -1043,8 +1070,11 @@ def geometry_score(meta: dict, args: argparse.Namespace) -> float:
             return -float("inf")
         if visibility_ratio < args.surface_min_visibility_ratio:
             return -float("inf")
+        if args.surface_support_check and support_ratio < args.surface_min_support_ratio:
+            return -float("inf")
 
-    return float(coverages.mean() + 0.25 * coverages.min())
+    support_bonus = 0.1 * support_ratio if args.surface_support_check else 0.0
+    return float(coverages.mean() + 0.25 * coverages.min() + support_bonus)
 
 
 def choose_auto_depth_surface_plane(
@@ -1208,6 +1238,7 @@ def select_patch_plane_with_natural_relaxation(
         "surface_max_tilt_degrees",
         "surface_min_center_depth",
         "surface_max_center_depth",
+        "surface_min_support_ratio",
     )
     original = {name: getattr(args, name) for name in constraint_names}
     profiles = [
@@ -1240,6 +1271,10 @@ def select_patch_plane_with_natural_relaxation(
                         args.natural_relax_min_center_depth,
                         float(original["surface_min_center_depth"]) - 0.3,
                     ),
+                    "surface_min_support_ratio": max(
+                        args.natural_relax_min_support_ratio,
+                        float(original["surface_min_support_ratio"]) - 0.15,
+                    ),
                 },
                 {
                     "level": 2,
@@ -1253,6 +1288,7 @@ def select_patch_plane_with_natural_relaxation(
                     "surface_orientation_filter": args.natural_relax_orientation_filter,
                     "surface_max_tilt_degrees": args.natural_relax_max_tilt_degrees,
                     "surface_min_center_depth": args.natural_relax_min_center_depth,
+                    "surface_min_support_ratio": args.natural_relax_min_support_ratio,
                 },
             ]
         )
@@ -1300,6 +1336,7 @@ def select_patch_plane_with_natural_relaxation(
                         f"coverage=[{used['surface_coverage_min']},{used['surface_coverage_max']}] "
                         f"visible_frames={used['surface_min_visible_frames']} "
                         f"visibility={used['surface_min_visibility_ratio']} "
+                        f"support={used['surface_min_support_ratio']} "
                         f"orientation={used['surface_orientation_filter']}"
                     )
                 return patch_world, meta
@@ -1375,6 +1412,11 @@ def choose_patch_plane_world(
         args.natural_relax_orientation_filter,
         args.natural_relax_max_tilt_degrees,
         args.natural_relax_min_center_depth,
+        args.surface_support_check,
+        args.surface_support_abs_tolerance,
+        args.surface_support_rel_tolerance,
+        args.surface_min_support_ratio,
+        args.natural_relax_min_support_ratio,
     )
     if cache_key in cache:
         cached = cache[cache_key]
@@ -2022,6 +2064,10 @@ def train_geometry_patch(
             "surface_max_tilt_degrees": args.surface_max_tilt_degrees,
             "surface_min_center_depth": args.surface_min_center_depth,
             "surface_max_center_depth": args.surface_max_center_depth,
+            "surface_support_check": bool(args.surface_support_check),
+            "surface_support_abs_tolerance": args.surface_support_abs_tolerance,
+            "surface_support_rel_tolerance": args.surface_support_rel_tolerance,
+            "surface_min_support_ratio": args.surface_min_support_ratio,
             "surface_strength_search": bool(args.surface_strength_search),
             "surface_strength_candidates": args.surface_strength_candidates,
             "surface_strength_steps": args.surface_strength_steps,
@@ -2035,6 +2081,7 @@ def train_geometry_patch(
             "natural_relax_orientation_filter": args.natural_relax_orientation_filter,
             "natural_relax_max_tilt_degrees": args.natural_relax_max_tilt_degrees,
             "natural_relax_min_center_depth": args.natural_relax_min_center_depth,
+            "natural_relax_min_support_ratio": args.natural_relax_min_support_ratio,
         },
         "intrinsics": intrinsics.astype(float).tolist(),
         "frame_manifest": args.frame_manifest,
@@ -2204,6 +2251,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--surface_max_tilt_degrees", type=float, default=35.0)
     parser.add_argument("--surface_min_center_depth", type=float, default=0.0)
     parser.add_argument("--surface_max_center_depth", type=float, default=0.0)
+    parser.add_argument("--surface_support_check", action="store_true")
+    parser.add_argument("--surface_support_abs_tolerance", type=float, default=0.08)
+    parser.add_argument("--surface_support_rel_tolerance", type=float, default=0.05)
+    parser.add_argument("--surface_min_support_ratio", type=float, default=0.6)
     parser.add_argument("--surface_strength_search", action="store_true")
     parser.add_argument("--surface_strength_candidates", type=int, default=1)
     parser.add_argument("--surface_strength_steps", type=int, default=0)
@@ -2221,6 +2272,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--natural_relax_max_tilt_degrees", type=float, default=50.0)
     parser.add_argument("--natural_relax_min_center_depth", type=float, default=1.0)
+    parser.add_argument("--natural_relax_min_support_ratio", type=float, default=0.3)
     parser.add_argument("--tv_weight", type=float, default=0.0)
     parser.add_argument("--printability_weight", type=float, default=0.0)
     parser.add_argument("--printable_color_levels", type=int, default=8)
