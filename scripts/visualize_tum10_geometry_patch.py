@@ -225,6 +225,7 @@ def visualize_sequence(
     alpha: float,
     contact_columns: int,
     thumb_width: int,
+    contact_sheet_only: bool,
 ) -> int:
     summary_path = seq_dir / "attack_summary.json"
     with summary_path.open("r", encoding="utf-8") as f:
@@ -244,8 +245,10 @@ def visualize_sequence(
     seq_out = out_root / seq_dir.name
     overlay_dir = seq_out / "overlay"
     outline_dir = seq_out / "outline"
-    overlay_dir.mkdir(parents=True, exist_ok=True)
-    outline_dir.mkdir(parents=True, exist_ok=True)
+    seq_out.mkdir(parents=True, exist_ok=True)
+    if not contact_sheet_only:
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        outline_dir.mkdir(parents=True, exist_ok=True)
 
     sheet_images = []
     for i in selected:
@@ -255,10 +258,11 @@ def visualize_sequence(
 
         visibility_mask = masks[i] if masks is not None else None
         over = composite_patch(base, texture, quad, alpha, label, visibility_mask)
-        outline = outline_only(base, quad, label, visibility_mask)
-        stem = f"{i:02d}_frame_{int(frame_indices[i]):06d}"
-        over.save(overlay_dir / f"{stem}_patch.png")
-        outline.save(outline_dir / f"{stem}_outline.png")
+        if not contact_sheet_only:
+            outline = outline_only(base, quad, label, visibility_mask)
+            stem = f"{i:02d}_frame_{int(frame_indices[i]):06d}"
+            over.save(overlay_dir / f"{stem}_patch.png")
+            outline.save(outline_dir / f"{stem}_outline.png")
         sheet_images.append(over)
 
     sheet = contact_sheet(sheet_images, contact_columns, thumb_width)
@@ -283,6 +287,7 @@ def main() -> None:
     parser.add_argument("--alpha", type=float, default=0.9)
     parser.add_argument("--contact_columns", type=int, default=5)
     parser.add_argument("--thumb_width", type=int, default=260)
+    parser.add_argument("--contact_sheet_only", action="store_true")
     args = parser.parse_args()
 
     root = Path(args.geometry_output_root)
@@ -311,6 +316,7 @@ def main() -> None:
             args.alpha,
             args.contact_columns,
             args.thumb_width,
+            args.contact_sheet_only,
         )
         total += count
         print(f"[visualized] {seq_dir.name}: {count} frame(s)")

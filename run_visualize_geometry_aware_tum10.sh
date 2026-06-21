@@ -11,6 +11,7 @@ VIS_FRAMES="${VIS_FRAMES:-all}"
 VIS_ALPHA="${VIS_ALPHA:-0.9}"
 VIS_CONTACT_COLUMNS="${VIS_CONTACT_COLUMNS:-5}"
 VIS_THUMB_WIDTH="${VIS_THUMB_WIDTH:-260}"
+VIS_CONTACT_SHEET_ONLY="${VIS_CONTACT_SHEET_ONLY:-0}"
 
 log() {
   printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
@@ -35,6 +36,12 @@ echo "geometry_output_root=$GEOMETRY_OUTPUT_ROOT"
 echo "out_dir=$VIS_OUT_DIR"
 echo "scene_pattern=$VIS_SCENE_PATTERN"
 echo "frames=$VIS_FRAMES"
+echo "contact_sheet_only=$VIS_CONTACT_SHEET_ONLY"
+
+visualization_args=()
+if [[ "$VIS_CONTACT_SHEET_ONLY" == "1" ]]; then
+  visualization_args+=(--contact_sheet_only)
+fi
 
 "$VGGT_PY" "$VGGT_ROOT/scripts/visualize_tum10_geometry_patch.py" \
   --geometry_output_root "$GEOMETRY_OUTPUT_ROOT" \
@@ -43,10 +50,13 @@ echo "frames=$VIS_FRAMES"
   --frames "$VIS_FRAMES" \
   --alpha "$VIS_ALPHA" \
   --contact_columns "$VIS_CONTACT_COLUMNS" \
-  --thumb_width "$VIS_THUMB_WIDTH"
+  --thumb_width "$VIS_THUMB_WIDTH" \
+  "${visualization_args[@]}"
 
 log "all done"
 echo "Patch texture: $VIS_OUT_DIR/geometry_patch_texture.png"
 echo "Contact sheets: $VIS_OUT_DIR/<sequence>/contact_sheet_patch.png"
-echo "Overlay frames: $VIS_OUT_DIR/<sequence>/overlay"
-echo "Outline frames: $VIS_OUT_DIR/<sequence>/outline"
+if [[ "$VIS_CONTACT_SHEET_ONLY" != "1" ]]; then
+  echo "Overlay frames: $VIS_OUT_DIR/<sequence>/overlay"
+  echo "Outline frames: $VIS_OUT_DIR/<sequence>/outline"
+fi
