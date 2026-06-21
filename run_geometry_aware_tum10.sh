@@ -66,6 +66,13 @@ SURFACE_STRENGTH_STEPS="${SURFACE_STRENGTH_STEPS:-0}"
 SURFACE_STRENGTH_LR="${SURFACE_STRENGTH_LR:-0.002}"
 SURFACE_STRENGTH_TEXTURE_INIT="${SURFACE_STRENGTH_TEXTURE_INIT:-random}"
 SURFACE_STRENGTH_REGULARIZATION_WEIGHT="${SURFACE_STRENGTH_REGULARIZATION_WEIGHT:-1.0}"
+NATURAL_AUTO_RELAX="${NATURAL_AUTO_RELAX:-0}"
+NATURAL_RELAX_MAX_COVERAGE="${NATURAL_RELAX_MAX_COVERAGE:-0.08}"
+NATURAL_RELAX_MIN_VISIBLE_FRAMES="${NATURAL_RELAX_MIN_VISIBLE_FRAMES:-2}"
+NATURAL_RELAX_MIN_VISIBILITY_RATIO="${NATURAL_RELAX_MIN_VISIBILITY_RATIO:-0.25}"
+NATURAL_RELAX_ORIENTATION_FILTER="${NATURAL_RELAX_ORIENTATION_FILTER:-fronto_or_tabletop}"
+NATURAL_RELAX_MAX_TILT_DEGREES="${NATURAL_RELAX_MAX_TILT_DEGREES:-50}"
+NATURAL_RELAX_MIN_CENTER_DEPTH="${NATURAL_RELAX_MIN_CENTER_DEPTH:-1.0}"
 
 PHYSICAL_EOT="${PHYSICAL_EOT:-1}"
 PRINT_MIN="${PRINT_MIN:-0.0}"
@@ -119,6 +126,7 @@ echo "fused_point_stride=$FUSED_POINT_STRIDE fused_surface_candidates=$FUSED_SUR
 echo "surface_score_mode=$SURFACE_SCORE_MODE coverage=[$SURFACE_COVERAGE_MIN,$SURFACE_COVERAGE_MAX] min_visible_frames=$SURFACE_MIN_VISIBLE_FRAMES min_visibility_ratio=$SURFACE_MIN_VISIBILITY_RATIO"
 echo "surface_orientation_filter=$SURFACE_ORIENTATION_FILTER max_tilt=$SURFACE_MAX_TILT_DEGREES center_depth=[$SURFACE_MIN_CENTER_DEPTH,$SURFACE_MAX_CENTER_DEPTH]"
 echo "surface_strength_search=$SURFACE_STRENGTH_SEARCH candidates=$SURFACE_STRENGTH_CANDIDATES steps=$SURFACE_STRENGTH_STEPS strength_lr=$SURFACE_STRENGTH_LR"
+echo "natural_auto_relax=$NATURAL_AUTO_RELAX max_coverage=$NATURAL_RELAX_MAX_COVERAGE min_visible_frames=$NATURAL_RELAX_MIN_VISIBLE_FRAMES min_visibility=$NATURAL_RELAX_MIN_VISIBILITY_RATIO orientation=$NATURAL_RELAX_ORIENTATION_FILTER"
 echo "physical_eot=$PHYSICAL_EOT print=[$PRINT_MIN,$PRINT_MAX] brightness=$EOT_BRIGHTNESS contrast=$EOT_CONTRAST gamma=$EOT_GAMMA noise_std=$EOT_NOISE_STD"
 echo "regularization tv=$TV_WEIGHT printability=$PRINTABILITY_WEIGHT levels=$PRINTABLE_COLOR_LEVELS low_frequency=$LOW_FREQUENCY_WEIGHT kernel=$LOW_FREQUENCY_KERNEL"
 
@@ -176,6 +184,9 @@ fi
 if [[ "$SURFACE_STRENGTH_SEARCH" == "1" ]]; then
   geometry_args+=(--surface_strength_search)
 fi
+if [[ "$NATURAL_AUTO_RELAX" == "1" ]]; then
+  geometry_args+=(--natural_auto_relax)
+fi
 if [[ "$FREEZE_TEXTURE" == "1" ]]; then
   geometry_args+=(--freeze_texture)
 fi
@@ -223,6 +234,12 @@ fi
   --surface_strength_lr "$SURFACE_STRENGTH_LR" \
   --surface_strength_texture_init "$SURFACE_STRENGTH_TEXTURE_INIT" \
   --surface_strength_regularization_weight "$SURFACE_STRENGTH_REGULARIZATION_WEIGHT" \
+  --natural_relax_max_coverage "$NATURAL_RELAX_MAX_COVERAGE" \
+  --natural_relax_min_visible_frames "$NATURAL_RELAX_MIN_VISIBLE_FRAMES" \
+  --natural_relax_min_visibility_ratio "$NATURAL_RELAX_MIN_VISIBILITY_RATIO" \
+  --natural_relax_orientation_filter "$NATURAL_RELAX_ORIENTATION_FILTER" \
+  --natural_relax_max_tilt_degrees "$NATURAL_RELAX_MAX_TILT_DEGREES" \
+  --natural_relax_min_center_depth "$NATURAL_RELAX_MIN_CENTER_DEPTH" \
   --visibility_depth_margin "$VISIBILITY_DEPTH_MARGIN" \
   --print_min "$PRINT_MIN" \
   --print_max "$PRINT_MAX" \

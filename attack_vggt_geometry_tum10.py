@@ -1164,6 +1164,158 @@ def choose_auto_depth_surface_plane(
     return best[1], best[2]
 
 
+def run_patch_plane_selector(
+    c2w: np.ndarray,
+    image_paths: list[str],
+    tensor_hw: tuple[int, int],
+    texture_size: int,
+    intrinsics: np.ndarray,
+    args: argparse.Namespace,
+    depth_maps: list[np.ndarray | None],
+) -> tuple[np.ndarray, dict]:
+    if args.plane_mode == "vggt_pointmap_surface":
+        return choose_vggt_pointmap_surface_plane(
+            c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps
+        )
+    if args.plane_mode == "fused_depth_surface":
+        return choose_fused_depth_surface_plane(
+            c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps
+        )
+    if args.plane_mode == "auto_depth_surface":
+        return choose_auto_depth_surface_plane(
+            c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps
+        )
+    result = build_fixed_patch_plane_world(c2w[0], args)
+    args._last_patch_plane_candidates = [(0.0, result[0].copy(), copy.deepcopy(result[1]))]
+    return result
+
+
+def select_patch_plane_with_natural_relaxation(
+    c2w: np.ndarray,
+    image_paths: list[str],
+    tensor_hw: tuple[int, int],
+    texture_size: int,
+    intrinsics: np.ndarray,
+    args: argparse.Namespace,
+    depth_maps: list[np.ndarray | None],
+) -> tuple[np.ndarray, dict]:
+    constraint_names = (
+        "surface_coverage_min",
+        "surface_coverage_max",
+        "surface_min_visible_frames",
+        "surface_min_visibility_ratio",
+        "surface_orientation_filter",
+        "surface_max_tilt_degrees",
+        "surface_min_center_depth",
+        "surface_max_center_depth",
+    )
+    original = {name: getattr(args, name) for name in constraint_names}
+    profiles = [
+        {
+            "level": 0,
+            "name": "strict",
+        }
+    ]
+    if args.natural_auto_relax and args.surface_score_mode == "natural":
+        profiles.extend(
+            [
+                {
+                    "level": 1,
+                    "name": "gentle",
+                    "surface_coverage_min": min(original["surface_coverage_min"], 0.002),
+                    "surface_coverage_max": max(original["surface_coverage_max"], 0.06),
+                    "surface_min_visible_frames": max(
+                        args.natural_relax_min_visible_frames,
+                        int(original["surface_min_visible_frames"]) - 1,
+                    ),
+                    "surface_min_visibility_ratio": max(
+                        args.natural_relax_min_visibility_ratio,
+                        float(original["surface_min_visibility_ratio"]) - 0.15,
+                    ),
+                    "surface_max_tilt_degrees": min(
+                        args.natural_relax_max_tilt_degrees,
+                        float(original["surface_max_tilt_degrees"]) + 10.0,
+                    ),
+                    "surface_min_center_depth": max(
+                        args.natural_relax_min_center_depth,
+                        float(original["surface_min_center_depth"]) - 0.3,
+                    ),
+                },
+                {
+                    "level": 2,
+                    "name": "broad_rigid_surface",
+                    "surface_coverage_min": min(original["surface_coverage_min"], 0.001),
+                    "surface_coverage_max": max(
+                        original["surface_coverage_max"], args.natural_relax_max_coverage
+                    ),
+                    "surface_min_visible_frames": args.natural_relax_min_visible_frames,
+                    "surface_min_visibility_ratio": args.natural_relax_min_visibility_ratio,
+                    "surface_orientation_filter": args.natural_relax_orientation_filter,
+                    "surface_max_tilt_degrees": args.natural_relax_max_tilt_degrees,
+                    "surface_min_center_depth": args.natural_relax_min_center_depth,
+                },
+            ]
+        )
+
+    errors = []
+    try:
+        for profile in profiles:
+            for name, value in original.items():
+                setattr(args, name, value)
+            for name, value in profile.items():
+                if name not in ("level", "name"):
+                    setattr(args, name, value)
+            try:
+                patch_world, meta = run_patch_plane_selector(
+                    c2w,
+                    image_paths,
+                    tensor_hw,
+                    texture_size,
+                    intrinsics,
+                    args,
+                    depth_maps,
+                )
+                used = {name: getattr(args, name) for name in constraint_names}
+                meta.update(
+                    {
+                        "natural_relaxation_level": int(profile["level"]),
+                        "natural_relaxation_name": str(profile["name"]),
+                        "natural_constraints_original": original,
+                        "natural_constraints_used": used,
+                    }
+                )
+                candidates = getattr(args, "_last_patch_plane_candidates", [])
+                for _, _, candidate_meta in candidates:
+                    candidate_meta.update(
+                        {
+                            "natural_relaxation_level": int(profile["level"]),
+                            "natural_relaxation_name": str(profile["name"]),
+                            "natural_constraints_original": original,
+                            "natural_constraints_used": used,
+                        }
+                    )
+                if int(profile["level"]) > 0:
+                    print(
+                        f"[natural-relax] level={profile['level']} name={profile['name']} "
+                        f"coverage=[{used['surface_coverage_min']},{used['surface_coverage_max']}] "
+                        f"visible_frames={used['surface_min_visible_frames']} "
+                        f"visibility={used['surface_min_visibility_ratio']} "
+                        f"orientation={used['surface_orientation_filter']}"
+                    )
+                return patch_world, meta
+            except RuntimeError as exc:
+                errors.append(f"level {profile['level']} ({profile['name']}): {exc}")
+                continue
+    finally:
+        for name, value in original.items():
+            setattr(args, name, value)
+
+    raise RuntimeError(
+        "No physically plausible natural surface was found after all relaxation levels. "
+        + " | ".join(errors)
+    )
+
+
 def choose_patch_plane_world(
     c2w: np.ndarray,
     image_paths: list[str],
@@ -1216,6 +1368,13 @@ def choose_patch_plane_world(
         args.low_frequency_weight,
         args.low_frequency_kernel,
         args.texture_init,
+        args.natural_auto_relax,
+        args.natural_relax_max_coverage,
+        args.natural_relax_min_visible_frames,
+        args.natural_relax_min_visibility_ratio,
+        args.natural_relax_orientation_filter,
+        args.natural_relax_max_tilt_degrees,
+        args.natural_relax_min_center_depth,
     )
     if cache_key in cache:
         cached = cache[cache_key]
@@ -1231,15 +1390,15 @@ def choose_patch_plane_world(
         return patch_world.copy(), copy.deepcopy(meta)
 
     args._last_patch_plane_candidates = []
-    if args.plane_mode == "vggt_pointmap_surface":
-        result = choose_vggt_pointmap_surface_plane(c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps)
-    elif args.plane_mode == "fused_depth_surface":
-        result = choose_fused_depth_surface_plane(c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps)
-    elif args.plane_mode == "auto_depth_surface":
-        result = choose_auto_depth_surface_plane(c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps)
-    else:
-        result = build_fixed_patch_plane_world(c2w[0], args)
-        args._last_patch_plane_candidates = [(0.0, result[0].copy(), copy.deepcopy(result[1]))]
+    result = select_patch_plane_with_natural_relaxation(
+        c2w,
+        image_paths,
+        tensor_hw,
+        texture_size,
+        intrinsics,
+        args,
+        depth_maps,
+    )
 
     candidates = getattr(args, "_last_patch_plane_candidates", [])
     cache[cache_key] = (
@@ -1869,6 +2028,13 @@ def train_geometry_patch(
             "surface_strength_lr": args.surface_strength_lr,
             "surface_strength_texture_init": args.surface_strength_texture_init,
             "surface_strength_regularization_weight": args.surface_strength_regularization_weight,
+            "natural_auto_relax": bool(args.natural_auto_relax),
+            "natural_relax_max_coverage": args.natural_relax_max_coverage,
+            "natural_relax_min_visible_frames": args.natural_relax_min_visible_frames,
+            "natural_relax_min_visibility_ratio": args.natural_relax_min_visibility_ratio,
+            "natural_relax_orientation_filter": args.natural_relax_orientation_filter,
+            "natural_relax_max_tilt_degrees": args.natural_relax_max_tilt_degrees,
+            "natural_relax_min_center_depth": args.natural_relax_min_center_depth,
         },
         "intrinsics": intrinsics.astype(float).tolist(),
         "frame_manifest": args.frame_manifest,
@@ -2044,6 +2210,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--surface_strength_lr", type=float, default=0.002)
     parser.add_argument("--surface_strength_texture_init", choices=("random", "gray", "white", "black", "checker"), default="random")
     parser.add_argument("--surface_strength_regularization_weight", type=float, default=1.0)
+    parser.add_argument("--natural_auto_relax", action="store_true")
+    parser.add_argument("--natural_relax_max_coverage", type=float, default=0.08)
+    parser.add_argument("--natural_relax_min_visible_frames", type=int, default=2)
+    parser.add_argument("--natural_relax_min_visibility_ratio", type=float, default=0.25)
+    parser.add_argument(
+        "--natural_relax_orientation_filter",
+        choices=("none", "fronto", "tabletop", "side", "fronto_or_tabletop", "axis_aligned"),
+        default="fronto_or_tabletop",
+    )
+    parser.add_argument("--natural_relax_max_tilt_degrees", type=float, default=50.0)
+    parser.add_argument("--natural_relax_min_center_depth", type=float, default=1.0)
     parser.add_argument("--tv_weight", type=float, default=0.0)
     parser.add_argument("--printability_weight", type=float, default=0.0)
     parser.add_argument("--printable_color_levels", type=int, default=8)
@@ -2107,6 +2284,7 @@ def main() -> None:
             "surface_strength_search": bool(args.surface_strength_search),
             "surface_strength_candidates": args.surface_strength_candidates,
             "surface_strength_steps": args.surface_strength_steps,
+            "natural_auto_relax": bool(args.natural_auto_relax),
             "regularization": {
                 "tv_weight": args.tv_weight,
                 "printability_weight": args.printability_weight,
