@@ -491,10 +491,12 @@ def load_clean_vggt_geometry(
             return None
 
         if point_map.ndim == 4 and point_map.shape[-1] == 3:
+            point_map_grid = point_map.copy()
             points = point_map.reshape(-1, 3)
         else:
             return None
         valid = np.isfinite(points).all(axis=1)
+        valid_grid = valid.reshape(point_map_grid.shape[:-1])
 
         if "point_conf" in data:
             conf = np.asarray(data["point_conf"]).reshape(-1)
@@ -502,6 +504,7 @@ def load_clean_vggt_geometry(
             if args.vggt_point_conf_percentile > 0 and valid.any():
                 threshold = np.percentile(conf[valid], args.vggt_point_conf_percentile)
                 valid &= conf >= threshold
+            valid_grid = valid.reshape(point_map_grid.shape[:-1])
 
         points = points[valid]
         if points.shape[0] > args.fused_max_points:
@@ -526,6 +529,8 @@ def load_clean_vggt_geometry(
         "c2w": c2w,
         "intrinsics": intrinsics,
         "points": points,
+        "point_map_grid": point_map_grid,
+        "point_valid_grid": valid_grid,
         "depth_maps": depth_maps,
         "source": str(npz_path),
         "tensor_hw": [tensor_h, tensor_w],
@@ -893,6 +898,118 @@ def choose_vggt_pointmap_surface_plane(
     return best[1], best[2]
 
 
+def choose_vggt_manual_anchor_surface_plane(
+    c2w: np.ndarray,
+    image_paths: list[str],
+    tensor_hw: tuple[int, int],
+    texture_size: int,
+    intrinsics: np.ndarray,
+    args: argparse.Namespace,
+    depth_maps: list[np.ndarray | None],
+) -> tuple[np.ndarray, dict]:
+    points = getattr(args, "_active_vggt_points", None)
+    point_map_grid = getattr(args, "_active_vggt_point_map_grid", None)
+    point_valid_grid = getattr(args, "_active_vggt_point_valid_grid", None)
+    source = getattr(args, "_active_vggt_geometry_source", None)
+    if points is None or point_map_grid is None or point_valid_grid is None:
+        raise RuntimeError("Manual VGGT anchor requires a structured clean VGGT point map.")
+
+    n_frames, grid_h, grid_w, _ = point_map_grid.shape
+    frame_idx = min(max(int(args.manual_anchor_frame), 0), n_frames - 1)
+    if args.manual_anchor_coordinates == "normalized":
+        target_x = float(args.manual_anchor_x) * (grid_w - 1)
+        target_y = float(args.manual_anchor_y) * (grid_h - 1)
+    else:
+        target_x = float(args.manual_anchor_x)
+        target_y = float(args.manual_anchor_y)
+    target_x = min(max(target_x, 0.0), grid_w - 1.0)
+    target_y = min(max(target_y, 0.0), grid_h - 1.0)
+
+    valid = point_valid_grid[frame_idx]
+    radius = max(0, int(args.manual_anchor_search_radius))
+    x0 = max(0, int(round(target_x)) - radius)
+    x1 = min(grid_w, int(round(target_x)) + radius + 1)
+    y0 = max(0, int(round(target_y)) - radius)
+    y1 = min(grid_h, int(round(target_y)) + radius + 1)
+    local_valid = np.argwhere(valid[y0:y1, x0:x1])
+    if local_valid.size == 0:
+        raise RuntimeError(
+            f"No valid VGGT point was found near manual anchor ({target_x:.1f}, {target_y:.1f}) "
+            f"within radius {radius}."
+        )
+    local_y = local_valid[:, 0] + y0
+    local_x = local_valid[:, 1] + x0
+    distances = (local_x - target_x) ** 2 + (local_y - target_y) ** 2
+    best_local = int(np.argmin(distances))
+    anchor_x = int(local_x[best_local])
+    anchor_y = int(local_y[best_local])
+    center_world = np.asarray(point_map_grid[frame_idx, anchor_y, anchor_x], dtype=np.float64)
+
+    axes = estimate_world_surface_axes(points, center_world, c2w[frame_idx], args)
+    if axes is None:
+        raise RuntimeError("Could not estimate a local plane at the manual VGGT anchor.")
+    axis_u, axis_v, normal, pca_meta = axes
+    if pca_meta["plane_residual_ratio"] > args.fused_max_plane_residual:
+        raise RuntimeError(
+            f"Manual anchor is not planar enough: residual={pca_meta['plane_residual_ratio']:.6f}."
+        )
+
+    rolled_u, rolled_v = rotate_axes(axis_u, axis_v, args.manual_anchor_roll_degrees)
+    patch_world = build_plane_world_from_world_axes(
+        center_world,
+        rolled_u,
+        rolled_v,
+        args.plane_width,
+        args.plane_height,
+    )
+    old_depth_maps = getattr(args, "_active_depth_maps", None)
+    args._active_depth_maps = depth_maps
+    try:
+        _, _, geom_meta = build_geometry_arrays_for_plane(
+            patch_world,
+            c2w,
+            image_paths,
+            tensor_hw,
+            texture_size,
+            intrinsics,
+            args,
+        )
+    finally:
+        args._active_depth_maps = old_depth_maps
+
+    support_ratio = float(geom_meta.get("surface_support_ratio_mean", 0.0))
+    if args.surface_support_check and support_ratio < args.surface_min_support_ratio:
+        raise RuntimeError(
+            f"Manual anchor patch is not sufficiently supported by the carrier surface: "
+            f"support={support_ratio:.4f}, required={args.surface_min_support_ratio:.4f}. "
+            "Adjust manual_anchor_x/y or reduce plane_width/height."
+        )
+
+    center_first_cam_h = np.linalg.inv(c2w[frame_idx]) @ np.asarray(
+        [center_world[0], center_world[1], center_world[2], 1.0], dtype=np.float64
+    )
+    placement = {
+        "placement_mode": "vggt_manual_anchor_surface",
+        "geometry_source": "clean_vggt_pointmap",
+        "clean_vggt_output": source,
+        "manual_anchor_coordinates": args.manual_anchor_coordinates,
+        "manual_anchor_requested": [float(args.manual_anchor_x), float(args.manual_anchor_y)],
+        "manual_anchor_frame": frame_idx,
+        "manual_anchor_tensor_xy": [anchor_x, anchor_y],
+        "manual_anchor_search_radius": radius,
+        "center_world": center_world.astype(float).tolist(),
+        "center_anchor_camera": center_first_cam_h[:3].astype(float).tolist(),
+        "surface_normal_world": normal.astype(float).tolist(),
+        "width_m": args.plane_width,
+        "height_m": args.plane_height,
+        "roll_degrees": float(args.manual_anchor_roll_degrees),
+        **pca_meta,
+    }
+    geom_meta.update(placement)
+    args._last_patch_plane_candidates = [(0.0, patch_world.copy(), copy.deepcopy(geom_meta))]
+    return patch_world, geom_meta
+
+
 def plane_depth_map(
     corners_cam: np.ndarray,
     intrinsics: np.ndarray,
@@ -1207,6 +1324,10 @@ def run_patch_plane_selector(
         return choose_vggt_pointmap_surface_plane(
             c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps
         )
+    if args.plane_mode == "vggt_manual_anchor_surface":
+        return choose_vggt_manual_anchor_surface_plane(
+            c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps
+        )
     if args.plane_mode == "fused_depth_surface":
         return choose_fused_depth_surface_plane(
             c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps
@@ -1417,6 +1538,12 @@ def choose_patch_plane_world(
         args.surface_support_rel_tolerance,
         args.surface_min_support_ratio,
         args.natural_relax_min_support_ratio,
+        args.manual_anchor_coordinates,
+        args.manual_anchor_x,
+        args.manual_anchor_y,
+        args.manual_anchor_frame,
+        args.manual_anchor_search_radius,
+        args.manual_anchor_roll_degrees,
     )
     if cache_key in cache:
         cached = cache[cache_key]
@@ -1700,9 +1827,13 @@ def load_tum_sequence(
     c2w = tum_rows_to_c2w(read_tum_rows(seq_dir / gt_name), frame_indices)
     local_intrinsics = intrinsics
     old_vggt_points = getattr(args, "_active_vggt_points", None)
+    old_vggt_point_map_grid = getattr(args, "_active_vggt_point_map_grid", None)
+    old_vggt_point_valid_grid = getattr(args, "_active_vggt_point_valid_grid", None)
     old_vggt_source = getattr(args, "_active_vggt_geometry_source", None)
     old_tensor_intrinsics = getattr(args, "_intrinsics_in_tensor_space", False)
     args._active_vggt_points = None
+    args._active_vggt_point_map_grid = None
+    args._active_vggt_point_valid_grid = None
     args._active_vggt_geometry_source = None
     args._intrinsics_in_tensor_space = False
     clean_features = None
@@ -1714,12 +1845,14 @@ def load_tum_sequence(
             ]
     try:
         depth_maps = load_depth_maps(seq_dir, image_paths, frame_indices, tensor_hw, args)
-        if args.plane_mode == "vggt_pointmap_surface":
+        if args.plane_mode in ("vggt_pointmap_surface", "vggt_manual_anchor_surface"):
             clean_geometry = load_clean_vggt_geometry(seq_dir.name, tensor_hw, args)
             if clean_geometry is not None:
                 c2w = clean_geometry["c2w"]
                 local_intrinsics = clean_geometry["intrinsics"]
                 args._active_vggt_points = clean_geometry["points"]
+                args._active_vggt_point_map_grid = clean_geometry["point_map_grid"]
+                args._active_vggt_point_valid_grid = clean_geometry["point_valid_grid"]
                 args._active_vggt_geometry_source = clean_geometry["source"]
                 args._intrinsics_in_tensor_space = True
                 if args.use_depth_visibility and clean_geometry["depth_maps"] is not None:
@@ -1740,6 +1873,8 @@ def load_tum_sequence(
         )
     finally:
         args._active_vggt_points = old_vggt_points
+        args._active_vggt_point_map_grid = old_vggt_point_map_grid
+        args._active_vggt_point_valid_grid = old_vggt_point_valid_grid
         args._active_vggt_geometry_source = old_vggt_source
         args._intrinsics_in_tensor_space = old_tensor_intrinsics
     return {
@@ -2068,6 +2203,14 @@ def train_geometry_patch(
             "surface_support_abs_tolerance": args.surface_support_abs_tolerance,
             "surface_support_rel_tolerance": args.surface_support_rel_tolerance,
             "surface_min_support_ratio": args.surface_min_support_ratio,
+            "manual_anchor": {
+                "coordinates": args.manual_anchor_coordinates,
+                "x": args.manual_anchor_x,
+                "y": args.manual_anchor_y,
+                "frame": args.manual_anchor_frame,
+                "search_radius": args.manual_anchor_search_radius,
+                "roll_degrees": args.manual_anchor_roll_degrees,
+            },
             "surface_strength_search": bool(args.surface_strength_search),
             "surface_strength_candidates": args.surface_strength_candidates,
             "surface_strength_steps": args.surface_strength_steps,
@@ -2203,7 +2346,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cy", type=float, default=247.6)
     parser.add_argument(
         "--plane_mode",
-        choices=("fixed", "auto_depth_surface", "fused_depth_surface", "vggt_pointmap_surface"),
+        choices=(
+            "fixed",
+            "auto_depth_surface",
+            "fused_depth_surface",
+            "vggt_pointmap_surface",
+            "vggt_manual_anchor_surface",
+        ),
         default="fixed",
     )
     parser.add_argument("--clean_vggt_output_root", default=None)
@@ -2213,6 +2362,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plane_distance", type=float, default=2.0)
     parser.add_argument("--plane_center_x", type=float, default=0.0)
     parser.add_argument("--plane_center_y", type=float, default=0.0)
+    parser.add_argument("--manual_anchor_coordinates", choices=("normalized", "pixel"), default="normalized")
+    parser.add_argument("--manual_anchor_x", type=float, default=0.5)
+    parser.add_argument("--manual_anchor_y", type=float, default=0.5)
+    parser.add_argument("--manual_anchor_frame", type=int, default=0)
+    parser.add_argument("--manual_anchor_search_radius", type=int, default=12)
+    parser.add_argument("--manual_anchor_roll_degrees", type=float, default=0.0)
     parser.add_argument("--use_depth_visibility", action="store_true")
     parser.add_argument("--depth_txt_name", default="depth.txt")
     parser.add_argument("--depth_scale", type=float, default=5000.0)

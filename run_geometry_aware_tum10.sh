@@ -11,13 +11,14 @@ TUM_ROOT="${TUM_ROOT:-$RECONS_ROOT/data/tum}"
 TUM10_FRAME_SCENES="${TUM10_FRAME_SCENES:-$VGGT_ROOT/data/tum_dynamics_10frame_individual_scenes}"
 TUM10_FRAME_MANIFEST="${TUM10_FRAME_MANIFEST:-$TUM10_FRAME_SCENES/tum10_frame_manifest.json}"
 TUM_FRAME_COUNT="${TUM_FRAME_COUNT:-10}"
+SCENE_PATTERN="${SCENE_PATTERN:-rgbd_dataset_freiburg3_*}"
 
 OUT_BASE="${OUT_BASE:-$VGGT_ROOT/outputs_attack_geometry_aware_tum10}"
 TUM_CLEAN_OUT="$OUT_BASE/tum10_clean_uniform_l3"
 TUM_GEOM_RUN_NAME="${TUM_GEOM_RUN_NAME:-tum10_vggt_pointmap_geometry_feature_l3}"
 TUM_GEOM_OUT="$OUT_BASE/$TUM_GEOM_RUN_NAME"
 
-TUM_CLEAN_MODEL="vggt_tum10_clean_uniform_l3_geomrun"
+TUM_CLEAN_MODEL="${TUM_CLEAN_MODEL:-vggt_tum10_clean_uniform_l3_geomrun}"
 TUM_GEOM_MODEL="${TUM_GEOM_MODEL:-vggt_tum10_vggt_pointmap_geometry_feature_l3}"
 
 ITERATIONS="${ITERATIONS:-200}"
@@ -35,6 +36,12 @@ PLANE_HEIGHT="${PLANE_HEIGHT:-0.6}"
 PLANE_DISTANCE="${PLANE_DISTANCE:-2.0}"
 PLANE_CENTER_X="${PLANE_CENTER_X:-0.0}"
 PLANE_CENTER_Y="${PLANE_CENTER_Y:-0.0}"
+MANUAL_ANCHOR_COORDINATES="${MANUAL_ANCHOR_COORDINATES:-normalized}"
+MANUAL_ANCHOR_X="${MANUAL_ANCHOR_X:-0.5}"
+MANUAL_ANCHOR_Y="${MANUAL_ANCHOR_Y:-0.5}"
+MANUAL_ANCHOR_FRAME="${MANUAL_ANCHOR_FRAME:-0}"
+MANUAL_ANCHOR_SEARCH_RADIUS="${MANUAL_ANCHOR_SEARCH_RADIUS:-12}"
+MANUAL_ANCHOR_ROLL_DEGREES="${MANUAL_ANCHOR_ROLL_DEGREES:-0}"
 PLANE_MODE="${PLANE_MODE:-vggt_pointmap_surface}"
 VGGT_POINT_CONF_PERCENTILE="${VGGT_POINT_CONF_PERCENTILE:-40}"
 USE_DEPTH_VISIBILITY="${USE_DEPTH_VISIBILITY:-1}"
@@ -125,6 +132,7 @@ echo "iterations=$ITERATIONS inner_loop=$INNER_LOOP scenes_per_iteration=$SCENES
 echo "texture_size=$TEXTURE_SIZE texture_init=$TEXTURE_INIT freeze_texture=$FREEZE_TEXTURE patch_lr=$PATCH_LR feature_layer=$FEATURE_LAYER"
 echo "plane_width=$PLANE_WIDTH plane_height=$PLANE_HEIGHT plane_distance=$PLANE_DISTANCE"
 echo "plane_center=($PLANE_CENTER_X,$PLANE_CENTER_Y)"
+echo "scene_pattern=$SCENE_PATTERN manual_anchor=($MANUAL_ANCHOR_X,$MANUAL_ANCHOR_Y) frame=$MANUAL_ANCHOR_FRAME roll=$MANUAL_ANCHOR_ROLL_DEGREES"
 echo "plane_mode=$PLANE_MODE clean_vggt_output_root=$TUM_CLEAN_OUT use_depth_visibility=$USE_DEPTH_VISIBILITY optimize_geometry=$OPTIMIZE_GEOMETRY"
 echo "surface_candidate_grid=$SURFACE_CANDIDATE_GRID geometry_size_scales=$GEOMETRY_SIZE_SCALES geometry_roll_degrees=$GEOMETRY_ROLL_DEGREES"
 echo "fused_point_stride=$FUSED_POINT_STRIDE fused_surface_candidates=$FUSED_SURFACE_CANDIDATES fused_normal_radius=$FUSED_NORMAL_RADIUS"
@@ -201,6 +209,7 @@ if [[ "$FREEZE_TEXTURE" == "1" ]]; then
 fi
 "$VGGT_PY" "$VGGT_ROOT/attack_vggt_geometry_tum10.py" \
   --tum_root "$TUM_ROOT" \
+  --scene_pattern "$SCENE_PATTERN" \
   --output_dir "$TUM_GEOM_OUT" \
   --frame_manifest "$TUM10_FRAME_MANIFEST" \
   --ckpt "$CKPT" \
@@ -216,6 +225,12 @@ fi
   --plane_distance "$PLANE_DISTANCE" \
   --plane_center_x "$PLANE_CENTER_X" \
   --plane_center_y "$PLANE_CENTER_Y" \
+  --manual_anchor_coordinates "$MANUAL_ANCHOR_COORDINATES" \
+  --manual_anchor_x "$MANUAL_ANCHOR_X" \
+  --manual_anchor_y "$MANUAL_ANCHOR_Y" \
+  --manual_anchor_frame "$MANUAL_ANCHOR_FRAME" \
+  --manual_anchor_search_radius "$MANUAL_ANCHOR_SEARCH_RADIUS" \
+  --manual_anchor_roll_degrees "$MANUAL_ANCHOR_ROLL_DEGREES" \
   --clean_vggt_output_root "$TUM_CLEAN_OUT" \
   --vggt_point_conf_percentile "$VGGT_POINT_CONF_PERCENTILE" \
   --surface_candidate_grid "$SURFACE_CANDIDATE_GRID" \
@@ -280,11 +295,13 @@ log "evaluate TUM-10 clean and geometry-aware attack"
   --vggt_output_root "$TUM_CLEAN_OUT" \
   --model_name "$TUM_CLEAN_MODEL" \
   --recons_root "$RECONS_ROOT" \
+  --scene_pattern "$SCENE_PATTERN" \
   --overwrite
 "$RECONS_PY" "$VGGT_ROOT/scripts/eval_vggt_tum_pose_for_recons_eval_tum10.py" \
   --vggt_output_root "$TUM_GEOM_OUT" \
   --model_name "$TUM_GEOM_MODEL" \
   --recons_root "$RECONS_ROOT" \
+  --scene_pattern "$SCENE_PATTERN" \
   --overwrite
 
 log "all done"

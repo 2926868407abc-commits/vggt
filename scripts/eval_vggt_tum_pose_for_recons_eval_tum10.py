@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_root", default=None)
     parser.add_argument("--metric_csv", default=None)
     parser.add_argument("--gt_name", default="groundtruth_90.txt")
+    parser.add_argument("--scene_pattern", default="rgbd_dataset_freiburg3_*")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -87,7 +88,7 @@ def main() -> None:
         seq_metrics_csv.unlink()
 
     results = []
-    scene_dirs = sorted(path for path in vggt_root.glob("rgbd_dataset_freiburg3_*") if path.is_dir())
+    scene_dirs = sorted(path for path in vggt_root.glob(args.scene_pattern) if path.is_dir())
     if not scene_dirs:
         raise SystemExit(f"No TUM outputs found under {vggt_root}")
 
