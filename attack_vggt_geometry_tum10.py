@@ -49,6 +49,7 @@ from attack_vggt_new1 import (
 )
 from attack_vggt_vla_style import load_frame_manifest, scheduled_lr
 from vggt.utils.load_fn import load_and_preprocess_images
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 
 def list_scene_dirs(root: Path, pattern: str) -> list[Path]:
@@ -1809,6 +1810,114 @@ def apply_geometry_patch(
     return patched
 
 
+def c2w_numpy_to_relative_tensor(c2w: np.ndarray, device: torch.device) -> torch.Tensor:
+    c2w_t = torch.from_numpy(np.asarray(c2w, dtype=np.float32)).to(device)
+    if c2w_t.ndim != 3:
+        raise ValueError(f"Expected c2w with shape [T,4,4], got {tuple(c2w_t.shape)}")
+    c2w_t = c2w_t.unsqueeze(0)
+    return normalize_c2w_to_first(c2w_t).detach()
+
+
+def w2c_3x4_to_c2w(extrinsic: torch.Tensor) -> torch.Tensor:
+    extrinsic = extrinsic.float()
+    batch_shape = extrinsic.shape[:-2]
+    bottom = torch.zeros(*batch_shape, 1, 4, device=extrinsic.device, dtype=extrinsic.dtype)
+    bottom[..., 0, 3] = 1.0
+    w2c = torch.cat([extrinsic, bottom], dim=-2)
+    return torch.linalg.inv(w2c)
+
+
+def pose_predictions_to_relative_c2w(
+    preds: dict[str, torch.Tensor],
+    image_hw: tuple[int, int],
+) -> torch.Tensor:
+    if "pose_enc" not in preds:
+        raise RuntimeError("VGGT output did not contain pose_enc for pose-output attack loss.")
+    extrinsic, _ = pose_encoding_to_extri_intri(preds["pose_enc"], image_hw)
+    return normalize_c2w_to_first(w2c_3x4_to_c2w(extrinsic))
+
+
+def normalize_c2w_to_first(c2w: torch.Tensor) -> torch.Tensor:
+    first_inv = torch.linalg.inv(c2w[:, :1])
+    return torch.matmul(first_inv, c2w)
+
+
+def invert_relative_trajectory(rel_c2w: torch.Tensor) -> torch.Tensor:
+    return torch.linalg.inv(rel_c2w)
+
+
+def pose_relative_mse(
+    pred_rel: torch.Tensor,
+    target_rel: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    target_rel = target_rel.detach().to(device=pred_rel.device, dtype=pred_rel.dtype)
+    if pred_rel.shape != target_rel.shape:
+        raise RuntimeError(f"Pose target shape mismatch: pred={tuple(pred_rel.shape)} target={tuple(target_rel.shape)}")
+    rot_diff = pred_rel[..., :3, :3] - target_rel[..., :3, :3]
+    trans_diff = pred_rel[..., :3, 3] - target_rel[..., :3, 3]
+    rot_mse = rot_diff.pow(2).mean()
+    trans_scale = target_rel[..., :3, 3].norm(dim=-1).mean().clamp_min(1e-3)
+    trans_mse = (trans_diff / trans_scale).pow(2).mean()
+    total = args.pose_rotation_weight * rot_mse + args.pose_translation_weight * trans_mse
+    return total, {
+        "pose_loss": float(total.detach().cpu()),
+        "pose_rot_mse": float(rot_mse.detach().cpu()),
+        "pose_trans_mse": float(trans_mse.detach().cpu()),
+        "pose_trans_scale": float(trans_scale.detach().cpu()),
+    }
+
+
+def should_cache_clean_pose(args: argparse.Namespace) -> bool:
+    return args.attack_loss == "pose_clean_untargeted" or (
+        args.attack_loss == "pose_reverse_targeted" and args.pose_reverse_reference == "clean"
+    )
+
+
+def attack_objective_loss(
+    model: torch.nn.Module,
+    adv_images: torch.Tensor,
+    item: dict,
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, dict[str, float], bool]:
+    if args.attack_loss == "feature_l1":
+        adv_features = extract_features(
+            model,
+            adv_images,
+            dtype,
+            args.feature_layer,
+            args.activation_checkpoint,
+        )
+        loss, terms = feature_l1_loss(adv_features, item["clean_features"])
+        return loss, terms, True
+
+    preds = forward_vggt(model, adv_images, dtype)
+    pred_rel = pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
+
+    if args.attack_loss == "pose_gt_untargeted":
+        target_rel = item["pose_gt_rel"]
+        loss, terms = pose_relative_mse(pred_rel, target_rel, args)
+        terms["pose_reference"] = "gt"
+        return loss, terms, True
+
+    if args.attack_loss == "pose_clean_untargeted":
+        target_rel = item["pose_clean_rel"]
+        loss, terms = pose_relative_mse(pred_rel, target_rel, args)
+        terms["pose_reference"] = "clean"
+        return loss, terms, True
+
+    if args.attack_loss == "pose_reverse_targeted":
+        source_key = "pose_gt_rel" if args.pose_reverse_reference == "gt" else "pose_clean_rel"
+        target_rel = invert_relative_trajectory(item[source_key])
+        loss, terms = pose_relative_mse(pred_rel, target_rel, args)
+        terms["pose_reference"] = args.pose_reverse_reference
+        terms["pose_target"] = "inverse_relative_trajectory"
+        return loss, terms, False
+
+    raise ValueError(f"Unknown attack_loss: {args.attack_loss}")
+
+
 def load_tum_sequence(
     seq_dir: Path,
     frame_indices: list[int],
@@ -1824,7 +1933,9 @@ def load_tum_sequence(
     image_paths = [all_images[int(idx)] for idx in frame_indices]
     images = load_and_preprocess_images(image_paths).to(device)
     tensor_hw = tuple(int(v) for v in images.shape[-2:])
-    c2w = tum_rows_to_c2w(read_tum_rows(seq_dir / gt_name), frame_indices)
+    gt_c2w = tum_rows_to_c2w(read_tum_rows(seq_dir / gt_name), frame_indices)
+    c2w = gt_c2w.copy()
+    pose_gt_rel = c2w_numpy_to_relative_tensor(gt_c2w, device)
     local_intrinsics = intrinsics
     old_vggt_points = getattr(args, "_active_vggt_points", None)
     old_vggt_point_map_grid = getattr(args, "_active_vggt_point_map_grid", None)
@@ -1837,12 +1948,19 @@ def load_tum_sequence(
     args._active_vggt_geometry_source = None
     args._intrinsics_in_tensor_space = False
     clean_features = None
+    clean_pose_rel = None
     if args.surface_strength_search and model is not None and dtype is not None:
         with torch.no_grad():
             clean_features = [
                 feature.detach()
                 for feature in extract_features(model, images, dtype, args.feature_layer)
             ]
+    if should_cache_clean_pose(args):
+        if model is None or dtype is None:
+            raise RuntimeError(f"{args.attack_loss} needs model/dtype to cache clean VGGT pose reference.")
+        with torch.no_grad():
+            clean_preds = forward_vggt(model, images, dtype)
+            clean_pose_rel = pose_predictions_to_relative_c2w(clean_preds, tensor_hw).detach()
     try:
         depth_maps = load_depth_maps(seq_dir, image_paths, frame_indices, tensor_hw, args)
         if args.plane_mode in ("vggt_pointmap_surface", "vggt_manual_anchor_surface"):
@@ -1884,7 +2002,10 @@ def load_tum_sequence(
         "image_paths": image_paths,
         "image_names": [Path(path).name for path in image_paths],
         "frame_indices": frame_indices,
-        "c2w_gt": c2w,
+        "c2w_gt": gt_c2w,
+        "c2w_geometry": c2w,
+        "pose_gt_rel": pose_gt_rel,
+        "pose_clean_rel": clean_pose_rel,
         "geometry_intrinsics": np.asarray(local_intrinsics).astype(float).tolist(),
         "geometry_source": geom_meta.get("geometry_source", "tum_gt_geometry"),
         "depth_available": [depth is not None for depth in depth_maps],
@@ -2044,7 +2165,7 @@ def train_geometry_patch(
                     model=model,
                     dtype=dtype,
                 )
-                if item["clean_features"] is None:
+                if args.attack_loss == "feature_l1" and item["clean_features"] is None:
                     with torch.no_grad():
                         item["clean_features"] = [
                             feature.detach()
@@ -2069,6 +2190,7 @@ def train_geometry_patch(
                 low_freq_terms = []
                 printable_terms = []
                 coverages = []
+                attack_term_values: dict[str, list[float]] = {}
                 for item in batch:
                     adv_images = apply_geometry_patch(
                         item["images"],
@@ -2078,18 +2200,25 @@ def train_geometry_patch(
                         args,
                         training=True,
                     )
-                    adv_features = extract_features(
+                    loss, terms, maximize_loss = attack_objective_loss(
                         model,
                         adv_images,
+                        item,
+                        args,
                         dtype,
-                        args.feature_layer,
-                        args.activation_checkpoint,
                     )
-                    loss, terms = feature_l1_loss(adv_features, item["clean_features"])
                     reg_terms = patch_regularization_terms(texture, args)
-                    objective = -loss + reg_terms["regularization_total"]
+                    objective = (-loss if maximize_loss else loss) + reg_terms["regularization_total"]
                     (objective / len(batch)).backward()
-                    losses.append(terms["feature_l1"])
+                    metric_value = terms.get("feature_l1")
+                    if metric_value is None:
+                        metric_value = terms.get("pose_loss")
+                    if metric_value is None:
+                        metric_value = terms["total"]
+                    losses.append(float(metric_value))
+                    for key, value in terms.items():
+                        if isinstance(value, (int, float)):
+                            attack_term_values.setdefault(key, []).append(float(value))
                     reg_totals.append(float(reg_terms["regularization_total"].detach().cpu()))
                     tv_terms.append(float(reg_terms["tv"].detach().cpu()))
                     low_freq_terms.append(float(reg_terms["low_frequency"].detach().cpu()))
@@ -2109,7 +2238,8 @@ def train_geometry_patch(
                     "inner_step": inner_step + 1,
                     "update": update_idx,
                     "lr": current_lr,
-                    "feature_l1": last_loss,
+                    "attack_loss": args.attack_loss,
+                    "attack_metric": last_loss,
                     "regularization_total": float(np.mean(reg_totals)) if reg_totals else 0.0,
                     "tv": float(np.mean(tv_terms)) if tv_terms else 0.0,
                     "low_frequency": float(np.mean(low_freq_terms)) if low_freq_terms else 0.0,
@@ -2117,11 +2247,13 @@ def train_geometry_patch(
                     "mask_coverage_mean": float(np.mean(coverages)),
                     "scenes": [item["seq"] for item in batch],
                 }
+                for key, values in attack_term_values.items():
+                    record[key] = float(np.mean(values))
                 history_file.write(json.dumps(record) + "\n")
                 if update_idx == 1 or update_idx % args.log_every == 0 or update_idx == total_updates:
                     print(
                         f"[train-geometry] update {update_idx:06d}/{total_updates:06d} "
-                        f"scenes={len(batch)} feature_l1={last_loss:.6f} "
+                        f"scenes={len(batch)} {args.attack_loss}={last_loss:.6f} "
                         f"reg={record['regularization_total']:.6f} "
                         f"coverage={record['mask_coverage_mean']:.6f}"
                     )
@@ -2135,7 +2267,10 @@ def train_geometry_patch(
     )
     metadata = {
         "mode": "gt_geometry_aware_planar_patch",
-        "attack_target": "feature_l1_clean_vs_adversarial",
+        "attack_target": args.attack_loss,
+        "pose_reverse_reference": args.pose_reverse_reference,
+        "pose_rotation_weight": args.pose_rotation_weight,
+        "pose_translation_weight": args.pose_translation_weight,
         "feature_layer": args.feature_layer,
         "texture_shape": list(texture.shape),
         "texture_init": args.texture_init,
@@ -2148,7 +2283,7 @@ def train_geometry_patch(
         "scenes_per_iteration": args.scenes_per_iteration,
         "total_updates": total_updates,
         "elapsed_seconds": time.time() - started,
-        "last_logged_feature_l1": last_loss,
+        "last_logged_attack_metric": last_loss,
         "depth_visibility": {
             "enabled": bool(args.use_depth_visibility),
             "depth_txt_name": args.depth_txt_name,
@@ -2335,6 +2470,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler", choices=("cosine", "none"), default="cosine")
     parser.add_argument("--warmup_iterations", type=int, default=20)
     parser.add_argument("--feature_layer", default="aggregator_final")
+    parser.add_argument(
+        "--attack_loss",
+        choices=("feature_l1", "pose_gt_untargeted", "pose_clean_untargeted", "pose_reverse_targeted"),
+        default="feature_l1",
+        help=(
+            "feature_l1 maximizes aggregator feature distance; pose_* losses operate on VGGT pose output. "
+            "pose_reverse_targeted minimizes distance to an inverse relative trajectory."
+        ),
+    )
+    parser.add_argument("--pose_reverse_reference", choices=("gt", "clean"), default="gt")
+    parser.add_argument("--pose_rotation_weight", type=float, default=1.0)
+    parser.add_argument("--pose_translation_weight", type=float, default=1.0)
     parser.add_argument("--activation_checkpoint", action="store_true")
     parser.add_argument("--skip_existing_outputs", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -2468,6 +2615,7 @@ def main() -> None:
     print(
         f"[cfg] device={device} dtype={dtype} scenes={len(scene_dirs)} "
         f"texture_size={args.texture_size} iterations={args.iterations} inner_loop={args.inner_loop} "
+        f"attack_loss={args.attack_loss} "
         f"plane_mode={args.plane_mode} depth_visibility={args.use_depth_visibility} "
         f"physical_eot={args.physical_eot} strength_search={args.surface_strength_search}"
     )
@@ -2481,6 +2629,10 @@ def main() -> None:
         patch_metadata = {
             "mode": "gt_geometry_aware_planar_patch",
             "loaded_texture_path": str(Path(args.texture_path)),
+            "attack_target": args.attack_loss,
+            "pose_reverse_reference": args.pose_reverse_reference,
+            "pose_rotation_weight": args.pose_rotation_weight,
+            "pose_translation_weight": args.pose_translation_weight,
             "frame_manifest": args.frame_manifest,
             "intrinsics": intrinsics.astype(float).tolist(),
             "plane_mode": args.plane_mode,

@@ -29,6 +29,10 @@ TEXTURE_SIZE="${TEXTURE_SIZE:-128}"
 TEXTURE_INIT="${TEXTURE_INIT:-random}"
 FREEZE_TEXTURE="${FREEZE_TEXTURE:-0}"
 FEATURE_LAYER="${FEATURE_LAYER:-aggregator_final}"
+ATTACK_LOSS="${ATTACK_LOSS:-feature_l1}"
+POSE_REVERSE_REFERENCE="${POSE_REVERSE_REFERENCE:-gt}"
+POSE_ROTATION_WEIGHT="${POSE_ROTATION_WEIGHT:-1.0}"
+POSE_TRANSLATION_WEIGHT="${POSE_TRANSLATION_WEIGHT:-1.0}"
 SEED="${SEED:-0}"
 
 PLANE_WIDTH="${PLANE_WIDTH:-0.6}"
@@ -130,6 +134,7 @@ require_dir "$TUM_ROOT"
 log "settings"
 echo "iterations=$ITERATIONS inner_loop=$INNER_LOOP scenes_per_iteration=$SCENES_PER_ITERATION"
 echo "texture_size=$TEXTURE_SIZE texture_init=$TEXTURE_INIT freeze_texture=$FREEZE_TEXTURE patch_lr=$PATCH_LR feature_layer=$FEATURE_LAYER"
+echo "attack_loss=$ATTACK_LOSS pose_reverse_reference=$POSE_REVERSE_REFERENCE pose_weights=(rot:$POSE_ROTATION_WEIGHT,trans:$POSE_TRANSLATION_WEIGHT)"
 echo "plane_width=$PLANE_WIDTH plane_height=$PLANE_HEIGHT plane_distance=$PLANE_DISTANCE"
 echo "plane_center=($PLANE_CENTER_X,$PLANE_CENTER_Y)"
 echo "scene_pattern=$SCENE_PATTERN manual_anchor=($MANUAL_ANCHOR_X,$MANUAL_ANCHOR_Y) frame=$MANUAL_ANCHOR_FRAME roll=$MANUAL_ANCHOR_ROLL_DEGREES"
@@ -220,6 +225,10 @@ fi
   --scenes_per_iteration "$SCENES_PER_ITERATION" \
   --patch_lr "$PATCH_LR" \
   --feature_layer "$FEATURE_LAYER" \
+  --attack_loss "$ATTACK_LOSS" \
+  --pose_reverse_reference "$POSE_REVERSE_REFERENCE" \
+  --pose_rotation_weight "$POSE_ROTATION_WEIGHT" \
+  --pose_translation_weight "$POSE_TRANSLATION_WEIGHT" \
   --plane_width "$PLANE_WIDTH" \
   --plane_height "$PLANE_HEIGHT" \
   --plane_distance "$PLANE_DISTANCE" \
