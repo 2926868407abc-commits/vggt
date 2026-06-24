@@ -1846,6 +1846,81 @@ def invert_relative_trajectory(rel_c2w: torch.Tensor) -> torch.Tensor:
     return torch.linalg.inv(rel_c2w)
 
 
+def yaw_rotation_matrices(
+    angles_rad: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    cos = torch.cos(angles_rad).to(device=device, dtype=dtype)
+    sin = torch.sin(angles_rad).to(device=device, dtype=dtype)
+    mats = torch.zeros(*angles_rad.shape, 4, 4, device=device, dtype=dtype)
+    mats[..., 0, 0] = cos
+    mats[..., 0, 2] = sin
+    mats[..., 1, 1] = 1.0
+    mats[..., 2, 0] = -sin
+    mats[..., 2, 2] = cos
+    mats[..., 3, 3] = 1.0
+    return mats
+
+
+def make_pose_bad_target(rel_c2w: torch.Tensor, args: argparse.Namespace) -> tuple[torch.Tensor, dict[str, float | str]]:
+    target = rel_c2w.detach().clone()
+    device = target.device
+    dtype = target.dtype
+    n_frames = target.shape[1]
+    if n_frames <= 1:
+        ramp = torch.zeros((1,), device=device, dtype=dtype)
+    else:
+        ramp = torch.linspace(0.0, 1.0, n_frames, device=device, dtype=dtype)
+
+    meta: dict[str, float | str] = {"pose_reference": args.pose_bad_reference}
+    if args.attack_loss == "pose_drift_targeted":
+        drift = torch.zeros((n_frames, 3), device=device, dtype=dtype)
+        drift[:, 0] = ramp * float(args.pose_drift_x_m)
+        drift[:, 1] = ramp * float(args.pose_drift_y_m)
+        drift[:, 2] = ramp * float(args.pose_drift_z_m)
+        target[:, :, :3, 3] = target[:, :, :3, 3] + drift[None]
+        if abs(float(args.pose_drift_yaw_degrees)) > 1e-8:
+            angles = ramp * math.radians(float(args.pose_drift_yaw_degrees))
+            yaw = yaw_rotation_matrices(angles, device=device, dtype=dtype)
+            target = torch.matmul(target, yaw[None])
+        meta.update(
+            {
+                "pose_target": "translation_drift",
+                "pose_drift_x_m": float(args.pose_drift_x_m),
+                "pose_drift_y_m": float(args.pose_drift_y_m),
+                "pose_drift_z_m": float(args.pose_drift_z_m),
+                "pose_drift_yaw_degrees": float(args.pose_drift_yaw_degrees),
+            }
+        )
+        return target, meta
+
+    if args.attack_loss == "pose_scale_targeted":
+        target[:, :, :3, 3] = target[:, :, :3, 3] * float(args.pose_translation_scale)
+        meta.update(
+            {
+                "pose_target": "translation_scale",
+                "pose_translation_scale": float(args.pose_translation_scale),
+            }
+        )
+        return target, meta
+
+    if args.attack_loss == "pose_yaw_targeted":
+        angles = ramp * math.radians(float(args.pose_yaw_degrees))
+        yaw = yaw_rotation_matrices(angles, device=device, dtype=dtype)
+        target = torch.matmul(target, yaw[None])
+        meta.update(
+            {
+                "pose_target": "yaw_bias",
+                "pose_yaw_degrees": float(args.pose_yaw_degrees),
+            }
+        )
+        return target, meta
+
+    raise ValueError(f"Unsupported bad pose target for attack_loss={args.attack_loss}")
+
+
 def pose_relative_mse(
     pred_rel: torch.Tensor,
     target_rel: torch.Tensor,
@@ -1871,6 +1946,9 @@ def pose_relative_mse(
 def should_cache_clean_pose(args: argparse.Namespace) -> bool:
     return args.attack_loss == "pose_clean_untargeted" or (
         args.attack_loss == "pose_reverse_targeted" and args.pose_reverse_reference == "clean"
+    ) or (
+        args.attack_loss in ("pose_drift_targeted", "pose_scale_targeted", "pose_yaw_targeted")
+        and args.pose_bad_reference == "clean"
     )
 
 
@@ -1913,6 +1991,13 @@ def attack_objective_loss(
         loss, terms = pose_relative_mse(pred_rel, target_rel, args)
         terms["pose_reference"] = args.pose_reverse_reference
         terms["pose_target"] = "inverse_relative_trajectory"
+        return loss, terms, False
+
+    if args.attack_loss in ("pose_drift_targeted", "pose_scale_targeted", "pose_yaw_targeted"):
+        source_key = "pose_gt_rel" if args.pose_bad_reference == "gt" else "pose_clean_rel"
+        target_rel, target_meta = make_pose_bad_target(item[source_key], args)
+        loss, terms = pose_relative_mse(pred_rel, target_rel, args)
+        terms.update(target_meta)
         return loss, terms, False
 
     raise ValueError(f"Unknown attack_loss: {args.attack_loss}")
@@ -2274,6 +2359,15 @@ def train_geometry_patch(
         "mode": "gt_geometry_aware_planar_patch",
         "attack_target": args.attack_loss,
         "pose_reverse_reference": args.pose_reverse_reference,
+        "pose_bad_reference": args.pose_bad_reference,
+        "pose_bad_target": {
+            "drift_x_m": args.pose_drift_x_m,
+            "drift_y_m": args.pose_drift_y_m,
+            "drift_z_m": args.pose_drift_z_m,
+            "drift_yaw_degrees": args.pose_drift_yaw_degrees,
+            "translation_scale": args.pose_translation_scale,
+            "yaw_degrees": args.pose_yaw_degrees,
+        },
         "pose_rotation_weight": args.pose_rotation_weight,
         "pose_translation_weight": args.pose_translation_weight,
         "feature_layer": args.feature_layer,
@@ -2478,14 +2572,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature_layer", default="aggregator_final")
     parser.add_argument(
         "--attack_loss",
-        choices=("feature_l1", "pose_gt_untargeted", "pose_clean_untargeted", "pose_reverse_targeted"),
+        choices=(
+            "feature_l1",
+            "pose_gt_untargeted",
+            "pose_clean_untargeted",
+            "pose_reverse_targeted",
+            "pose_drift_targeted",
+            "pose_scale_targeted",
+            "pose_yaw_targeted",
+        ),
         default="feature_l1",
         help=(
             "feature_l1 maximizes aggregator feature distance; pose_* losses operate on VGGT pose output. "
-            "pose_reverse_targeted minimizes distance to an inverse relative trajectory."
+            "pose_reverse/drift/scale/yaw targeted losses minimize distance to a constructed bad trajectory."
         ),
     )
     parser.add_argument("--pose_reverse_reference", choices=("gt", "clean"), default="gt")
+    parser.add_argument("--pose_bad_reference", choices=("gt", "clean"), default="gt")
+    parser.add_argument("--pose_drift_x_m", type=float, default=0.5)
+    parser.add_argument("--pose_drift_y_m", type=float, default=0.0)
+    parser.add_argument("--pose_drift_z_m", type=float, default=0.0)
+    parser.add_argument("--pose_drift_yaw_degrees", type=float, default=0.0)
+    parser.add_argument("--pose_translation_scale", type=float, default=2.0)
+    parser.add_argument("--pose_yaw_degrees", type=float, default=30.0)
     parser.add_argument("--pose_rotation_weight", type=float, default=1.0)
     parser.add_argument("--pose_translation_weight", type=float, default=1.0)
     parser.add_argument("--activation_checkpoint", action="store_true")
@@ -2637,6 +2746,15 @@ def main() -> None:
             "loaded_texture_path": str(Path(args.texture_path)),
             "attack_target": args.attack_loss,
             "pose_reverse_reference": args.pose_reverse_reference,
+            "pose_bad_reference": args.pose_bad_reference,
+            "pose_bad_target": {
+                "drift_x_m": args.pose_drift_x_m,
+                "drift_y_m": args.pose_drift_y_m,
+                "drift_z_m": args.pose_drift_z_m,
+                "drift_yaw_degrees": args.pose_drift_yaw_degrees,
+                "translation_scale": args.pose_translation_scale,
+                "yaw_degrees": args.pose_yaw_degrees,
+            },
             "pose_rotation_weight": args.pose_rotation_weight,
             "pose_translation_weight": args.pose_translation_weight,
             "frame_manifest": args.frame_manifest,
