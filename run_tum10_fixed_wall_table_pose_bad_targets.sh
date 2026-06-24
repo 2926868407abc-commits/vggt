@@ -12,11 +12,12 @@ SCENE_PATTERN="${SCENE_PATTERN:-rgbd_dataset_freiburg3_sitting_static}"
 UPDATES="${UPDATES:-1000}"
 RUN_WALL="${RUN_WALL:-1}"
 RUN_TABLE="${RUN_TABLE:-1}"
+RUN_SUFFIX="${RUN_SUFFIX:-}"
 
 COMMON_ENV=(
   SCENE_PATTERN="$SCENE_PATTERN"
   TUM_CLEAN_MODEL="${TUM_CLEAN_MODEL:-vggt_tum10_sitting_static_clean_uniform_l3}"
-  PLANE_MODE=vggt_manual_anchor_surface
+  PLANE_MODE=depth_manual_anchor_surface
   MANUAL_ANCHOR_COORDINATES=normalized
   MANUAL_ANCHOR_FRAME=0
   MANUAL_ANCHOR_SEARCH_RADIUS="${MANUAL_ANCHOR_SEARCH_RADIUS:-16}"
@@ -60,8 +61,8 @@ run_one() {
   local height="$8"
   shift 8
 
-  local run_name="tum10_sitting_static_fixed_${carrier}_pose_${target_name}_targeted_${UPDATES}"
-  local model_name="vggt_tum10_sitting_static_fixed_${carrier}_pose_${target_name}_targeted_${UPDATES}"
+  local run_name="tum10_sitting_static_fixed_${carrier}_pose_${target_name}_targeted_${UPDATES}${RUN_SUFFIX}"
+  local model_name="vggt_tum10_sitting_static_fixed_${carrier}_pose_${target_name}_targeted_${UPDATES}${RUN_SUFFIX}"
 
   echo "===== ${carrier}: ${target_name} (${attack_loss}) ====="
   env "${COMMON_ENV[@]}" \

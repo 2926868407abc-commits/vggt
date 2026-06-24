@@ -246,7 +246,11 @@ def load_depth_maps(
     tensor_hw: tuple[int, int],
     args: argparse.Namespace,
 ) -> list[np.ndarray | None]:
-    if not args.use_depth_visibility and args.plane_mode not in ("auto_depth_surface", "fused_depth_surface"):
+    if not args.use_depth_visibility and args.plane_mode not in (
+        "auto_depth_surface",
+        "fused_depth_surface",
+        "depth_manual_anchor_surface",
+    ):
         return [None for _ in image_paths]
     depth_paths = match_depth_paths(seq_dir, image_paths, frame_indices, args)
     return [
@@ -1011,6 +1015,137 @@ def choose_vggt_manual_anchor_surface_plane(
     return patch_world, geom_meta
 
 
+def choose_depth_manual_anchor_surface_plane(
+    c2w: np.ndarray,
+    image_paths: list[str],
+    tensor_hw: tuple[int, int],
+    texture_size: int,
+    intrinsics: np.ndarray,
+    args: argparse.Namespace,
+    depth_maps: list[np.ndarray | None],
+) -> tuple[np.ndarray, dict]:
+    n_frames = len(image_paths)
+    frame_idx = min(max(int(args.manual_anchor_frame), 0), n_frames - 1)
+    depth = depth_maps[frame_idx] if depth_maps else None
+    if depth is None:
+        raise RuntimeError("Manual depth anchor requires a matched TUM depth map.")
+
+    tensor_h, tensor_w = tensor_hw
+    if args.manual_anchor_coordinates == "normalized":
+        target_x = float(args.manual_anchor_x) * (tensor_w - 1)
+        target_y = float(args.manual_anchor_y) * (tensor_h - 1)
+    else:
+        target_x = float(args.manual_anchor_x)
+        target_y = float(args.manual_anchor_y)
+    target_x = min(max(target_x, 0.0), tensor_w - 1.0)
+    target_y = min(max(target_y, 0.0), tensor_h - 1.0)
+
+    radius = max(0, int(args.manual_anchor_search_radius))
+    x0 = max(0, int(round(target_x)) - radius)
+    x1 = min(tensor_w, int(round(target_x)) + radius + 1)
+    y0 = max(0, int(round(target_y)) - radius)
+    y1 = min(tensor_h, int(round(target_y)) + radius + 1)
+
+    local_depth = depth[y0:y1, x0:x1]
+    local_valid = np.argwhere(
+        np.isfinite(local_depth)
+        & (local_depth >= float(args.depth_min_m))
+        & (local_depth <= float(args.depth_max_m))
+    )
+    if local_valid.size == 0:
+        raise RuntimeError(
+            f"No valid TUM depth point was found near manual anchor ({target_x:.1f}, {target_y:.1f}) "
+            f"within radius {radius}."
+        )
+
+    local_y = local_valid[:, 0] + y0
+    local_x = local_valid[:, 1] + x0
+    distances = (local_x - target_x) ** 2 + (local_y - target_y) ** 2
+    best_local = int(np.argmin(distances))
+    anchor_x = int(local_x[best_local])
+    anchor_y = int(local_y[best_local])
+
+    proj = projection_params_for_frame(args, image_paths[frame_idx], tensor_hw)
+    frame_intrinsics = intrinsics[frame_idx] if np.asarray(intrinsics).ndim == 3 else intrinsics
+    xy = np.stack([local_x.astype(np.float64), local_y.astype(np.float64)], axis=-1)
+    z = depth[local_y, local_x].astype(np.float64)
+    local_cam = unproject_tensor_xy(xy, z, frame_intrinsics, proj)
+    local_h = np.concatenate([local_cam, np.ones((local_cam.shape[0], 1), dtype=np.float64)], axis=1)
+    local_world = (c2w[frame_idx] @ local_h.T).T[:, :3]
+
+    center_cam = unproject_tensor_xy(
+        np.asarray([[anchor_x, anchor_y]], dtype=np.float64),
+        np.asarray([depth[anchor_y, anchor_x]], dtype=np.float64),
+        frame_intrinsics,
+        proj,
+    )[0]
+    center_world = (c2w[frame_idx] @ np.asarray([center_cam[0], center_cam[1], center_cam[2], 1.0])).T[:3]
+
+    axes = estimate_world_surface_axes(local_world, center_world, c2w[frame_idx], args)
+    if axes is None:
+        raise RuntimeError("Could not estimate a local plane at the manual TUM-depth anchor.")
+    axis_u, axis_v, normal, pca_meta = axes
+    if pca_meta["plane_residual_ratio"] > args.fused_max_plane_residual:
+        raise RuntimeError(
+            f"Manual depth anchor is not planar enough: residual={pca_meta['plane_residual_ratio']:.6f}."
+        )
+
+    rolled_u, rolled_v = rotate_axes(axis_u, axis_v, args.manual_anchor_roll_degrees)
+    patch_world = build_plane_world_from_world_axes(
+        center_world,
+        rolled_u,
+        rolled_v,
+        args.plane_width,
+        args.plane_height,
+    )
+    old_depth_maps = getattr(args, "_active_depth_maps", None)
+    args._active_depth_maps = depth_maps
+    try:
+        _, _, geom_meta = build_geometry_arrays_for_plane(
+            patch_world,
+            c2w,
+            image_paths,
+            tensor_hw,
+            texture_size,
+            intrinsics,
+            args,
+        )
+    finally:
+        args._active_depth_maps = old_depth_maps
+
+    support_ratio = float(geom_meta.get("surface_support_ratio_mean", 0.0))
+    if args.surface_support_check and support_ratio < args.surface_min_support_ratio:
+        raise RuntimeError(
+            f"Manual depth anchor patch is not sufficiently supported by the carrier surface: "
+            f"support={support_ratio:.4f}, required={args.surface_min_support_ratio:.4f}. "
+            "Adjust manual_anchor_x/y or reduce plane_width/height."
+        )
+
+    center_first_cam_h = np.linalg.inv(c2w[frame_idx]) @ np.asarray(
+        [center_world[0], center_world[1], center_world[2], 1.0], dtype=np.float64
+    )
+    placement = {
+        "placement_mode": "depth_manual_anchor_surface",
+        "geometry_source": "tum_depth_manual_anchor",
+        "manual_anchor_coordinates": args.manual_anchor_coordinates,
+        "manual_anchor_requested": [float(args.manual_anchor_x), float(args.manual_anchor_y)],
+        "manual_anchor_frame": frame_idx,
+        "manual_anchor_tensor_xy": [anchor_x, anchor_y],
+        "manual_anchor_search_radius": radius,
+        "local_depth_point_count": int(local_world.shape[0]),
+        "center_world": center_world.astype(float).tolist(),
+        "center_anchor_camera": center_first_cam_h[:3].astype(float).tolist(),
+        "surface_normal_world": normal.astype(float).tolist(),
+        "width_m": args.plane_width,
+        "height_m": args.plane_height,
+        "roll_degrees": float(args.manual_anchor_roll_degrees),
+        **pca_meta,
+    }
+    geom_meta.update(placement)
+    args._last_patch_plane_candidates = [(0.0, patch_world.copy(), copy.deepcopy(geom_meta))]
+    return patch_world, geom_meta
+
+
 def plane_depth_map(
     corners_cam: np.ndarray,
     intrinsics: np.ndarray,
@@ -1327,6 +1462,10 @@ def run_patch_plane_selector(
         )
     if args.plane_mode == "vggt_manual_anchor_surface":
         return choose_vggt_manual_anchor_surface_plane(
+            c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps
+        )
+    if args.plane_mode == "depth_manual_anchor_surface":
+        return choose_depth_manual_anchor_surface_plane(
             c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps
         )
     if args.plane_mode == "fused_depth_surface":
@@ -2614,6 +2753,7 @@ def parse_args() -> argparse.Namespace:
             "fused_depth_surface",
             "vggt_pointmap_surface",
             "vggt_manual_anchor_surface",
+            "depth_manual_anchor_surface",
         ),
         default="fixed",
     )
