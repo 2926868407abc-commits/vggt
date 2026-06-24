@@ -288,17 +288,22 @@ def main() -> None:
     parser.add_argument("--contact_columns", type=int, default=5)
     parser.add_argument("--thumb_width", type=int, default=260)
     parser.add_argument("--contact_sheet_only", action="store_true")
+    parser.add_argument(
+        "--texture_path",
+        default=None,
+        help="Optional texture image to render. Defaults to geometry_patch/geometry_patch_texture.png.",
+    )
     args = parser.parse_args()
 
     root = Path(args.geometry_output_root)
     out_dir = Path(args.out_dir)
-    texture_path = root / "geometry_patch" / "geometry_patch_texture.png"
+    texture_path = Path(args.texture_path) if args.texture_path else root / "geometry_patch" / "geometry_patch_texture.png"
     if not texture_path.exists():
         raise FileNotFoundError(f"Missing texture image: {texture_path}")
 
     texture = Image.open(texture_path).convert("RGB")
     out_dir.mkdir(parents=True, exist_ok=True)
-    texture.save(out_dir / "geometry_patch_texture.png")
+    texture.save(out_dir / texture_path.name)
 
     scene_dirs = sorted(
         path for path in root.glob(args.scene_pattern) if (path / "attack_summary.json").exists()

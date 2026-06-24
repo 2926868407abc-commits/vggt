@@ -12,6 +12,7 @@ VIS_ALPHA="${VIS_ALPHA:-0.9}"
 VIS_CONTACT_COLUMNS="${VIS_CONTACT_COLUMNS:-5}"
 VIS_THUMB_WIDTH="${VIS_THUMB_WIDTH:-260}"
 VIS_CONTACT_SHEET_ONLY="${VIS_CONTACT_SHEET_ONLY:-0}"
+VIS_TEXTURE_PATH="${VIS_TEXTURE_PATH:-}"
 
 log() {
   printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
@@ -29,7 +30,11 @@ log "check paths"
 require_file "$VGGT_PY"
 require_file "$VGGT_ROOT/scripts/visualize_tum10_geometry_patch.py"
 require_dir "$GEOMETRY_OUTPUT_ROOT"
-require_file "$GEOMETRY_OUTPUT_ROOT/geometry_patch/geometry_patch_texture.png"
+if [[ -n "$VIS_TEXTURE_PATH" ]]; then
+  require_file "$VIS_TEXTURE_PATH"
+else
+  require_file "$GEOMETRY_OUTPUT_ROOT/geometry_patch/geometry_patch_texture.png"
+fi
 
 log "visualize geometry-aware patch"
 echo "geometry_output_root=$GEOMETRY_OUTPUT_ROOT"
@@ -37,10 +42,14 @@ echo "out_dir=$VIS_OUT_DIR"
 echo "scene_pattern=$VIS_SCENE_PATTERN"
 echo "frames=$VIS_FRAMES"
 echo "contact_sheet_only=$VIS_CONTACT_SHEET_ONLY"
+echo "texture_path=${VIS_TEXTURE_PATH:-$GEOMETRY_OUTPUT_ROOT/geometry_patch/geometry_patch_texture.png}"
 
 visualization_args=()
 if [[ "$VIS_CONTACT_SHEET_ONLY" == "1" ]]; then
   visualization_args+=(--contact_sheet_only)
+fi
+if [[ -n "$VIS_TEXTURE_PATH" ]]; then
+  visualization_args+=(--texture_path "$VIS_TEXTURE_PATH")
 fi
 
 "$VGGT_PY" "$VGGT_ROOT/scripts/visualize_tum10_geometry_patch.py" \

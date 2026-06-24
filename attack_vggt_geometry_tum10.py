@@ -2116,6 +2116,11 @@ def train_geometry_patch(
 
     patch_dir = output_dir / "geometry_patch"
     patch_dir.mkdir(parents=True, exist_ok=True)
+    initial_texture_npz = patch_dir / "initial_texture.npz"
+    np.savez_compressed(initial_texture_npz, texture=texture.detach().float().cpu().numpy())
+    to_pil_image(texture.squeeze(0).detach().float().cpu().clamp(0, 1)).save(
+        patch_dir / "initial_texture.png"
+    )
     history_path = patch_dir / "training_history.jsonl"
     if history_path.exists():
         history_path.unlink()
@@ -2364,6 +2369,7 @@ def train_geometry_patch(
         "intrinsics": intrinsics.astype(float).tolist(),
         "frame_manifest": args.frame_manifest,
         "gt_name": args.gt_name,
+        "initial_texture_path": str(initial_texture_npz),
         "texture_path": str(texture_npz),
     }
     with (patch_dir / "geometry_patch_meta.json").open("w", encoding="utf-8") as f:
