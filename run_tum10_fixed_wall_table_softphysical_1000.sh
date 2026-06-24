@@ -45,11 +45,14 @@ echo "===== fixed wall poster: 1000 updates ====="
 env "${COMMON_ENV[@]}" \
   TUM_GEOM_RUN_NAME="${WALL_RUN_NAME:-tum10_sitting_static_fixed_wall_poster_softphysical_1000}" \
   TUM_GEOM_MODEL="${WALL_MODEL:-vggt_tum10_sitting_static_fixed_wall_poster_softphysical_1000}" \
-  MANUAL_ANCHOR_X="${WALL_ANCHOR_X:-0.50}" \
-  MANUAL_ANCHOR_Y="${WALL_ANCHOR_Y:-0.22}" \
+  MANUAL_ANCHOR_X="${WALL_ANCHOR_X:-0.62}" \
+  MANUAL_ANCHOR_Y="${WALL_ANCHOR_Y:-0.28}" \
   MANUAL_ANCHOR_ROLL_DEGREES="${WALL_ROLL_DEGREES:-0}" \
-  PLANE_WIDTH="${WALL_WIDTH:-0.20}" \
-  PLANE_HEIGHT="${WALL_HEIGHT:-0.28}" \
+  PLANE_WIDTH="${WALL_WIDTH:-0.14}" \
+  PLANE_HEIGHT="${WALL_HEIGHT:-0.20}" \
+  SURFACE_SUPPORT_ABS_TOLERANCE="${WALL_SURFACE_SUPPORT_ABS_TOLERANCE:-0.04}" \
+  SURFACE_SUPPORT_REL_TOLERANCE="${WALL_SURFACE_SUPPORT_REL_TOLERANCE:-0.03}" \
+  SURFACE_MIN_SUPPORT_RATIO="${WALL_SURFACE_MIN_SUPPORT_RATIO:-0.75}" \
   bash "$SCRIPT_DIR/run_geometry_aware_tum10.sh"
 
 echo "===== fixed table sticker: 1000 updates ====="

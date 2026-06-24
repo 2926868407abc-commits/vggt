@@ -56,6 +56,7 @@ run_one() {
   local roll="$7"
   local width="$8"
   local height="$9"
+  shift 9
 
   echo "===== ${label}: ${attack_loss} ====="
   env "${COMMON_ENV[@]}" \
@@ -67,6 +68,7 @@ run_one() {
     MANUAL_ANCHOR_ROLL_DEGREES="$roll" \
     PLANE_WIDTH="$width" \
     PLANE_HEIGHT="$height" \
+    "$@" \
     bash "$SCRIPT_DIR/run_geometry_aware_tum10.sh"
 }
 
@@ -75,22 +77,28 @@ run_one \
   "pose_gt_untargeted" \
   "${WALL_GT_RUN_NAME:-tum10_sitting_static_fixed_wall_pose_gt_untargeted_${UPDATES}}" \
   "${WALL_GT_MODEL:-vggt_tum10_sitting_static_fixed_wall_pose_gt_untargeted_${UPDATES}}" \
-  "${WALL_ANCHOR_X:-0.50}" \
-  "${WALL_ANCHOR_Y:-0.22}" \
+  "${WALL_ANCHOR_X:-0.62}" \
+  "${WALL_ANCHOR_Y:-0.28}" \
   "${WALL_ROLL_DEGREES:-0}" \
-  "${WALL_WIDTH:-0.20}" \
-  "${WALL_HEIGHT:-0.28}"
+  "${WALL_WIDTH:-0.14}" \
+  "${WALL_HEIGHT:-0.20}" \
+  SURFACE_SUPPORT_ABS_TOLERANCE="${WALL_SURFACE_SUPPORT_ABS_TOLERANCE:-0.04}" \
+  SURFACE_SUPPORT_REL_TOLERANCE="${WALL_SURFACE_SUPPORT_REL_TOLERANCE:-0.03}" \
+  SURFACE_MIN_SUPPORT_RATIO="${WALL_SURFACE_MIN_SUPPORT_RATIO:-0.75}"
 
 run_one \
   "fixed wall poster" \
   "pose_reverse_targeted" \
   "${WALL_REVERSE_RUN_NAME:-tum10_sitting_static_fixed_wall_pose_reverse_targeted_${UPDATES}}" \
   "${WALL_REVERSE_MODEL:-vggt_tum10_sitting_static_fixed_wall_pose_reverse_targeted_${UPDATES}}" \
-  "${WALL_ANCHOR_X:-0.50}" \
-  "${WALL_ANCHOR_Y:-0.22}" \
+  "${WALL_ANCHOR_X:-0.62}" \
+  "${WALL_ANCHOR_Y:-0.28}" \
   "${WALL_ROLL_DEGREES:-0}" \
-  "${WALL_WIDTH:-0.20}" \
-  "${WALL_HEIGHT:-0.28}"
+  "${WALL_WIDTH:-0.14}" \
+  "${WALL_HEIGHT:-0.20}" \
+  SURFACE_SUPPORT_ABS_TOLERANCE="${WALL_SURFACE_SUPPORT_ABS_TOLERANCE:-0.04}" \
+  SURFACE_SUPPORT_REL_TOLERANCE="${WALL_SURFACE_SUPPORT_REL_TOLERANCE:-0.03}" \
+  SURFACE_MIN_SUPPORT_RATIO="${WALL_SURFACE_MIN_SUPPORT_RATIO:-0.75}"
 
 run_one \
   "fixed table sticker" \

@@ -84,28 +84,35 @@ run_carrier() {
   local roll="$4"
   local width="$5"
   local height="$6"
+  shift 6
 
   run_one "$carrier" "drift" "pose_drift_targeted" "$anchor_x" "$anchor_y" "$roll" "$width" "$height" \
     POSE_DRIFT_X_M="${POSE_DRIFT_X_M:-0.5}" \
     POSE_DRIFT_Y_M="${POSE_DRIFT_Y_M:-0.0}" \
     POSE_DRIFT_Z_M="${POSE_DRIFT_Z_M:-0.0}" \
-    POSE_DRIFT_YAW_DEGREES="${POSE_DRIFT_YAW_DEGREES:-0.0}"
+    POSE_DRIFT_YAW_DEGREES="${POSE_DRIFT_YAW_DEGREES:-0.0}" \
+    "$@"
 
   run_one "$carrier" "scale" "pose_scale_targeted" "$anchor_x" "$anchor_y" "$roll" "$width" "$height" \
-    POSE_TRANSLATION_SCALE="${POSE_TRANSLATION_SCALE:-2.0}"
+    POSE_TRANSLATION_SCALE="${POSE_TRANSLATION_SCALE:-2.0}" \
+    "$@"
 
   run_one "$carrier" "yaw" "pose_yaw_targeted" "$anchor_x" "$anchor_y" "$roll" "$width" "$height" \
-    POSE_YAW_DEGREES="${POSE_YAW_DEGREES:-30.0}"
+    POSE_YAW_DEGREES="${POSE_YAW_DEGREES:-30.0}" \
+    "$@"
 }
 
 if [[ "$RUN_WALL" == "1" ]]; then
   run_carrier \
     "wall" \
-    "${WALL_ANCHOR_X:-0.50}" \
-    "${WALL_ANCHOR_Y:-0.22}" \
+    "${WALL_ANCHOR_X:-0.62}" \
+    "${WALL_ANCHOR_Y:-0.28}" \
     "${WALL_ROLL_DEGREES:-0}" \
-    "${WALL_WIDTH:-0.20}" \
-    "${WALL_HEIGHT:-0.28}"
+    "${WALL_WIDTH:-0.14}" \
+    "${WALL_HEIGHT:-0.20}" \
+    SURFACE_SUPPORT_ABS_TOLERANCE="${WALL_SURFACE_SUPPORT_ABS_TOLERANCE:-0.04}" \
+    SURFACE_SUPPORT_REL_TOLERANCE="${WALL_SURFACE_SUPPORT_REL_TOLERANCE:-0.03}" \
+    SURFACE_MIN_SUPPORT_RATIO="${WALL_SURFACE_MIN_SUPPORT_RATIO:-0.75}"
 fi
 
 if [[ "$RUN_TABLE" == "1" ]]; then
