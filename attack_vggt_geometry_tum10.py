@@ -1120,6 +1120,17 @@ def choose_depth_manual_anchor_surface_plane(
             f"support={support_ratio:.4f}, required={args.surface_min_support_ratio:.4f}. "
             "Adjust manual_anchor_x/y or reduce plane_width/height."
         )
+    if args.surface_score_mode == "natural" and not np.isfinite(geometry_score(geom_meta, args)):
+        coverage = float(geom_meta.get("mask_coverage_mean", 0.0))
+        raw_coverage = float(geom_meta.get("raw_projected_coverage_mean", 0.0))
+        visibility_ratio = float(geom_meta.get("visibility_ratio_mean", 0.0))
+        raise RuntimeError(
+            "Manual depth anchor patch violates natural sticker constraints: "
+            f"coverage={coverage:.6f}, raw_coverage={raw_coverage:.6f}, "
+            f"visibility={visibility_ratio:.4f}, support={support_ratio:.4f}. "
+            "Adjust manual_anchor_x/y, reduce plane_width/height, or relax "
+            "surface_coverage_min/max and visibility/support thresholds."
+        )
 
     center_first_cam_h = np.linalg.inv(c2w[frame_idx]) @ np.asarray(
         [center_world[0], center_world[1], center_world[2], 1.0], dtype=np.float64
@@ -2271,11 +2282,39 @@ def initialize_texture(
         )
         checker = ((xx // 16 + yy // 16) % 2).float()
         texture = checker[None, None].repeat(1, 3, 1, 1)
+    elif init == "image":
+        if not args.texture_init_image:
+            raise ValueError("--texture_init image requires --texture_init_image")
+        texture = load_texture_image(args.texture_init_image, args.texture_size, device)
     else:
         raise ValueError(f"Unknown texture_init: {init}")
     texture = texture.clamp(args.print_min, args.print_max)
     texture.requires_grad_(requires_grad)
     return texture
+
+
+def load_texture_image(image_path: str | Path, texture_size: int, device: torch.device) -> torch.Tensor:
+    with Image.open(image_path) as image:
+        image = image.convert("RGB").resize((texture_size, texture_size), Image.Resampling.BICUBIC)
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
+    return tensor.clamp(0.0, 1.0)
+
+
+def natural_reference_texture(args: argparse.Namespace, device: torch.device) -> torch.Tensor | None:
+    path = args.natural_reference_image or (
+        args.texture_init_image if args.texture_init == "image" else None
+    )
+    if not path or args.natural_reference_weight <= 0:
+        return None
+    cached = getattr(args, "_natural_reference_texture", None)
+    cached_path = getattr(args, "_natural_reference_texture_path", None)
+    if cached is not None and cached_path == str(path):
+        return cached
+    reference = load_texture_image(path, args.texture_size, device).detach()
+    args._natural_reference_texture = reference
+    args._natural_reference_texture_path = str(path)
+    return reference
 
 
 def total_variation_loss(texture: torch.Tensor) -> torch.Tensor:
@@ -2311,16 +2350,22 @@ def patch_regularization_terms(texture: torch.Tensor, args: argparse.Namespace) 
     tv = total_variation_loss(texture)
     low_freq = low_frequency_loss(texture, args.low_frequency_kernel)
     printable = printable_color_loss(texture, args)
+    reference = natural_reference_texture(args, texture.device)
+    natural_reference = (
+        F.mse_loss(texture, reference) if reference is not None else texture.new_zeros(())
+    )
     total = (
         args.tv_weight * tv
         + args.low_frequency_weight * low_freq
         + args.printability_weight * printable
+        + args.natural_reference_weight * natural_reference
     )
     return {
         "regularization_total": total,
         "tv": tv,
         "low_frequency": low_freq,
         "printability": printable,
+        "natural_reference": natural_reference,
     }
 
 
@@ -2418,6 +2463,7 @@ def train_geometry_patch(
                 tv_terms = []
                 low_freq_terms = []
                 printable_terms = []
+                natural_reference_terms = []
                 coverages = []
                 attack_term_values: dict[str, list[float]] = {}
                 for item in batch:
@@ -2452,6 +2498,7 @@ def train_geometry_patch(
                     tv_terms.append(float(reg_terms["tv"].detach().cpu()))
                     low_freq_terms.append(float(reg_terms["low_frequency"].detach().cpu()))
                     printable_terms.append(float(reg_terms["printability"].detach().cpu()))
+                    natural_reference_terms.append(float(reg_terms["natural_reference"].detach().cpu()))
                     coverages.append(item["geometry"]["mask_coverage_mean"])
 
                 if texture.grad is None:
@@ -2473,6 +2520,7 @@ def train_geometry_patch(
                     "tv": float(np.mean(tv_terms)) if tv_terms else 0.0,
                     "low_frequency": float(np.mean(low_freq_terms)) if low_freq_terms else 0.0,
                     "printability": float(np.mean(printable_terms)) if printable_terms else 0.0,
+                    "natural_reference": float(np.mean(natural_reference_terms)) if natural_reference_terms else 0.0,
                     "mask_coverage_mean": float(np.mean(coverages)),
                     "scenes": [item["seq"] for item in batch],
                 }
@@ -2512,6 +2560,7 @@ def train_geometry_patch(
         "feature_layer": args.feature_layer,
         "texture_shape": list(texture.shape),
         "texture_init": args.texture_init,
+        "texture_init_image": args.texture_init_image,
         "freeze_texture": bool(args.freeze_texture),
         "patch_lr": args.patch_lr,
         "scheduler": args.scheduler,
@@ -2543,6 +2592,8 @@ def train_geometry_patch(
             "printable_color_levels": args.printable_color_levels,
             "low_frequency_weight": args.low_frequency_weight,
             "low_frequency_kernel": args.low_frequency_kernel,
+            "natural_reference_image": args.natural_reference_image,
+            "natural_reference_weight": args.natural_reference_weight,
         },
         "plane": {
             "mode": args.plane_mode,
@@ -2700,7 +2751,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gt_name", default="groundtruth_90.txt")
     parser.add_argument("--texture_path", default=None, help="Reuse an existing geometry_patch_texture.npz")
     parser.add_argument("--texture_size", type=int, default=128)
-    parser.add_argument("--texture_init", choices=("random", "gray", "white", "black", "checker"), default="random")
+    parser.add_argument(
+        "--texture_init",
+        choices=("random", "gray", "white", "black", "checker", "image"),
+        default="random",
+    )
+    parser.add_argument(
+        "--texture_init_image",
+        default=None,
+        help="RGB image used when --texture_init=image, e.g. a natural/style-transferred sticker texture.",
+    )
     parser.add_argument("--freeze_texture", action="store_true")
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--inner_loop", type=int, default=10)
@@ -2835,6 +2895,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--printable_color_levels", type=int, default=8)
     parser.add_argument("--low_frequency_weight", type=float, default=0.0)
     parser.add_argument("--low_frequency_kernel", type=int, default=9)
+    parser.add_argument(
+        "--natural_reference_image",
+        default=None,
+        help="Optional natural/style-transferred texture reference preserved by an MSE regularizer.",
+    )
+    parser.add_argument("--natural_reference_weight", type=float, default=0.0)
     parser.add_argument("--physical_eot", action="store_true")
     parser.add_argument("--print_min", type=float, default=0.0)
     parser.add_argument("--print_max", type=float, default=1.0)

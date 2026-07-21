@@ -27,6 +27,7 @@ SCENES_PER_ITERATION="${SCENES_PER_ITERATION:-1}"
 PATCH_LR="${PATCH_LR:-0.001}"
 TEXTURE_SIZE="${TEXTURE_SIZE:-128}"
 TEXTURE_INIT="${TEXTURE_INIT:-random}"
+TEXTURE_INIT_IMAGE="${TEXTURE_INIT_IMAGE:-}"
 FREEZE_TEXTURE="${FREEZE_TEXTURE:-0}"
 FEATURE_LAYER="${FEATURE_LAYER:-aggregator_final}"
 ATTACK_LOSS="${ATTACK_LOSS:-feature_l1}"
@@ -109,6 +110,8 @@ PRINTABILITY_WEIGHT="${PRINTABILITY_WEIGHT:-0.0}"
 PRINTABLE_COLOR_LEVELS="${PRINTABLE_COLOR_LEVELS:-8}"
 LOW_FREQUENCY_WEIGHT="${LOW_FREQUENCY_WEIGHT:-0.0}"
 LOW_FREQUENCY_KERNEL="${LOW_FREQUENCY_KERNEL:-9}"
+NATURAL_REFERENCE_IMAGE="${NATURAL_REFERENCE_IMAGE:-}"
+NATURAL_REFERENCE_WEIGHT="${NATURAL_REFERENCE_WEIGHT:-0.0}"
 
 FORCE_PREPARE_TUM10="${FORCE_PREPARE_TUM10:-0}"
 FORCE_CLEAN="${FORCE_CLEAN:-0}"
@@ -141,6 +144,7 @@ require_dir "$TUM_ROOT"
 log "settings"
 echo "iterations=$ITERATIONS inner_loop=$INNER_LOOP scenes_per_iteration=$SCENES_PER_ITERATION"
 echo "texture_size=$TEXTURE_SIZE texture_init=$TEXTURE_INIT freeze_texture=$FREEZE_TEXTURE patch_lr=$PATCH_LR feature_layer=$FEATURE_LAYER"
+echo "texture_init_image=$TEXTURE_INIT_IMAGE"
 echo "attack_loss=$ATTACK_LOSS pose_reverse_reference=$POSE_REVERSE_REFERENCE pose_weights=(rot:$POSE_ROTATION_WEIGHT,trans:$POSE_TRANSLATION_WEIGHT)"
 echo "pose_bad_reference=$POSE_BAD_REFERENCE drift=($POSE_DRIFT_X_M,$POSE_DRIFT_Y_M,$POSE_DRIFT_Z_M)m drift_yaw=$POSE_DRIFT_YAW_DEGREES scale=$POSE_TRANSLATION_SCALE yaw=$POSE_YAW_DEGREES"
 echo "plane_width=$PLANE_WIDTH plane_height=$PLANE_HEIGHT plane_distance=$PLANE_DISTANCE"
@@ -156,6 +160,7 @@ echo "surface_strength_search=$SURFACE_STRENGTH_SEARCH candidates=$SURFACE_STREN
 echo "natural_auto_relax=$NATURAL_AUTO_RELAX max_coverage=$NATURAL_RELAX_MAX_COVERAGE min_visible_frames=$NATURAL_RELAX_MIN_VISIBLE_FRAMES min_visibility=$NATURAL_RELAX_MIN_VISIBILITY_RATIO orientation=$NATURAL_RELAX_ORIENTATION_FILTER"
 echo "physical_eot=$PHYSICAL_EOT print=[$PRINT_MIN,$PRINT_MAX] brightness=$EOT_BRIGHTNESS contrast=$EOT_CONTRAST gamma=$EOT_GAMMA noise_std=$EOT_NOISE_STD"
 echo "regularization tv=$TV_WEIGHT printability=$PRINTABILITY_WEIGHT levels=$PRINTABLE_COLOR_LEVELS low_frequency=$LOW_FREQUENCY_WEIGHT kernel=$LOW_FREQUENCY_KERNEL"
+echo "natural_reference image=$NATURAL_REFERENCE_IMAGE weight=$NATURAL_REFERENCE_WEIGHT"
 
 log "prepare TUM images links"
 for seq_dir in "$TUM_ROOT"/rgbd_dataset_freiburg3_*; do
@@ -219,6 +224,13 @@ if [[ "$SURFACE_SUPPORT_CHECK" == "1" ]]; then
 fi
 if [[ "$FREEZE_TEXTURE" == "1" ]]; then
   geometry_args+=(--freeze_texture)
+fi
+texture_args=()
+if [[ -n "$TEXTURE_INIT_IMAGE" ]]; then
+  texture_args+=(--texture_init_image "$TEXTURE_INIT_IMAGE")
+fi
+if [[ -n "$NATURAL_REFERENCE_IMAGE" ]]; then
+  texture_args+=(--natural_reference_image "$NATURAL_REFERENCE_IMAGE")
 fi
 "$VGGT_PY" "$VGGT_ROOT/attack_vggt_geometry_tum10.py" \
   --tum_root "$TUM_ROOT" \
@@ -304,7 +316,9 @@ fi
   --printable_color_levels "$PRINTABLE_COLOR_LEVELS" \
   --low_frequency_weight "$LOW_FREQUENCY_WEIGHT" \
   --low_frequency_kernel "$LOW_FREQUENCY_KERNEL" \
+  --natural_reference_weight "$NATURAL_REFERENCE_WEIGHT" \
   --seed "$SEED" \
+  "${texture_args[@]}" \
   "${geometry_args[@]}" \
   "${patch_args[@]}" \
   "${apply_args[@]}"
