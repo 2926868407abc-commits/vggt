@@ -1987,6 +1987,30 @@ def pose_predictions_to_relative_c2w(
     return normalize_c2w_to_first(w2c_3x4_to_c2w(extrinsic))
 
 
+def forward_camera_pose_only(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    dtype: torch.dtype,
+    activation_checkpoint: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Run only VGGT's aggregator and camera head for pose-loss attacks."""
+    if model.camera_head is None:
+        raise RuntimeError("VGGT model has no camera_head.")
+    images_b = images.unsqueeze(0) if images.ndim == 4 else images
+    with torch.cuda.amp.autocast(dtype=dtype):
+        old_checkpoint = getattr(model.aggregator, "gradient_checkpointing", False)
+        if hasattr(model.aggregator, "gradient_checkpointing"):
+            model.aggregator.gradient_checkpointing = activation_checkpoint
+        try:
+            aggregated_tokens_list, _ = model.aggregator(images_b)
+        finally:
+            if hasattr(model.aggregator, "gradient_checkpointing"):
+                model.aggregator.gradient_checkpointing = old_checkpoint
+    with torch.cuda.amp.autocast(enabled=False):
+        pose_enc_list = model.camera_head(aggregated_tokens_list)
+    return {"pose_enc": pose_enc_list[-1], "pose_enc_list": pose_enc_list}
+
+
 def normalize_c2w_to_first(c2w: torch.Tensor) -> torch.Tensor:
     first_inv = torch.linalg.inv(c2w[:, :1])
     return torch.matmul(first_inv, c2w)
@@ -2120,7 +2144,12 @@ def attack_objective_loss(
         loss, terms = feature_l1_loss(adv_features, item["clean_features"])
         return loss, terms, True
 
-    preds = forward_vggt(model, adv_images, dtype)
+    preds = forward_camera_pose_only(
+        model,
+        adv_images,
+        dtype,
+        args.activation_checkpoint,
+    )
     pred_rel = pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
 
     if args.attack_loss == "pose_gt_untargeted":

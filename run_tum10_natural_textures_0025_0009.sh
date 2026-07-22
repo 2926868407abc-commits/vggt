@@ -33,6 +33,7 @@ run_one() {
   TUM_GEOM_MODEL="vggt_tum10_sitting_static_wall_pose_gt_${name}_natural_lr002_ref005" \
   TUM_CLEAN_MODEL=vggt_tum10_sitting_static_clean_uniform_l3 \
   ATTACK_LOSS=pose_gt_untargeted \
+  ACTIVATION_CHECKPOINT="${ACTIVATION_CHECKPOINT:-0}" \
   PLANE_MODE=depth_manual_anchor_surface \
   SURFACE_SCORE_MODE=natural \
   SURFACE_COVERAGE_MIN="${SURFACE_COVERAGE_MIN:-0.003}" \

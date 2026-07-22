@@ -31,6 +31,7 @@ TEXTURE_INIT_IMAGE="${TEXTURE_INIT_IMAGE:-}"
 FREEZE_TEXTURE="${FREEZE_TEXTURE:-0}"
 FEATURE_LAYER="${FEATURE_LAYER:-aggregator_final}"
 ATTACK_LOSS="${ATTACK_LOSS:-feature_l1}"
+ACTIVATION_CHECKPOINT="${ACTIVATION_CHECKPOINT:-0}"
 POSE_REVERSE_REFERENCE="${POSE_REVERSE_REFERENCE:-gt}"
 POSE_BAD_REFERENCE="${POSE_BAD_REFERENCE:-gt}"
 POSE_DRIFT_X_M="${POSE_DRIFT_X_M:-0.5}"
@@ -145,6 +146,7 @@ log "settings"
 echo "iterations=$ITERATIONS inner_loop=$INNER_LOOP scenes_per_iteration=$SCENES_PER_ITERATION"
 echo "texture_size=$TEXTURE_SIZE texture_init=$TEXTURE_INIT freeze_texture=$FREEZE_TEXTURE patch_lr=$PATCH_LR feature_layer=$FEATURE_LAYER"
 echo "texture_init_image=$TEXTURE_INIT_IMAGE"
+echo "activation_checkpoint=$ACTIVATION_CHECKPOINT"
 echo "attack_loss=$ATTACK_LOSS pose_reverse_reference=$POSE_REVERSE_REFERENCE pose_weights=(rot:$POSE_ROTATION_WEIGHT,trans:$POSE_TRANSLATION_WEIGHT)"
 echo "pose_bad_reference=$POSE_BAD_REFERENCE drift=($POSE_DRIFT_X_M,$POSE_DRIFT_Y_M,$POSE_DRIFT_Z_M)m drift_yaw=$POSE_DRIFT_YAW_DEGREES scale=$POSE_TRANSLATION_SCALE yaw=$POSE_YAW_DEGREES"
 echo "plane_width=$PLANE_WIDTH plane_height=$PLANE_HEIGHT plane_distance=$PLANE_DISTANCE"
@@ -224,6 +226,9 @@ if [[ "$SURFACE_SUPPORT_CHECK" == "1" ]]; then
 fi
 if [[ "$FREEZE_TEXTURE" == "1" ]]; then
   geometry_args+=(--freeze_texture)
+fi
+if [[ "$ACTIVATION_CHECKPOINT" == "1" ]]; then
+  geometry_args+=(--activation_checkpoint)
 fi
 texture_args=()
 if [[ -n "$TEXTURE_INIT_IMAGE" ]]; then
