@@ -34,7 +34,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 from torchvision.transforms.functional import to_pil_image
 
 from attack_vggt_new1 import (
@@ -157,6 +157,52 @@ def unproject_tensor_xy(xy: np.ndarray, depth_m: np.ndarray, intrinsics: np.ndar
     return points
 
 
+def parse_manual_quad_xy(value: str, tensor_hw: tuple[int, int], coordinates: str) -> np.ndarray:
+    parts = [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
+    if len(parts) != 8:
+        raise ValueError(
+            "--manual_quad_xy expects 8 numbers: x0,y0,x1,y1,x2,y2,x3,y3 "
+            "ordered top-left, top-right, bottom-right, bottom-left."
+        )
+    quad = np.asarray([float(item) for item in parts], dtype=np.float64).reshape(4, 2)
+    tensor_h, tensor_w = tensor_hw
+    if coordinates == "normalized":
+        quad[:, 0] *= tensor_w - 1
+        quad[:, 1] *= tensor_h - 1
+    elif coordinates != "pixel":
+        raise ValueError(f"Unsupported manual_quad_coordinates={coordinates!r}")
+    quad[:, 0] = np.clip(quad[:, 0], 0.0, tensor_w - 1.0)
+    quad[:, 1] = np.clip(quad[:, 1], 0.0, tensor_h - 1.0)
+    return quad
+
+
+def manual_quad_mask(quad_xy: np.ndarray, tensor_hw: tuple[int, int]) -> np.ndarray:
+    tensor_h, tensor_w = tensor_hw
+    mask_img = Image.new("L", (tensor_w, tensor_h), 0)
+    polygon = [(float(x), float(y)) for x, y in quad_xy]
+    ImageDraw.Draw(mask_img).polygon(polygon, fill=1)
+    return np.asarray(mask_img, dtype=bool)
+
+
+def shrink_quad_xy(quad_xy: np.ndarray, ratio: float) -> np.ndarray:
+    ratio = float(np.clip(ratio, 0.05, 1.0))
+    center = quad_xy.mean(axis=0, keepdims=True)
+    return center + (quad_xy - center) * ratio
+
+
+def fit_camera_plane_pca(points_cam: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    center_cam = points_cam.mean(axis=0)
+    centered = points_cam - center_cam[None, :]
+    cov = centered.T @ centered / max(1, points_cam.shape[0] - 1)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)
+    normal_cam = eigvecs[:, order[0]]
+    if np.dot(normal_cam, -center_cam) < 0:
+        normal_cam = -normal_cam
+    residual = float(eigvals[order[0]] / max(float(eigvals.sum()), 1e-12))
+    return center_cam, normal_cam, eigvals[order], residual
+
+
 def read_depth_rows(path: Path) -> list[tuple[float, Path]]:
     rows: list[tuple[float, Path]] = []
     if not path.exists():
@@ -250,6 +296,7 @@ def load_depth_maps(
         "auto_depth_surface",
         "fused_depth_surface",
         "depth_manual_anchor_surface",
+        "depth_manual_quad_surface",
     ):
         return [None for _ in image_paths]
     depth_paths = match_depth_paths(seq_dir, image_paths, frame_indices, args)
@@ -1157,6 +1204,190 @@ def choose_depth_manual_anchor_surface_plane(
     return patch_world, geom_meta
 
 
+def choose_depth_manual_quad_surface_plane(
+    c2w: np.ndarray,
+    image_paths: list[str],
+    tensor_hw: tuple[int, int],
+    texture_size: int,
+    intrinsics: np.ndarray,
+    args: argparse.Namespace,
+    depth_maps: list[np.ndarray | None],
+) -> tuple[np.ndarray, dict]:
+    n_frames = len(image_paths)
+    frame_idx = min(max(int(args.manual_anchor_frame), 0), n_frames - 1)
+    depth = depth_maps[frame_idx] if depth_maps else None
+    if depth is None:
+        raise RuntimeError("Manual quad surface requires a matched TUM depth map.")
+    if not str(args.manual_quad_xy).strip():
+        raise RuntimeError(
+            "--manual_quad_xy is required for depth_manual_quad_surface. "
+            "Use x0,y0,x1,y1,x2,y2,x3,y3 in TL,TR,BR,BL order."
+        )
+
+    tensor_h, tensor_w = tensor_hw
+    quad_xy = parse_manual_quad_xy(args.manual_quad_xy, tensor_hw, args.manual_quad_coordinates)
+    fit_quad_xy = shrink_quad_xy(quad_xy, args.manual_quad_fit_shrink)
+    fit_mask = manual_quad_mask(fit_quad_xy, tensor_hw)
+    full_mask = manual_quad_mask(quad_xy, tensor_hw)
+    valid = (
+        fit_mask
+        & np.isfinite(depth)
+        & (depth >= float(args.depth_min_m))
+        & (depth <= float(args.depth_max_m))
+    )
+    ys, xs = np.nonzero(valid)
+    stride = max(1, int(args.manual_quad_depth_sample_stride))
+    if stride > 1 and xs.size > 0:
+        keep = ((xs + ys) % stride) == 0
+        xs = xs[keep]
+        ys = ys[keep]
+    min_depth_samples = max(6, int(args.fused_min_neighbors))
+    if xs.size < min_depth_samples and args.manual_quad_fit_shrink < 1.0:
+        valid = (
+            full_mask
+            & np.isfinite(depth)
+            & (depth >= float(args.depth_min_m))
+            & (depth <= float(args.depth_max_m))
+        )
+        ys, xs = np.nonzero(valid)
+        if stride > 1 and xs.size > 0:
+            keep = ((xs + ys) % stride) == 0
+            xs = xs[keep]
+            ys = ys[keep]
+        fit_quad_xy = quad_xy
+    if xs.size < min_depth_samples:
+        raise RuntimeError(
+            f"Manual quad has too few valid depth samples: {xs.size}. "
+            "Move the quad inside a depth-valid surface or reduce --manual_quad_depth_sample_stride."
+        )
+
+    proj = projection_params_for_frame(args, image_paths[frame_idx], tensor_hw)
+    frame_intrinsics = intrinsics[frame_idx] if np.asarray(intrinsics).ndim == 3 else intrinsics
+    sample_xy = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=-1)
+    sample_z = depth[ys, xs].astype(np.float64)
+    sample_cam = unproject_tensor_xy(sample_xy, sample_z, frame_intrinsics, proj)
+
+    center_cam, normal_cam, eigvals_ordered, initial_residual = fit_camera_plane_pca(sample_cam)
+    initial_distances = np.abs((sample_cam - center_cam[None, :]) @ normal_cam)
+    tolerance = max(
+        float(args.manual_quad_plane_inlier_tolerance),
+        float(np.median(sample_z)) * float(args.surface_support_rel_tolerance),
+    )
+    inlier_mask = initial_distances <= tolerance
+    min_inliers = max(
+        min_depth_samples,
+        int(math.ceil(float(args.manual_quad_min_inlier_ratio) * sample_cam.shape[0])),
+    )
+    if int(inlier_mask.sum()) < min_inliers:
+        keep_count = min(sample_cam.shape[0], min_inliers)
+        keep_idx = np.argsort(initial_distances)[:keep_count]
+        inlier_mask = np.zeros(sample_cam.shape[0], dtype=bool)
+        inlier_mask[keep_idx] = True
+    inlier_cam = sample_cam[inlier_mask]
+    center_cam, normal_cam, eigvals_ordered, residual = fit_camera_plane_pca(inlier_cam)
+    final_distances = np.abs((sample_cam - center_cam[None, :]) @ normal_cam)
+    inlier_distances = final_distances[inlier_mask]
+    inlier_ratio = float(inlier_cam.shape[0] / max(1, sample_cam.shape[0]))
+    inlier_p95 = float(np.percentile(inlier_distances, 95)) if inlier_distances.size else float("inf")
+    if residual > args.fused_max_plane_residual and inlier_p95 > tolerance:
+        raise RuntimeError(
+            f"Manual quad is not planar enough after robust fitting: "
+            f"initial_residual={initial_residual:.6f}, residual={residual:.6f}, "
+            f"inlier_ratio={inlier_ratio:.4f}, p95_dist={inlier_p95:.4f}m, "
+            f"tolerance={tolerance:.4f}m, limit={args.fused_max_plane_residual:.6f}."
+        )
+
+    quad_uv = tensor_xy_to_original_uv(quad_xy, proj)
+    rays = np.empty((4, 3), dtype=np.float64)
+    rays[:, 0] = (quad_uv[:, 0] - frame_intrinsics[0, 2]) / frame_intrinsics[0, 0]
+    rays[:, 1] = (quad_uv[:, 1] - frame_intrinsics[1, 2]) / frame_intrinsics[1, 1]
+    rays[:, 2] = 1.0
+    denom = rays @ normal_cam
+    if np.any(np.abs(denom) < 1e-8):
+        raise RuntimeError("Manual quad corners are nearly parallel to the fitted depth plane.")
+    scale = float(np.dot(normal_cam, center_cam)) / denom
+    if np.any(~np.isfinite(scale)) or np.any(scale <= 1e-6):
+        raise RuntimeError("Manual quad corners do not intersect the fitted depth plane in front of the camera.")
+    corners_cam = rays * scale[:, None]
+    corners_h = np.concatenate([corners_cam, np.ones((4, 1), dtype=np.float64)], axis=1)
+    patch_world = (c2w[frame_idx] @ corners_h.T).T[:, :3]
+
+    old_depth_maps = getattr(args, "_active_depth_maps", None)
+    args._active_depth_maps = depth_maps
+    try:
+        _, _, geom_meta = build_geometry_arrays_for_plane(
+            patch_world,
+            c2w,
+            image_paths,
+            tensor_hw,
+            texture_size,
+            intrinsics,
+            args,
+        )
+    finally:
+        args._active_depth_maps = old_depth_maps
+
+    support_ratio = float(geom_meta.get("surface_support_ratio_mean", 0.0))
+    if args.surface_support_check and support_ratio < args.surface_min_support_ratio:
+        raise RuntimeError(
+            f"Manual quad patch is not sufficiently supported by the carrier surface: "
+            f"support={support_ratio:.4f}, required={args.surface_min_support_ratio:.4f}. "
+            "Move the quad corners inside the carrier surface or relax support thresholds."
+        )
+    if args.surface_score_mode == "natural" and not np.isfinite(geometry_score(geom_meta, args)):
+        coverage = float(geom_meta.get("mask_coverage_mean", 0.0))
+        raw_coverage = float(geom_meta.get("raw_projected_coverage_mean", 0.0))
+        visibility_ratio = float(geom_meta.get("visibility_ratio_mean", 0.0))
+        raise RuntimeError(
+            "Manual quad patch violates natural sticker constraints: "
+            f"coverage={coverage:.6f}, raw_coverage={raw_coverage:.6f}, "
+            f"visibility={visibility_ratio:.4f}, support={support_ratio:.4f}. "
+            "Adjust manual_quad_xy or relax surface_coverage_min/max and visibility/support thresholds."
+        )
+
+    center_world = patch_world.mean(axis=0)
+    center_first_cam_h = np.linalg.inv(c2w[frame_idx]) @ np.asarray(
+        [center_world[0], center_world[1], center_world[2], 1.0], dtype=np.float64
+    )
+    width_top = float(np.linalg.norm(patch_world[1] - patch_world[0]))
+    width_bottom = float(np.linalg.norm(patch_world[2] - patch_world[3]))
+    height_left = float(np.linalg.norm(patch_world[3] - patch_world[0]))
+    height_right = float(np.linalg.norm(patch_world[2] - patch_world[1]))
+    normal_world = c2w[frame_idx][:3, :3] @ normal_cam
+    placement = {
+        "placement_mode": "depth_manual_quad_surface",
+        "geometry_source": "tum_depth_manual_quad",
+        "manual_quad_coordinates": args.manual_quad_coordinates,
+        "manual_quad_requested": [float(v) for v in parse_float_list(args.manual_quad_xy.replace(";", ","))],
+        "manual_quad_tensor_xy": quad_xy.astype(float).tolist(),
+        "manual_quad_fit_tensor_xy": fit_quad_xy.astype(float).tolist(),
+        "manual_quad_frame": frame_idx,
+        "manual_quad_fit_shrink": float(args.manual_quad_fit_shrink),
+        "manual_quad_depth_sample_stride": stride,
+        "manual_quad_depth_sample_count": int(sample_cam.shape[0]),
+        "manual_quad_inlier_count": int(inlier_cam.shape[0]),
+        "manual_quad_inlier_ratio": inlier_ratio,
+        "manual_quad_plane_inlier_tolerance_m": tolerance,
+        "manual_quad_initial_plane_residual_ratio": initial_residual,
+        "manual_quad_inlier_distance_p95_m": inlier_p95,
+        "center_world": center_world.astype(float).tolist(),
+        "center_anchor_camera": center_first_cam_h[:3].astype(float).tolist(),
+        "surface_normal_camera": normal_cam.astype(float).tolist(),
+        "surface_normal_world": normal_world.astype(float).tolist(),
+        "width_m": float((width_top + width_bottom) / 2.0),
+        "height_m": float((height_left + height_right) / 2.0),
+        "width_top_m": width_top,
+        "width_bottom_m": width_bottom,
+        "height_left_m": height_left,
+        "height_right_m": height_right,
+        "pca_eigenvalues": eigvals_ordered.astype(float).tolist(),
+        "plane_residual_ratio": residual,
+    }
+    geom_meta.update(placement)
+    args._last_patch_plane_candidates = [(0.0, patch_world.copy(), copy.deepcopy(geom_meta))]
+    return patch_world, geom_meta
+
+
 def plane_depth_map(
     corners_cam: np.ndarray,
     intrinsics: np.ndarray,
@@ -1479,6 +1710,10 @@ def run_patch_plane_selector(
         return choose_depth_manual_anchor_surface_plane(
             c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps
         )
+    if args.plane_mode == "depth_manual_quad_surface":
+        return choose_depth_manual_quad_surface_plane(
+            c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps
+        )
     if args.plane_mode == "fused_depth_surface":
         return choose_fused_depth_surface_plane(
             c2w, image_paths, tensor_hw, texture_size, intrinsics, args, depth_maps
@@ -1695,6 +1930,12 @@ def choose_patch_plane_world(
         args.manual_anchor_frame,
         args.manual_anchor_search_radius,
         args.manual_anchor_roll_degrees,
+        args.manual_quad_coordinates,
+        args.manual_quad_xy,
+        args.manual_quad_depth_sample_stride,
+        args.manual_quad_fit_shrink,
+        args.manual_quad_plane_inlier_tolerance,
+        args.manual_quad_min_inlier_ratio,
     )
     if cache_key in cache:
         cached = cache[cache_key]
@@ -2117,6 +2358,57 @@ def pose_relative_mse(
     }
 
 
+def pose_scale_invariant_mse(
+    pred_rel: torch.Tensor,
+    target_rel: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Scale-invariant variant of pose_relative_mse.
+
+    pose_relative_mse divides both trajectories by one constant taken from the
+    *target* (mean GT relative-translation norm). That fixes the unit but leaves
+    the global pred/GT scale difference inside the loss. VGGT's reconstruction
+    scale is arbitrary per sequence (measured 2.07..4.15 across TUM-10 by
+    scripts/diag_gauge_invariance.py), and the evaluator aligns with Sim(3)
+    before measuring, so that residual scale term is gradient the metric throws
+    away.
+
+    Here each trajectory is normalized by its *own* relative-translation RMS
+    before the comparison, which removes the scale gauge from the loss. The
+    rotation term is deliberately untouched: normalize_c2w_to_first already
+    makes the relative rotations invariant to a global rotation and translation.
+
+    Side effect worth knowing: after normalization both translation fields have
+    unit RMS, so the translation term is bounded by 4/3 instead of growing
+    without limit.
+    """
+    target_rel = target_rel.detach().to(device=pred_rel.device, dtype=pred_rel.dtype)
+    if pred_rel.shape != target_rel.shape:
+        raise RuntimeError(f"Pose target shape mismatch: pred={tuple(pred_rel.shape)} target={tuple(target_rel.shape)}")
+    eps = float(getattr(args, "pose_scale_invariant_eps", 1e-6))
+
+    rot_diff = pred_rel[..., :3, :3] - target_rel[..., :3, :3]
+    rot_mse = rot_diff.pow(2).mean()
+
+    pred_trans = pred_rel[..., :3, 3]
+    target_trans = target_rel[..., :3, 3]
+    # RMS over the frame axis, keeping every leading (batch) axis independent so
+    # that a batch of sequences with different scales is still handled per-sequence.
+    pred_rms = pred_trans.pow(2).sum(dim=-1).mean(dim=-1, keepdim=True).clamp_min(eps * eps).sqrt()
+    target_rms = target_trans.pow(2).sum(dim=-1).mean(dim=-1, keepdim=True).clamp_min(eps * eps).sqrt()
+    trans_diff = pred_trans / pred_rms.unsqueeze(-1) - target_trans / target_rms.unsqueeze(-1)
+    trans_mse = trans_diff.pow(2).mean()
+
+    total = args.pose_rotation_weight * rot_mse + args.pose_translation_weight * trans_mse
+    return total, {
+        "pose_loss": float(total.detach().cpu()),
+        "pose_rot_mse": float(rot_mse.detach().cpu()),
+        "pose_trans_mse": float(trans_mse.detach().cpu()),
+        "pose_pred_trans_rms": float(pred_rms.detach().mean().cpu()),
+        "pose_target_trans_rms": float(target_rms.detach().mean().cpu()),
+    }
+
+
 def should_cache_clean_pose(args: argparse.Namespace) -> bool:
     return args.attack_loss == "pose_clean_untargeted" or (
         args.attack_loss == "pose_reverse_targeted" and args.pose_reverse_reference == "clean"
@@ -2155,6 +2447,12 @@ def attack_objective_loss(
     if args.attack_loss == "pose_gt_untargeted":
         target_rel = item["pose_gt_rel"]
         loss, terms = pose_relative_mse(pred_rel, target_rel, args)
+        terms["pose_reference"] = "gt"
+        return loss, terms, True
+
+    if args.attack_loss == "pose_scale_invariant_mse":
+        target_rel = item["pose_gt_rel"]
+        loss, terms = pose_scale_invariant_mse(pred_rel, target_rel, args)
         terms["pose_reference"] = "gt"
         return loss, terms, True
 
@@ -2586,6 +2884,7 @@ def train_geometry_patch(
         },
         "pose_rotation_weight": args.pose_rotation_weight,
         "pose_translation_weight": args.pose_translation_weight,
+        "pose_scale_invariant_eps": args.pose_scale_invariant_eps,
         "feature_layer": args.feature_layer,
         "texture_shape": list(texture.shape),
         "texture_init": args.texture_init,
@@ -2663,6 +2962,15 @@ def train_geometry_patch(
                 "frame": args.manual_anchor_frame,
                 "search_radius": args.manual_anchor_search_radius,
                 "roll_degrees": args.manual_anchor_roll_degrees,
+            },
+            "manual_quad": {
+                "coordinates": args.manual_quad_coordinates,
+                "xy": args.manual_quad_xy,
+                "frame": args.manual_anchor_frame,
+                "depth_sample_stride": args.manual_quad_depth_sample_stride,
+                "fit_shrink": args.manual_quad_fit_shrink,
+                "plane_inlier_tolerance": args.manual_quad_plane_inlier_tolerance,
+                "min_inlier_ratio": args.manual_quad_min_inlier_ratio,
             },
             "surface_strength_search": bool(args.surface_strength_search),
             "surface_strength_candidates": args.surface_strength_candidates,
@@ -2803,6 +3111,7 @@ def parse_args() -> argparse.Namespace:
         choices=(
             "feature_l1",
             "pose_gt_untargeted",
+            "pose_scale_invariant_mse",
             "pose_clean_untargeted",
             "pose_reverse_targeted",
             "pose_drift_targeted",
@@ -2812,7 +3121,10 @@ def parse_args() -> argparse.Namespace:
         default="feature_l1",
         help=(
             "feature_l1 maximizes aggregator feature distance; pose_* losses operate on VGGT pose output. "
-            "pose_reverse/drift/scale/yaw targeted losses minimize distance to a constructed bad trajectory."
+            "pose_reverse/drift/scale/yaw targeted losses minimize distance to a constructed bad trajectory. "
+            "pose_scale_invariant_mse is pose_gt_untargeted with each trajectory normalized by its own "
+            "translation RMS, so the loss no longer rewards the global scale gauge that the Sim(3)-aligned "
+            "ATE discards (note: this is scale-INVARIANT, unrelated to the scale-TARGETED pose_scale_targeted)."
         ),
     )
     parser.add_argument("--pose_reverse_reference", choices=("gt", "clean"), default="gt")
@@ -2825,6 +3137,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose_yaw_degrees", type=float, default=30.0)
     parser.add_argument("--pose_rotation_weight", type=float, default=1.0)
     parser.add_argument("--pose_translation_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--pose_scale_invariant_eps",
+        type=float,
+        default=1e-6,
+        help="floor on the per-trajectory translation RMS used by pose_scale_invariant_mse, "
+        "so a degenerate (near-static) sequence cannot blow the normalization up",
+    )
     parser.add_argument("--activation_checkpoint", action="store_true")
     parser.add_argument("--skip_existing_outputs", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -2843,6 +3162,7 @@ def parse_args() -> argparse.Namespace:
             "vggt_pointmap_surface",
             "vggt_manual_anchor_surface",
             "depth_manual_anchor_surface",
+            "depth_manual_quad_surface",
         ),
         default="fixed",
     )
@@ -2859,6 +3179,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manual_anchor_frame", type=int, default=0)
     parser.add_argument("--manual_anchor_search_radius", type=int, default=12)
     parser.add_argument("--manual_anchor_roll_degrees", type=float, default=0.0)
+    parser.add_argument("--manual_quad_coordinates", choices=("normalized", "pixel"), default="normalized")
+    parser.add_argument(
+        "--manual_quad_xy",
+        default="",
+        help=(
+            "Quad for depth_manual_quad_surface, ordered TL,TR,BR,BL. "
+            "Format: x0,y0,x1,y1,x2,y2,x3,y3; values are normalized unless "
+            "--manual_quad_coordinates=pixel."
+        ),
+    )
+    parser.add_argument("--manual_quad_depth_sample_stride", type=int, default=2)
+    parser.add_argument(
+        "--manual_quad_fit_shrink",
+        type=float,
+        default=0.70,
+        help="Fit the carrier plane using an inner quad, while keeping the full quad as the rendered patch boundary.",
+    )
+    parser.add_argument(
+        "--manual_quad_plane_inlier_tolerance",
+        type=float,
+        default=0.06,
+        help="Absolute point-to-plane tolerance in meters for robust manual-quad plane fitting.",
+    )
+    parser.add_argument(
+        "--manual_quad_min_inlier_ratio",
+        type=float,
+        default=0.25,
+        help="Minimum fraction of quad depth samples kept for robust manual-quad plane refitting.",
+    )
     parser.add_argument("--use_depth_visibility", action="store_true")
     parser.add_argument("--depth_txt_name", default="depth.txt")
     parser.add_argument("--depth_scale", type=float, default=5000.0)
@@ -2992,6 +3341,7 @@ def main() -> None:
             },
             "pose_rotation_weight": args.pose_rotation_weight,
             "pose_translation_weight": args.pose_translation_weight,
+            "pose_scale_invariant_eps": args.pose_scale_invariant_eps,
             "frame_manifest": args.frame_manifest,
             "intrinsics": intrinsics.astype(float).tolist(),
             "plane_mode": args.plane_mode,
