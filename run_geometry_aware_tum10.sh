@@ -55,6 +55,12 @@ MANUAL_ANCHOR_Y="${MANUAL_ANCHOR_Y:-0.5}"
 MANUAL_ANCHOR_FRAME="${MANUAL_ANCHOR_FRAME:-0}"
 MANUAL_ANCHOR_SEARCH_RADIUS="${MANUAL_ANCHOR_SEARCH_RADIUS:-12}"
 MANUAL_ANCHOR_ROLL_DEGREES="${MANUAL_ANCHOR_ROLL_DEGREES:-0}"
+MANUAL_QUAD_COORDINATES="${MANUAL_QUAD_COORDINATES:-normalized}"
+MANUAL_QUAD_XY="${MANUAL_QUAD_XY:-}"
+MANUAL_QUAD_DEPTH_SAMPLE_STRIDE="${MANUAL_QUAD_DEPTH_SAMPLE_STRIDE:-2}"
+MANUAL_QUAD_FIT_SHRINK="${MANUAL_QUAD_FIT_SHRINK:-0.70}"
+MANUAL_QUAD_PLANE_INLIER_TOLERANCE="${MANUAL_QUAD_PLANE_INLIER_TOLERANCE:-0.06}"
+MANUAL_QUAD_MIN_INLIER_RATIO="${MANUAL_QUAD_MIN_INLIER_RATIO:-0.25}"
 PLANE_MODE="${PLANE_MODE:-vggt_pointmap_surface}"
 VGGT_POINT_CONF_PERCENTILE="${VGGT_POINT_CONF_PERCENTILE:-40}"
 USE_DEPTH_VISIBILITY="${USE_DEPTH_VISIBILITY:-1}"
@@ -119,6 +125,7 @@ FORCE_CLEAN="${FORCE_CLEAN:-0}"
 FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_APPLY="${FORCE_APPLY:-0}"
 RUN_EVAL="${RUN_EVAL:-1}"
+RUN_GAUGE_DIAG="${RUN_GAUGE_DIAG:-1}"
 
 log() {
   printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
@@ -152,6 +159,8 @@ echo "pose_bad_reference=$POSE_BAD_REFERENCE drift=($POSE_DRIFT_X_M,$POSE_DRIFT_
 echo "plane_width=$PLANE_WIDTH plane_height=$PLANE_HEIGHT plane_distance=$PLANE_DISTANCE"
 echo "plane_center=($PLANE_CENTER_X,$PLANE_CENTER_Y)"
 echo "scene_pattern=$SCENE_PATTERN manual_anchor=($MANUAL_ANCHOR_X,$MANUAL_ANCHOR_Y) frame=$MANUAL_ANCHOR_FRAME roll=$MANUAL_ANCHOR_ROLL_DEGREES"
+echo "manual_quad coordinates=$MANUAL_QUAD_COORDINATES xy=$MANUAL_QUAD_XY depth_sample_stride=$MANUAL_QUAD_DEPTH_SAMPLE_STRIDE"
+echo "manual_quad robust_fit shrink=$MANUAL_QUAD_FIT_SHRINK inlier_tol=$MANUAL_QUAD_PLANE_INLIER_TOLERANCE min_inlier_ratio=$MANUAL_QUAD_MIN_INLIER_RATIO"
 echo "plane_mode=$PLANE_MODE clean_vggt_output_root=$TUM_CLEAN_OUT use_depth_visibility=$USE_DEPTH_VISIBILITY optimize_geometry=$OPTIMIZE_GEOMETRY"
 echo "surface_candidate_grid=$SURFACE_CANDIDATE_GRID geometry_size_scales=$GEOMETRY_SIZE_SCALES geometry_roll_degrees=$GEOMETRY_ROLL_DEGREES"
 echo "fused_point_stride=$FUSED_POINT_STRIDE fused_surface_candidates=$FUSED_SURFACE_CANDIDATES fused_normal_radius=$FUSED_NORMAL_RADIUS"
@@ -163,6 +172,7 @@ echo "natural_auto_relax=$NATURAL_AUTO_RELAX max_coverage=$NATURAL_RELAX_MAX_COV
 echo "physical_eot=$PHYSICAL_EOT print=[$PRINT_MIN,$PRINT_MAX] brightness=$EOT_BRIGHTNESS contrast=$EOT_CONTRAST gamma=$EOT_GAMMA noise_std=$EOT_NOISE_STD"
 echo "regularization tv=$TV_WEIGHT printability=$PRINTABILITY_WEIGHT levels=$PRINTABLE_COLOR_LEVELS low_frequency=$LOW_FREQUENCY_WEIGHT kernel=$LOW_FREQUENCY_KERNEL"
 echo "natural_reference image=$NATURAL_REFERENCE_IMAGE weight=$NATURAL_REFERENCE_WEIGHT"
+echo "run_eval=$RUN_EVAL run_gauge_diag=$RUN_GAUGE_DIAG"
 
 log "prepare TUM images links"
 for seq_dir in "$TUM_ROOT"/rgbd_dataset_freiburg3_*; do
@@ -272,6 +282,12 @@ fi
   --manual_anchor_frame "$MANUAL_ANCHOR_FRAME" \
   --manual_anchor_search_radius "$MANUAL_ANCHOR_SEARCH_RADIUS" \
   --manual_anchor_roll_degrees "$MANUAL_ANCHOR_ROLL_DEGREES" \
+  --manual_quad_coordinates "$MANUAL_QUAD_COORDINATES" \
+  --manual_quad_xy "$MANUAL_QUAD_XY" \
+  --manual_quad_depth_sample_stride "$MANUAL_QUAD_DEPTH_SAMPLE_STRIDE" \
+  --manual_quad_fit_shrink "$MANUAL_QUAD_FIT_SHRINK" \
+  --manual_quad_plane_inlier_tolerance "$MANUAL_QUAD_PLANE_INLIER_TOLERANCE" \
+  --manual_quad_min_inlier_ratio "$MANUAL_QUAD_MIN_INLIER_RATIO" \
   --clean_vggt_output_root "$TUM_CLEAN_OUT" \
   --vggt_point_conf_percentile "$VGGT_POINT_CONF_PERCENTILE" \
   --surface_candidate_grid "$SURFACE_CANDIDATE_GRID" \
@@ -328,6 +344,20 @@ fi
   "${patch_args[@]}" \
   "${apply_args[@]}"
 
+if [[ "$RUN_GAUGE_DIAG" == "1" ]]; then
+  # Gauge diagnostics: how much of the trajectory damage is a global Sim(3) that
+  # the Sim(3)-aligned ATE discards. Writes its own CSV only; it does not touch
+  # the ATE/RPE evaluation or its outputs.
+  log "gauge diagnostics (gauge_absorbed_frac / sim3_scale_vs_clean)"
+  "$RECONS_PY" "$VGGT_ROOT/scripts/eval_gauge_absorbed_frac.py" \
+    --vggt_output_root "$TUM_GEOM_OUT" \
+    --model_name "$TUM_GEOM_MODEL" \
+    --recons_root "$RECONS_ROOT" \
+    --tum_root "$TUM_ROOT" \
+    --clean_vggt_output_root "$TUM_CLEAN_OUT" \
+    --scene_pattern "$SCENE_PATTERN"
+fi
+
 if [[ "$RUN_EVAL" != "1" ]]; then
   log "skip recons_eval because RUN_EVAL=$RUN_EVAL"
   exit 0
@@ -350,3 +380,6 @@ log "evaluate TUM-10 clean and geometry-aware attack"
 log "all done"
 echo "TUM clean:    $RECONS_ROOT/outputs/relpose-distance/tum10-metric-$TUM_CLEAN_MODEL.csv"
 echo "TUM geometry: $RECONS_ROOT/outputs/relpose-distance/tum10-metric-$TUM_GEOM_MODEL.csv"
+if [[ "$RUN_GAUGE_DIAG" == "1" ]]; then
+  echo "TUM gauge:    $RECONS_ROOT/outputs/relpose-distance/tum10-gauge-$TUM_GEOM_MODEL.csv"
+fi
