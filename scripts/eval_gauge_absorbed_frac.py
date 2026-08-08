@@ -10,6 +10,19 @@ A value near 1 means the attack mostly moved / rescaled / rotated the whole
 reconstruction, which `evo_utils.eval_metrics(align=True, correct_scale=True)`
 removes before it measures anything.
 
+It also reports where the ATE sits inside its own achievable range. Umeyama is
+free to choose the scale, so the aligned prediction can always collapse to a
+single point; since Umeyama *minimises* the residual, that gives a hard ceiling
+
+    ATE  <=  ate_ceiling := sqrt( mean_i || gt_i - mean(gt) ||^2 )
+
+independent of how badly the prediction is corrupted. Raw ATE is therefore not
+comparable across sequences, and on a low-motion sequence it saturates: on TUM
+fr3 sitting_static the ceiling is 0.0310 m and a *random* prediction already
+scores ~0.0281 (90% of it), so an attacked ATE of 0.0285 is indistinguishable
+from noise. `ate_frac_of_ceiling` and `ate_random_baseline` make that visible
+instead of leaving it for a reader to work out.
+
 This script does NOT modify or re-implement the evaluation. It imports
 recons_eval's own functions through scripts/diag_gauge_invariance.py, and writes
 only its own CSV. The ATE column here is the same estimator the production eval
@@ -59,7 +72,33 @@ def parse_args() -> argparse.Namespace:
                    help="default: <recons_root>/outputs/relpose-distance/"
                         "tum10-gauge-<model_name>.csv")
     p.add_argument("--work_dir", default=None)
+    p.add_argument("--random_baseline_draws", type=int, default=50,
+                   help="random predictions used to estimate the no-information ATE "
+                        "for this sequence (fixed seed; 0 disables)")
+    p.add_argument("--random_baseline_seed", type=int, default=0)
     return p.parse_args()
+
+
+def ate_ceiling(gt_c2w: np.ndarray) -> float:
+    """Largest ATE any prediction can reach: the GT RMS radius about its centroid."""
+    p = gt_c2w[:, :3, 3]
+    return float(np.sqrt(((p - p.mean(axis=0)) ** 2).sum(axis=1).mean()))
+
+
+def random_prediction_ate(rec, gt_traj, n_frames: int, draws: int, seed: int) -> float:
+    """Mean ATE of predictions carrying no trajectory information at all."""
+    if draws <= 0:
+        return float("nan")
+    rng = np.random.default_rng(seed)
+    vals = []
+    for _ in range(draws):
+        c2w = np.tile(np.eye(4), (n_frames, 1, 1))
+        c2w[:, :3, 3] = rng.normal(scale=1.0, size=(n_frames, 3))
+        try:
+            vals.append(rec.ate(rec.evo_utils.get_tum_poses(c2w), gt_traj, True, True))
+        except Exception:
+            continue  # evo refuses degenerate covariances; just skip that draw
+    return float(np.mean(vals)) if vals else float("nan")
 
 
 def main() -> None:
@@ -99,16 +138,27 @@ def main() -> None:
         # scale of the CLEAN prediction w.r.t. GT, so the run's own scale gauge is on record
         c_clean, _, _ = umeyama(clean["c2w"][:, :3, 3].T, gt_c2w[:, :3, 3].T)
 
+        ate = rec.ate(traj, gt_traj, True, True)
+        ceiling = ate_ceiling(gt_c2w)
+        rand_ate = random_prediction_ate(rec, gt_traj, len(run["frame_indices"]),
+                                         args.random_baseline_draws, args.random_baseline_seed)
+        clean_ate = rec.ate(rec.evo_utils.get_tum_poses(clean["c2w"]), gt_traj, True, True)
+
         row = {
             "model": args.model_name,
             "dataset": "tum10",
             "seq": scene,
             "n_frames": len(run["frame_indices"]),
-            "ATE_align_scale": rec.ate(traj, gt_traj, True, True),
+            "ATE_align_scale": ate,
             "ATE_align_noscale": rec.ate(traj, gt_traj, True, False),
             "ATE_noalign": rec.ate(traj, gt_traj, False, False),
             "RPE_trans": rpe_trans,
             "RPE_rot_deg": rpe_rot,
+            "ate_ceiling": ceiling,
+            "ate_frac_of_ceiling": ate / ceiling if ceiling > 0 else float("nan"),
+            "ate_clean_frac_of_ceiling": clean_ate / ceiling if ceiling > 0 else float("nan"),
+            "ate_random_baseline": rand_ate,
+            "ate_random_frac_of_ceiling": rand_ate / ceiling if ceiling > 0 else float("nan"),
             "clean_umeyama_scale_pred_to_gt": float(c_clean),
         }
         row.update(sim3_decomposition(rec, run["c2w"], clean["c2w"]))
@@ -116,10 +166,15 @@ def main() -> None:
         print(
             f"{args.model_name} {scene}: "
             f"ATE={row['ATE_align_scale']:.6f} "
-            f"(no-scale {row['ATE_align_noscale']:.6f}, no-align {row['ATE_noalign']:.6f})  "
+            f"({row['ate_frac_of_ceiling'] * 100:.1f}% of the {ceiling:.6f} ceiling; "
+            f"clean {row['ate_clean_frac_of_ceiling'] * 100:.1f}%, "
+            f"random {row['ate_random_frac_of_ceiling'] * 100:.1f}%)  "
             f"gauge_absorbed={row['gauge_absorbed_frac']:.4f}  "
             f"sim3_scale_vs_clean={row['sim3_scale_vs_clean']:.4f}"
         )
+        if row["ate_frac_of_ceiling"] >= row["ate_random_frac_of_ceiling"] - 0.05:
+            print(f"    WARNING: {scene} ATE is at or near the no-information level "
+                  f"-- this sequence cannot distinguish this attack from noise.")
 
     if len(rows) > 1:
         mean_row = {"model": args.model_name, "dataset": "tum10", "seq": "MEAN",

@@ -2409,6 +2409,156 @@ def pose_scale_invariant_mse(
     }
 
 
+def pairwise_relative_c2w(rel: torch.Tensor) -> torch.Tensor:
+    """T_ij = T_i^{-1} T_j for every unordered pair i<j.
+
+    (..., N, 4, 4) -> (..., N*(N-1)/2, 4, 4). For the 10-frame TUM setting that
+    is 45 pairs.
+    """
+    n = rel.shape[-3]
+    pairs = torch.triu_indices(n, n, offset=1, device=rel.device)
+    left = torch.linalg.inv(rel[..., pairs[0], :, :])
+    return torch.matmul(left, rel[..., pairs[1], :, :])
+
+
+def pose_pairwise_relative_mse(
+    pred_rel: torch.Tensor,
+    target_rel: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Pairwise relative-pose loss: no privileged frame.
+
+    `pose_relative_mse` and `pose_scale_invariant_mse` both measure everything
+    relative to frame 0, which gives frame 0 leverage the metric does not grant
+    it: perturbing T_0 alone sends every relative pose to delta^-1 * rel_i, so all
+    N-1 terms move at once, while the Sim(3)-aligned ATE just sees one outlier
+    camera. Comparing all N(N-1)/2 pairs instead removes that asymmetry -- a
+    corrupted frame 0 now touches only the N-1 pairs that contain it (9 of 45
+    here) instead of all of them.
+
+    Gauge behaviour, for g = (s*R_g, t_g) acting on the trajectory:
+        T_i'^-1 T_j' = [ R_i^T R_j | s * R_i^T (p_j - p_i) ]
+    so the rotation block is exactly invariant to the whole of Sim(3), and the
+    translation block only picks up the scale s, which the per-trajectory RMS
+    normalisation below removes -- same treatment as pose_scale_invariant_mse,
+    so the scale leak is not reintroduced.
+    """
+    target_rel = target_rel.detach().to(device=pred_rel.device, dtype=pred_rel.dtype)
+    if pred_rel.shape != target_rel.shape:
+        raise RuntimeError(f"Pose target shape mismatch: pred={tuple(pred_rel.shape)} target={tuple(target_rel.shape)}")
+    if pred_rel.shape[-3] < 2:
+        raise RuntimeError("pose_pairwise_relative_mse needs at least 2 frames")
+    eps = float(getattr(args, "pose_scale_invariant_eps", 1e-6))
+
+    pred_pair = pairwise_relative_c2w(pred_rel)
+    target_pair = pairwise_relative_c2w(target_rel)
+
+    rot_mse = (pred_pair[..., :3, :3] - target_pair[..., :3, :3]).pow(2).mean()
+
+    pred_trans = pred_pair[..., :3, 3]
+    target_trans = target_pair[..., :3, 3]
+    pred_rms = pred_trans.pow(2).sum(dim=-1).mean(dim=-1, keepdim=True).clamp_min(eps * eps).sqrt()
+    target_rms = target_trans.pow(2).sum(dim=-1).mean(dim=-1, keepdim=True).clamp_min(eps * eps).sqrt()
+    trans_mse = (pred_trans / pred_rms.unsqueeze(-1) - target_trans / target_rms.unsqueeze(-1)).pow(2).mean()
+
+    total = args.pose_rotation_weight * rot_mse + args.pose_translation_weight * trans_mse
+    return total, {
+        "pose_loss": float(total.detach().cpu()),
+        "pose_rot_mse": float(rot_mse.detach().cpu()),
+        "pose_trans_mse": float(trans_mse.detach().cpu()),
+        "pose_n_pairs": int(pred_pair.shape[-3]),
+        "pose_pred_trans_rms": float(pred_rms.detach().mean().cpu()),
+        "pose_target_trans_rms": float(target_rms.detach().mean().cpu()),
+    }
+
+
+def umeyama_sim3_torch(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Least-squares Sim(3) with  c * x @ R^T + t  ~=  y.  x, y: (..., N, 3).
+
+    Same estimator as `mv_recon/utils.py::umeyama` and the one evo uses inside
+    `align(correct_scale=True)`, written in torch so it can sit inside a loss.
+    """
+    n = x.shape[-2]
+    mu_x = x.mean(dim=-2, keepdim=True)
+    mu_y = y.mean(dim=-2, keepdim=True)
+    xc = x - mu_x
+    yc = y - mu_y
+    var_x = xc.pow(2).sum(dim=-1).mean(dim=-1)
+    cov = torch.matmul(yc.transpose(-1, -2), xc) / n
+    u, d, vh = torch.linalg.svd(cov)
+    sign = torch.sign(torch.det(u) * torch.det(vh))
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+    s_diag = torch.ones_like(d)
+    s_diag[..., -1] = sign
+    rot = torch.matmul(torch.matmul(u, torch.diag_embed(s_diag)), vh)
+    scale = (d * s_diag).sum(dim=-1) / var_x.clamp_min(eps * eps)
+    trans = mu_y - scale[..., None, None] * torch.matmul(mu_x, rot.transpose(-1, -2))
+    return scale, rot, trans
+
+
+def pose_aligned_residual_mse(
+    pred_rel: torch.Tensor,
+    target_rel: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Differentiable ATE: residual measured *after* the evaluator's own alignment.
+
+    The evaluator fits the best Sim(3) before it measures anything, so a loss that
+    scores residuals in a fixed gauge is optimising a different quantity. This one
+    reproduces the alignment step: fit Umeyama(pred -> target) exactly as
+    `evo.core.geometry.umeyama_alignment(..., with_scale=True)` does, apply it, and
+    take the RMS residual. It is then divided by the target's own RMS radius, which
+    is the largest residual any prediction can produce (the alignment can always
+    collapse the prediction to a point, and Umeyama *minimises* the residual). So
+    the translation term equals ATE / ate_ceiling and lives in [0, 1]: it reaches 1
+    exactly when the ATE is maximal, unlike the fixed-gauge losses whose ceiling
+    sits at an arbitrary point unrelated to the metric.
+
+    The alignment parameters are solved under `no_grad` on purpose. They minimise
+    the very residual being differentiated, so by the envelope theorem their
+    contribution to dL/d(pred) vanishes at the optimum, and detaching them is
+    first-order exact while completely avoiding the ill-conditioned SVD gradient
+    when the covariance has near-equal singular values.
+    `tests/test_pose_gauge_losses.py` checks this against full autograd.
+    """
+    target_rel = target_rel.detach().to(device=pred_rel.device, dtype=pred_rel.dtype)
+    if pred_rel.shape != target_rel.shape:
+        raise RuntimeError(f"Pose target shape mismatch: pred={tuple(pred_rel.shape)} target={tuple(target_rel.shape)}")
+    eps = float(getattr(args, "pose_scale_invariant_eps", 1e-6))
+
+    pred_pos = pred_rel[..., :3, 3]
+    target_pos = target_rel[..., :3, 3]
+
+    with torch.no_grad():
+        scale, rot, trans = umeyama_sim3_torch(pred_pos, target_pos, eps)
+
+    aligned = scale[..., None, None] * torch.matmul(pred_pos, rot.transpose(-1, -2)) + trans
+    resid_ms = (aligned - target_pos).pow(2).sum(dim=-1).mean(dim=-1)
+    rmse = resid_ms.clamp_min(0.0).sqrt()
+
+    target_centred = target_pos - target_pos.mean(dim=-2, keepdim=True)
+    ceiling = target_centred.pow(2).sum(dim=-1).mean(dim=-1).clamp_min(eps * eps).sqrt()
+    trans_term = (rmse / ceiling).mean()
+
+    # rotation measured in the same aligned gauge, so it is Sim(3)-invariant too
+    aligned_rot = torch.matmul(rot.unsqueeze(-3), pred_rel[..., :3, :3])
+    rot_mse = (aligned_rot - target_rel[..., :3, :3]).pow(2).mean()
+
+    total = args.pose_rotation_weight * rot_mse + args.pose_translation_weight * trans_term
+    return total, {
+        "pose_loss": float(total.detach().cpu()),
+        "pose_rot_mse": float(rot_mse.detach().cpu()),
+        "pose_trans_mse": float(trans_term.detach().cpu()),
+        "pose_aligned_ate": float(rmse.detach().mean().cpu()),
+        "pose_ate_ceiling": float(ceiling.detach().mean().cpu()),
+        "pose_align_scale": float(scale.detach().mean().cpu()),
+    }
+
+
 def should_cache_clean_pose(args: argparse.Namespace) -> bool:
     return args.attack_loss == "pose_clean_untargeted" or (
         args.attack_loss == "pose_reverse_targeted" and args.pose_reverse_reference == "clean"
@@ -2453,6 +2603,18 @@ def attack_objective_loss(
     if args.attack_loss == "pose_scale_invariant_mse":
         target_rel = item["pose_gt_rel"]
         loss, terms = pose_scale_invariant_mse(pred_rel, target_rel, args)
+        terms["pose_reference"] = "gt"
+        return loss, terms, True
+
+    if args.attack_loss == "pose_pairwise_relative_mse":
+        target_rel = item["pose_gt_rel"]
+        loss, terms = pose_pairwise_relative_mse(pred_rel, target_rel, args)
+        terms["pose_reference"] = "gt"
+        return loss, terms, True
+
+    if args.attack_loss == "pose_aligned_residual_mse":
+        target_rel = item["pose_gt_rel"]
+        loss, terms = pose_aligned_residual_mse(pred_rel, target_rel, args)
         terms["pose_reference"] = "gt"
         return loss, terms, True
 
@@ -3112,6 +3274,8 @@ def parse_args() -> argparse.Namespace:
             "feature_l1",
             "pose_gt_untargeted",
             "pose_scale_invariant_mse",
+            "pose_pairwise_relative_mse",
+            "pose_aligned_residual_mse",
             "pose_clean_untargeted",
             "pose_reverse_targeted",
             "pose_drift_targeted",
@@ -3124,7 +3288,11 @@ def parse_args() -> argparse.Namespace:
             "pose_reverse/drift/scale/yaw targeted losses minimize distance to a constructed bad trajectory. "
             "pose_scale_invariant_mse is pose_gt_untargeted with each trajectory normalized by its own "
             "translation RMS, so the loss no longer rewards the global scale gauge that the Sim(3)-aligned "
-            "ATE discards (note: this is scale-INVARIANT, unrelated to the scale-TARGETED pose_scale_targeted)."
+            "ATE discards (note: this is scale-INVARIANT, unrelated to the scale-TARGETED pose_scale_targeted). "
+            "pose_pairwise_relative_mse compares all N(N-1)/2 relative poses instead of normalizing to frame 0, "
+            "removing frame 0's privileged position. pose_aligned_residual_mse reproduces the evaluator's own "
+            "Umeyama Sim(3) alignment inside the loss and scores the residual after it, i.e. a differentiable "
+            "ATE normalized by its ceiling."
         ),
     )
     parser.add_argument("--pose_reverse_reference", choices=("gt", "clean"), default="gt")
