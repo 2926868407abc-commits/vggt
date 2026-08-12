@@ -126,6 +126,7 @@ FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_APPLY="${FORCE_APPLY:-0}"
 RUN_EVAL="${RUN_EVAL:-1}"
 RUN_GAUGE_DIAG="${RUN_GAUGE_DIAG:-1}"
+RUN_CONSISTENCY_CHECK="${RUN_CONSISTENCY_CHECK:-1}"
 
 log() {
   printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
@@ -172,7 +173,7 @@ echo "natural_auto_relax=$NATURAL_AUTO_RELAX max_coverage=$NATURAL_RELAX_MAX_COV
 echo "physical_eot=$PHYSICAL_EOT print=[$PRINT_MIN,$PRINT_MAX] brightness=$EOT_BRIGHTNESS contrast=$EOT_CONTRAST gamma=$EOT_GAMMA noise_std=$EOT_NOISE_STD"
 echo "regularization tv=$TV_WEIGHT printability=$PRINTABILITY_WEIGHT levels=$PRINTABLE_COLOR_LEVELS low_frequency=$LOW_FREQUENCY_WEIGHT kernel=$LOW_FREQUENCY_KERNEL"
 echo "natural_reference image=$NATURAL_REFERENCE_IMAGE weight=$NATURAL_REFERENCE_WEIGHT"
-echo "run_eval=$RUN_EVAL run_gauge_diag=$RUN_GAUGE_DIAG"
+echo "run_eval=$RUN_EVAL run_gauge_diag=$RUN_GAUGE_DIAG run_consistency_check=$RUN_CONSISTENCY_CHECK"
 
 log "prepare TUM images links"
 for seq_dir in "$TUM_ROOT"/rgbd_dataset_freiburg3_*; do
@@ -343,6 +344,19 @@ fi
   "${geometry_args[@]}" \
   "${patch_args[@]}" \
   "${apply_args[@]}"
+
+if [[ "$RUN_CONSISTENCY_CHECK" == "1" ]]; then
+  # Recompute the run's own attack loss on the saved prediction. A large gap means
+  # the trained attack did not survive into what actually gets evaluated -- the EOT
+  # jitter is applied during training but not when the outputs are written.
+  # Report only; it never fails the run.
+  log "train/test consistency check"
+  "$VGGT_PY" "$VGGT_ROOT/scripts/check_train_test_consistency.py" \
+    --vggt_output_root "$TUM_GEOM_OUT" \
+    --tum_root "$TUM_ROOT" \
+    --scene_pattern "$SCENE_PATTERN" \
+    --out_csv "$TUM_GEOM_OUT/train_test_consistency.csv" || true
+fi
 
 if [[ "$RUN_GAUGE_DIAG" == "1" ]]; then
   # Gauge diagnostics: how much of the trajectory damage is a global Sim(3) that
