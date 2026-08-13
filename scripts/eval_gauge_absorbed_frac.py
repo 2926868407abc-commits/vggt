@@ -85,6 +85,28 @@ def ate_ceiling(gt_c2w: np.ndarray) -> float:
     return float(np.sqrt(((p - p.mean(axis=0)) ** 2).sum(axis=1).mean()))
 
 
+def deviation_from_clean(pred_c2w: np.ndarray, clean_c2w: np.ndarray) -> tuple[float, float]:
+    """How far the attack moved this model's own prediction, and by what factor.
+
+    ATE saturates: it is bounded by `ate_ceiling`, and the strongest runs already sit
+    at 98-99% of it, so it can no longer separate a strong attack from a stronger one.
+    Following the scale-free framing of Beware of Road Markings (NeurIPS 2024), which
+    defines its Mean Relative Shift Ratio against the model's own clean prediction
+    rather than against ground truth, this measures the RMS trajectory displacement
+    from the clean prediction and normalises it by the clean trajectory's own radius.
+    No alignment is involved, so no gauge is discarded and there is no ceiling.
+
+    Report it next to the ATE, not instead of it: the two can rank runs differently.
+    Measured on sitting_halfsphere, pose_gt_untargeted has the largest displacement of
+    the four losses (52.7x the clean radius) but only 72.9% of ceiling ATE, because
+    98.6% of that displacement is a global Sim(3) the aligned ATE removes.
+    """
+    p, c = pred_c2w[:, :3, 3], clean_c2w[:, :3, 3]
+    dev = float(np.sqrt(((p - c) ** 2).sum(axis=1).mean()))
+    radius = float(np.sqrt(((c - c.mean(axis=0)) ** 2).sum(axis=1).mean()))
+    return dev, (dev / radius if radius > 0 else float("nan"))
+
+
 def random_prediction_ate(rec, gt_traj, n_frames: int, draws: int, seed: int) -> float:
     """Mean ATE of predictions carrying no trajectory information at all."""
     if draws <= 0:
@@ -143,6 +165,7 @@ def main() -> None:
         rand_ate = random_prediction_ate(rec, gt_traj, len(run["frame_indices"]),
                                          args.random_baseline_draws, args.random_baseline_seed)
         clean_ate = rec.ate(rec.evo_utils.get_tum_poses(clean["c2w"]), gt_traj, True, True)
+        dev_abs, dev_rel = deviation_from_clean(run["c2w"], clean["c2w"])
 
         row = {
             "model": args.model_name,
@@ -159,6 +182,8 @@ def main() -> None:
             "ate_clean_frac_of_ceiling": clean_ate / ceiling if ceiling > 0 else float("nan"),
             "ate_random_baseline": rand_ate,
             "ate_random_frac_of_ceiling": rand_ate / ceiling if ceiling > 0 else float("nan"),
+            "dev_from_clean": dev_abs,
+            "dev_from_clean_rel": dev_rel,
             "clean_umeyama_scale_pred_to_gt": float(c_clean),
         }
         row.update(sim3_decomposition(rec, run["c2w"], clean["c2w"]))
@@ -169,6 +194,7 @@ def main() -> None:
             f"({row['ate_frac_of_ceiling'] * 100:.1f}% of the {ceiling:.6f} ceiling; "
             f"clean {row['ate_clean_frac_of_ceiling'] * 100:.1f}%, "
             f"random {row['ate_random_frac_of_ceiling'] * 100:.1f}%)  "
+            f"dev_from_clean={dev_rel:.2f}x  "
             f"gauge_absorbed={row['gauge_absorbed_frac']:.4f}  "
             f"sim3_scale_vs_clean={row['sim3_scale_vs_clean']:.4f}"
         )

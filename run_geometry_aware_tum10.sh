@@ -127,6 +127,7 @@ FORCE_APPLY="${FORCE_APPLY:-0}"
 RUN_EVAL="${RUN_EVAL:-1}"
 RUN_GAUGE_DIAG="${RUN_GAUGE_DIAG:-1}"
 RUN_CONSISTENCY_CHECK="${RUN_CONSISTENCY_CHECK:-1}"
+FREEZE_MODEL_PARAMETERS="${FREEZE_MODEL_PARAMETERS:-1}"
 
 log() {
   printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
@@ -240,6 +241,9 @@ if [[ "$FREEZE_TEXTURE" == "1" ]]; then
 fi
 if [[ "$ACTIVATION_CHECKPOINT" == "1" ]]; then
   geometry_args+=(--activation_checkpoint)
+fi
+if [[ "$FREEZE_MODEL_PARAMETERS" != "1" ]]; then
+  geometry_args+=(--no_freeze_model_parameters)
 fi
 texture_args=()
 if [[ -n "$TEXTURE_INIT_IMAGE" ]]; then

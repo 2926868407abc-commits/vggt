@@ -45,10 +45,39 @@
 - 载体：右侧电脑显示器屏幕，`PLANE_MODE=depth_manual_quad_surface`
 - 主 loss：`ATTACK_LOSS=pose_gt_untargeted`
 - 可选 loss：`pose_aligned_residual_mse`（可微 ATE，三序列里两个最强，见问题 1）/
-  `pose_scale_invariant_mse`（尺度不变版）/ `pose_pairwise_relative_mse`（**已判定无效**）/
+  `pose_scale_invariant_mse`（尺度不变版）/ `pose_pairwise_relative_mse`（校准后在
+  halfsphere 上最强，**此前"无效"的结论已推翻**，见已知问题 8）/
   `feature_l1` / `pose_clean_untargeted` / `pose_{reverse,drift,scale,yaw}_targeted`
 
-### 三序列 loss 对照（1000 步，ATE 占各自 ceiling 的比例，越高越强）
+### 三序列 loss 对照（**已校准**：正则逐序列校准 + `PHYSICAL_EOT=0`，1000 步）
+
+这是唯一可信的一版。校准前的旧表见下一节，**结论不同，不要引用旧表**。
+
+| 序列 | loss | ATE | %ceiling | devRel | gaugeAbs |
+|---|---|---|---|---|---|
+| sitting_xyz | 旧 `pose_gt_untargeted` | 0.01622 | 8.1% | 0.98 | 0.916 |
+| （上界 0.2005 | `scale_invariant` | 0.17445 | 87.0% | 3.02 | 0.712 |
+| clean 3.9% | `pairwise` | 0.02969 | 14.8% | 3.29 | 0.950 |
+| 随机 93.8%） | **`aligned_residual`** | **0.19739** | **98.5%** | **10.68** | 0.908 |
+| sitting_halfsphere | 旧 `pose_gt_untargeted` | 0.18363 | 72.9% | 52.73 | 0.986 |
+| （上界 0.2519 | `scale_invariant` | 0.20379 | 80.9% | 10.71 | 0.925 |
+| clean 3.2% | **`pairwise`** | **0.22240** | **88.3%** | 6.81 | 0.871 |
+| 随机 90.5%） | `aligned_residual` | 0.11057 | 43.9% | 0.61 | **0.303** |
+| sitting_static | 旧 `pose_gt_untargeted` | 0.02191 | 70.6% | 20.84 | 0.967 |
+| （上界 0.0310 | `scale_invariant` | 0.01751 | 56.4% | 8.46 | 0.936 |
+| clean 19.5% | `pairwise` | 0.01862 | 60.0% | 10.72 | 0.947 |
+| 随机 90.3%） | **`aligned_residual`** | **0.03069** | **98.9%** ⚠ | 3.65 | 0.732 |
+
+⚠ 该格未收敛：末 20 步 loss 的 std 是 1.254（均值 3.366），其余各格 std ≤ 0.03。
+数字本身没错，但可信度低于其他格。
+
+**仍然没有一个 loss 通吃**：`aligned_residual` 在 xyz / static 上接近上界，
+在 halfsphere 上只有 43.9%；`pairwise` 反过来在 halfsphere 上最强。
+
+**`devRel` 与 ATE 会给出相反排序**，必须一起报。halfsphere 上旧 loss 的 devRel 是
+全表最高的 52.7，ATE 却只有 72.9%——因为它 98.6% 的破坏是全局 Sim(3)，被对齐吃掉。
+
+### 校准前的旧对照（**已作废，仅存档**）
 
 | 序列 | ceiling | clean | 随机 | 旧 `pose_gt_untargeted` | `scale_invariant` | `pairwise` | `aligned_residual` |
 |---|---|---|---|---|---|---|---|
@@ -77,11 +106,18 @@ clean 才 3.9%），在 halfsphere 上却接近上限。任何单序列得出的
    loss 约放大 N 倍；而 ATE 的最佳拟合只把它当成一个离群帧。
 
    为此实现了 `pose_pairwise_relative_mse`（45 对帧两两比较，无特权帧，单元测试
-   验证了帧 0 扰动下它显著低于帧 0 归一化版）。**但实测无效**：sitting_xyz 上只有
-   5.9%，低于旧 loss 的 6.2%。排查过程已排除梯度损坏（‖grad‖=0.224，有限差分吻合）、
-   步长（lr 扫 50 倍无变化）、loss 不敏感（扰动响应比 si 更高）、正则压制
-   （按实测比值把正则缩小 64 倍，ATE 仅 4.2%→5.9%）。**结论：这个目标函数确实
-   推不动攻击，不要再在它上面花时间。** 保留作 ablation 对照行。
+   验证了帧 0 扰动下它显著低于帧 0 归一化版）。
+
+   **⚠ 这里曾经两次下错结论。** 未校准时它在 sitting_xyz 上只有 4.2%，我判定
+   "目标函数推不动攻击、不要再花时间"。**那是错的**——正则权重按旧 loss 的量级
+   调好，而 pairwise 的梯度小两个数量级，一直被同一副镣铐按死。用
+   `scripts/calibrate_attack_reg_balance.py` 逐序列校准后：xyz 14.8%，
+   **halfsphere 88.3%（四个 loss 里最强）**。
+
+   教训：**任何 loss 对比在正则校准之前都不算数**，见已知问题 8。当时我排除了
+   梯度损坏、步长、loss 敏感度三项，也试过按比例缩正则（只缩了权重、没做完整
+   校准，4.2%→5.9%），据此就下了结论——排查不完整时不该给出"不要再花时间"
+   这种终局判断。
 
    **实际有效的方案是 `pose_aligned_residual_mse`**：在 loss 内部复现评测自己的
    Umeyama Sim(3) 对齐再算残差，除以目标轨迹 RMS 半径，平移项 = ATE/ceiling ∈ [0,1]，
@@ -143,6 +179,21 @@ clean 才 3.9%），在 halfsphere 上却接近上限。任何单序列得出的
    **要求：一律报告 `ate_frac_of_ceiling`，不要只报裸 ATE。** 管线已自动产出
    （`RUN_GAUGE_DIAG=1` → `tum10-gauge-<model>.csv`），接近无信息水平时会告警。
 
+   **但 `ate_frac_of_ceiling` 本身也会饱和**：最强的 run 已经到 98–99%，再往上
+   分辨不出强弱。所以管线同时产出 `dev_from_clean_rel`——相对该模型**自己的 clean
+   预测**的 RMS 轨迹位移，除以 clean 轨迹半径。不做对齐，因而不丢规范、无上界。
+   这个框架取自 NeurIPS'24 *Beware of Road Markings*：他们同样面对"相对深度尺度
+   跨模型差异巨大"的问题，解法是定义 MRSR = `sum(f(x̂)-f(x))/sum(f(x))`，
+   **跟自己的 clean 预测比而不是跟 GT 比**。
+
+   两个指标会给出**相反的排序**，必须一起报。halfsphere 上旧 loss 的
+   `dev_from_clean_rel` 是全表最高的 52.7，ATE 却只有 72.9%——它把轨迹推得极远
+   但 98.6% 是全局 Sim(3)。
+
+   *另一个可借鉴的报法（USENIX Adversary is on the Road）*：报绝对米数 + clean/
+   attacked 成对 + 涨幅百分比，并用道路宽度之类的物理量做安全性锚定
+   （"RMSE 超过 13 米，而道路宽度是…"），比纯比值更有说服力。
+
 8. **正则权重与 loss 量级耦合**
    `objective = -attack + reg`。正则梯度是常数（同一初始纹理下实测 1.15e-5），
    攻击梯度随 loss 量级变化，所以 `TV_WEIGHT` / `PRINTABILITY_WEIGHT=0.001`
@@ -155,8 +206,18 @@ clean 才 3.9%），在 halfsphere 上却接近上限。任何单序列得出的
    在 xyz 上不能。
 
    **做 loss ablation 前先量这个比值并按 loss 对齐正则权重**，否则比的是梯度尺度
-   不是目标函数。测量方法见本轮诊断（复刻一次训练迭代，分别对 attack 和 reg 求
-   `d/d texture`）。
+   不是目标函数。工具：`scripts/calibrate_attack_reg_balance.py`（复刻一次训练迭代，
+   分别对 attack 和 reg 求 `d/d texture`，给出把各 loss 拉到同一比值所需的权重）。
+   **比值逐序列不同，每个序列都要单独校准。**
+
+   校准的实际效果：pairwise 在 xyz 上 4.2%→14.8%，在 halfsphere 上升到 88.3%
+   （四个 loss 里最强）。**校准前后的排名完全不同**，这是本轮最重要的方法论结论。
+
+   *更好的方案（来自 3DGAA，未实现）*：不预先校准，而是训练中**动态归一化**权重——
+   `λ_adv = w_adv/(w_adv+w_shape+ε)`，`λ_shape = max(1-λ_adv, λ_min)`，两项损失各自
+   归一化，`λ_adv` 与攻击损失成反比，攻击变强时自动转向物理真实性，`λ_min` 取 0.4
+   防止塌向单一目标。这解决了本脚本的固有缺陷：它只在初始点匹配，而 aligned 的
+   loss 训练中涨了 40 倍，比值早就漂走了。
 
 9. **单元测试覆盖不到训练回路**
    `tests/test_pose_*.py` 在 float64、合成轨迹、脱离训练回路下验证 loss 数学，
@@ -164,14 +225,44 @@ clean 才 3.9%），在 halfsphere 上却接近上限。任何单序列得出的
    20 步冒烟并检查 `|g_attack|/|g_reg|` 与训练/测试一致性**，否则"测试全绿但训练
    不动"会重复发生。
 
+10. **单次运行的差异小于 ~7% 不算结论**
+    同一配置跑两遍，20 步内 loss 最大相对差 **7.045%**（GPU 非确定性内核逐步放大；
+    第 1 步三者完全一致，之后发散）。**任何小于这个量级的 loss 差异都读不出来，
+    必须先跑重复。** 已有的主结论都远在噪声之上（xyz 上 aligned 98.5% vs 旧 8.1%
+    是 12 倍），不受影响。
+
+    相关：判断"训练/测试差距"时不能只看百分比。sitting_static + aligned 曾报出
+    18.2% 的差距，但该 run 末 20 步 loss 的 std 是 1.254（均值 3.366），这个差距
+    只有 0.5 sigma，**是未收敛的震荡不是转移失败**。
+    `check_train_test_consistency.py` 现在同时报 `gap_sigma`，只在
+    「百分比 > 20% 且 > 2 sigma」时才告警。
+
+11. **EOT 只有光度是不够的**（问题 3 的补充，来自文献对照）
+    对比四篇物理攻击论文：ECCV'22 Optimal Adversarial Patches 做尺寸/旋转/亮度/
+    饱和度随机化，**粘贴位置按透视模型算**（远处更小、更靠近消失点），消融显示
+    EOT 让攻击性能 **+40.63%**；CVPR'24 3D²Fool 明说"EoT 不足以抵抗恶劣天气"，
+    额外加曝光/阴影（多项式模型 + 高斯模糊边界）和**基于深度图的雨雾噪声**；
+    π-Jack 用 EoT + 风格迁移；3DGAA 有独立的物理增强模块含深度软阴影。
+
+    **我们的 EOT 只有 brightness/contrast/gamma/noise，对单应 `H_t` 零扰动，
+    且全序列共享一个标量。** 注意反差：他们的 EOT 让攻击更强，我们的实测让
+    aligned 在 halfsphere 上损失 64% 的效果——因为纯光度且共享标量时，攻击可以
+    直接学去利用那个噪声。**补几何扰动（对 `H_t` 加扰动 + per-frame 独立采样）
+    是正解。**
+
 ## 工作约定
 
 - **改动要小而可验证。** 一次只改一个问题，不要顺手重构无关代码。
 - **不改评测语义。** 评测脚本只读不写；诊断需要新指标时新建脚本，不要改现有 eval。
 - **新 loss 必须配单元测试。** 尤其涉及 SE(3)/Sim(3) 的，测试要能验证不变性。
   数学测试不够，还要跑 20 步冒烟并检查 `|g_attack|/|g_reg|`，见已知问题 9。
-- **下一步不要再加 loss。** 当前瓶颈是评测协议不是目标函数：单序列、裸 ATE、
-  EOT 训练/测试差距、正则权重与 loss 量级耦合（问题 3/7/8）。先把协议固定下来
-  （多序列 + `ate_frac_of_ceiling` + 固定 EOT + 对齐正则比值），再重新评判 loss。
+- **标准评测协议**（做任何 loss 对比都按这个来，四条缺一不可）：
+  1. 至少三个序列：sitting_xyz、sitting_halfsphere、sitting_static（后者是退化对照）。
+     排除 walking_halfsphere（可见性 0.370）和 walking_xyz（有帧掉到 0.052）——
+     补丁遮挡太重，测的是遮挡不是攻击。
+  2. `PHYSICAL_EOT=0`，消除训练/测试差距这个混淆（几何 EOT 补上之前）。
+  3. **逐序列跑 `calibrate_attack_reg_balance.py`**，按输出设正则权重。
+  4. 同时报 `ate_frac_of_ceiling` 和 `dev_from_clean_rel`，两者排序可能相反。
+- **差异小于 ~7% 一律先跑重复再下结论**，见已知问题 10。
 - **旧 loss 全部保留**，作为论文 ablation 的对照行，不要删除或原地替换。
 - 长实验前先用 `ITERATIONS=20` 冒烟，确认能跑通再放长。

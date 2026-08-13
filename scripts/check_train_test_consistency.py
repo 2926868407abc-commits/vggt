@@ -123,14 +123,27 @@ def main() -> None:
 
         train_vals = [r["pose_loss"] for r in tail if "pose_loss" in r]
         train_loss = float(np.mean(train_vals)) if train_vals else float("nan")
+        train_std = float(np.std(train_vals)) if train_vals else float("nan")
         gap = (train_loss - float(final_loss)) / train_loss if train_loss else float("nan")
-        worst = max(worst, abs(gap)) if np.isfinite(gap) else worst
+        # A percentage gap on its own is not evidence: an unconverged run oscillates,
+        # and then any single comparison point differs from the tail mean by chance.
+        # Measured case: sitting_static + aligned_residual showed an 18.2% "gap" whose
+        # tail std was 1.254 on a mean of 3.366, i.e. the gap was 0.5 sigma -- pure
+        # noise -- while the eleven other runs had std <= 0.03. Only flag when the gap
+        # is both large in relative terms and large against the run's own spread.
+        gap_sigma = ((train_loss - float(final_loss)) / train_std
+                     if train_std and np.isfinite(train_std) and train_std > 0
+                     else float("nan"))
+        if np.isfinite(gap) and np.isfinite(gap_sigma) and abs(gap_sigma) > 2.0:
+            worst = max(worst, abs(gap))
 
         row = {
             "run": run_root.name, "seq": scene, "attack_loss": loss_name,
             "train_loss_mean_last20": train_loss,
+            "train_loss_std_last20": train_std,
             "final_loss_on_saved_prediction": float(final_loss),
             "relative_gap": gap,
+            "gap_sigma": gap_sigma,
             "train_trans": float(np.mean([r["pose_trans_mse"] for r in tail
                                           if "pose_trans_mse" in r])),
             "final_trans": terms["pose_trans_mse"],
@@ -141,11 +154,15 @@ def main() -> None:
         }
         rows.append(row)
         flag = ""
-        if np.isfinite(gap) and abs(gap) > 0.20:
+        if np.isfinite(gap) and abs(gap) > 0.20 and np.isfinite(gap_sigma) and abs(gap_sigma) > 2.0:
             flag = ("   <-- WARNING: the trained attack did not transfer to the evaluated "
                     "prediction; suspect EOT (try PHYSICAL_EOT=0)")
-        print(f"{scene}: {loss_name}  train={train_loss:.4f}  final={float(final_loss):.4f}  "
-              f"gap={gap*100:+.1f}%{flag}")
+        elif np.isfinite(gap) and abs(gap) > 0.20:
+            flag = (f"   (gap is only {abs(gap_sigma):.1f} sigma of this run's own tail "
+                    f"spread -- the optimisation has not converged, not a transfer failure)")
+        print(f"{scene}: {loss_name}  train={train_loss:.4f}+-{train_std:.4f}  "
+              f"final={float(final_loss):.4f}  gap={gap*100:+.1f}% ({gap_sigma:+.1f} sigma)"
+              f"{flag}")
         print(f"    trans {row['train_trans']:.4f} -> {row['final_trans']:.4f}   "
               f"rot {row['train_rot']:.4f} -> {row['final_rot']:.4f}   "
               f"physical_eot={row['physical_eot']}")

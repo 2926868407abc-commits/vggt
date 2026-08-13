@@ -2868,6 +2868,15 @@ def train_geometry_patch(
     dtype: torch.dtype,
     output_dir: Path,
 ) -> tuple[torch.Tensor, dict]:
+    # Only the texture is optimised, but the model's 1.257B parameters still carry
+    # requires_grad=True by default, so every backward also computes and stores
+    # gradients for them (4.68 GiB in fp32) and autograd keeps the activations those
+    # gradients need. Freezing removes that without touching the texture's own
+    # gradient path. --no_freeze_model_parameters restores the old behaviour for A/B.
+    if getattr(args, "freeze_model_parameters", True):
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+
     rng = np.random.default_rng(args.seed)
     texture = initialize_texture(args, device, requires_grad=not args.freeze_texture)
     optimizer = None if args.freeze_texture else torch.optim.AdamW([texture], lr=args.patch_lr)
@@ -3313,6 +3322,15 @@ def parse_args() -> argparse.Namespace:
         "so a degenerate (near-static) sequence cannot blow the normalization up",
     )
     parser.add_argument("--activation_checkpoint", action="store_true")
+    parser.add_argument(
+        "--no_freeze_model_parameters",
+        dest="freeze_model_parameters",
+        action="store_false",
+        help="keep the VGGT parameters trainable during patch optimization (the old "
+        "behaviour). Only the texture is ever stepped, so this just costs memory and "
+        "time; kept for A/B comparison against runs made before the freeze.",
+    )
+    parser.set_defaults(freeze_model_parameters=True)
     parser.add_argument("--skip_existing_outputs", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=10)
