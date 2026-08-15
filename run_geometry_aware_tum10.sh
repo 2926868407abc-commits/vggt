@@ -40,6 +40,13 @@ POSE_DRIFT_Z_M="${POSE_DRIFT_Z_M:-0.0}"
 POSE_DRIFT_YAW_DEGREES="${POSE_DRIFT_YAW_DEGREES:-0.0}"
 POSE_TRANSLATION_SCALE="${POSE_TRANSLATION_SCALE:-2.0}"
 POSE_YAW_DEGREES="${POSE_YAW_DEGREES:-30.0}"
+PIECEWISE_GAUGE_FAMILY="${PIECEWISE_GAUGE_FAMILY:-}"
+PIECEWISE_GAUGE_MAGNITUDE="${PIECEWISE_GAUGE_MAGNITUDE:-1.0}"
+ORTHOGONAL_MODE_ORDER="${ORTHOGONAL_MODE_ORDER:-2}"
+ORTHOGONAL_MODE_AXIS="${ORTHOGONAL_MODE_AXIS:-0}"
+JOINT_POSE_WEIGHT="${JOINT_POSE_WEIGHT:-1.0}"
+JOINT_DEPTH_WEIGHT="${JOINT_DEPTH_WEIGHT:-1.0}"
+JOINT_POINT_WEIGHT="${JOINT_POINT_WEIGHT:-1.0}"
 POSE_ROTATION_WEIGHT="${POSE_ROTATION_WEIGHT:-1.0}"
 POSE_TRANSLATION_WEIGHT="${POSE_TRANSLATION_WEIGHT:-1.0}"
 SEED="${SEED:-0}"
@@ -245,6 +252,9 @@ fi
 if [[ "$FREEZE_MODEL_PARAMETERS" != "1" ]]; then
   geometry_args+=(--no_freeze_model_parameters)
 fi
+if [[ -n "$PIECEWISE_GAUGE_FAMILY" ]]; then
+  geometry_args+=(--piecewise_gauge_family "$PIECEWISE_GAUGE_FAMILY")
+fi
 texture_args=()
 if [[ -n "$TEXTURE_INIT_IMAGE" ]]; then
   texture_args+=(--texture_init_image "$TEXTURE_INIT_IMAGE")
@@ -274,6 +284,12 @@ fi
   --pose_drift_yaw_degrees "$POSE_DRIFT_YAW_DEGREES" \
   --pose_translation_scale "$POSE_TRANSLATION_SCALE" \
   --pose_yaw_degrees "$POSE_YAW_DEGREES" \
+  --piecewise_gauge_magnitude "$PIECEWISE_GAUGE_MAGNITUDE" \
+  --orthogonal_mode_order "$ORTHOGONAL_MODE_ORDER" \
+  --orthogonal_mode_axis "$ORTHOGONAL_MODE_AXIS" \
+  --joint_pose_weight "$JOINT_POSE_WEIGHT" \
+  --joint_depth_weight "$JOINT_DEPTH_WEIGHT" \
+  --joint_point_weight "$JOINT_POINT_WEIGHT" \
   --pose_rotation_weight "$POSE_ROTATION_WEIGHT" \
   --pose_translation_weight "$POSE_TRANSLATION_WEIGHT" \
   --plane_width "$PLANE_WIDTH" \

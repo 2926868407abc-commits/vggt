@@ -38,6 +38,7 @@ from PIL import Image, ImageDraw
 from torchvision.transforms.functional import to_pil_image
 
 from attack_vggt_new1 import (
+    autocast_context,
     detach_predictions,
     extract_features,
     feature_l1_loss,
@@ -2559,6 +2560,308 @@ def pose_aligned_residual_mse(
     }
 
 
+def sim3_action_basis(positions: np.ndarray) -> np.ndarray:
+    """The 7 displacement directions one Sim(3) can produce, as (7, 3N).
+
+    Three translations, three rotations about the centroid, one scale. Any target
+    displacement lying inside this span is erased by the evaluator's alignment no
+    matter how large it is, which is why constant gauges score exactly zero.
+    """
+    cols = []
+    for k in range(3):
+        d = np.zeros_like(positions); d[:, k] = 1.0
+        cols.append(d.reshape(-1))
+    centred = positions - positions.mean(0)
+    for k in range(3):
+        axis = np.zeros(3); axis[k] = 1.0
+        cols.append(np.cross(axis[None, :], centred).reshape(-1))
+    cols.append(centred.reshape(-1))
+    return np.stack(cols)
+
+
+def orthogonal_mode_displacement(positions: np.ndarray, order: int, axis: int,
+                                 magnitude: float) -> np.ndarray:
+    """Low-frequency camera displacement with the Sim(3) span projected out.
+
+    The hand-built families saturate because raising their magnitude scales the
+    absorbed and surviving parts together, leaving the ratio fixed: trans_ramp
+    stops at 76% of the ATE ceiling and scale_sine never grows at all. Choosing the
+    direction instead of the size fixes that. Take a cosine profile over the frame
+    index, subtract its projection onto the seven Sim(3) directions, and what is
+    left cannot be absorbed at all.
+
+    Measured in scripts/diag_optimal_gauge.py: order 2 reaches 89-93% of ceiling on
+    all three sequences at a frame-to-frame jump of 0.30-0.37, against 68-76% for
+    the best hand-built family at a comparable jump. Higher orders are slightly
+    less absorbable but noticeably less smooth (order 5 jumps 0.69-0.77), and the
+    ATE saturates either way, so order 2 is the useful setting.
+    """
+    n = positions.shape[0]
+    basis = sim3_action_basis(positions)
+    q, _ = np.linalg.qr(basis.T)
+    profile = np.cos(np.pi * order * np.arange(n, dtype=np.float64) / max(n - 1, 1))
+    field = np.zeros((n, 3), dtype=np.float64)
+    field[:, axis] = profile
+    flat = field.reshape(-1)
+    perp = flat - q @ (q.T @ flat)
+    norm = float(np.linalg.norm(perp))
+    if norm < 1e-12:
+        raise ValueError(f"orthogonal mode order={order} axis={axis} is fully absorbed "
+                         "by Sim(3); pick a different order or axis")
+    delta = (perp / norm * math.sqrt(n)).reshape(n, 3)
+    radius = float(np.sqrt(((positions - positions.mean(0)) ** 2).sum(1).mean()))
+    return magnitude * radius * delta
+
+
+def piecewise_gauge_schedule(family: str, n: int, magnitude: float,
+                             positions: np.ndarray | None = None,
+                             order: int = 2, axis: int = 0
+                             ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-frame similarity (scale_i, yaw_i in degrees, translation_i).
+
+    A constant gauge is removed exactly by the evaluator's single Sim(3) fit and
+    scores zero ATE no matter how large it is -- verified up to 109x the scene
+    radius in scripts/diag_piecewise_gauge.py. Only a gauge that *varies* with the
+    frame leaves anything behind. These are the families measured there; the
+    schedules must stay in sync with that script or the targets stop matching the
+    feasibility numbers.
+    """
+    idx = np.arange(n, dtype=np.float64)
+    span = max(n - 1, 1)
+    ones, zeros = np.ones(n), np.zeros(n)
+    zero_t = np.zeros((n, 3))
+    unit = np.asarray([1.0, 1.0, 1.0]) / math.sqrt(3.0)
+
+    if family == "scale_ramp":
+        return 1.0 + magnitude * idx / span, zeros, zero_t
+    if family == "scale_sine":
+        return 1.0 + magnitude * np.sin(2 * math.pi * idx / span), zeros, zero_t
+    if family == "scale_split":
+        return np.where(idx < n // 2, 1.0, 1.0 + magnitude), zeros, zero_t
+    if family == "yaw_ramp":
+        return ones, 30.0 * magnitude * idx / span, zero_t
+    if family == "yaw_sine":
+        return ones, 30.0 * magnitude * np.sin(2 * math.pi * idx / span), zero_t
+    if family == "trans_ramp":
+        return ones, zeros, np.outer(magnitude * idx / span, unit)
+    if family == "trans_sine":
+        return ones, zeros, np.outer(magnitude * np.sin(2 * math.pi * idx / span), unit)
+    if family == "orthogonal_mode":
+        if positions is None:
+            raise ValueError("orthogonal_mode needs the trajectory positions")
+        # A pure per-frame translation, so the joint-head derivation still holds:
+        # pose shifts by delta_i, depth is unchanged, the point cloud shifts with it.
+        return ones, zeros, orthogonal_mode_displacement(positions, order, axis, magnitude)
+    raise ValueError(f"Unknown piecewise gauge family: {family}")
+
+
+def apply_piecewise_gauge(c2w: np.ndarray, family: str, magnitude: float,
+                          order: int = 2, axis: int = 0) -> np.ndarray:
+    """Act on a camera-to-world trajectory with a per-frame similarity.
+
+    Applied in the world frame, matching scripts/diag_piecewise_gauge.py. Applying
+    it after first-frame normalisation instead would be a different target, because
+    a per-frame gauge does not commute with the change of reference frame.
+    """
+    scales, yaws, trans = piecewise_gauge_schedule(
+        family, c2w.shape[0], magnitude, positions=c2w[:, :3, 3], order=order, axis=axis)
+    out = np.array(c2w, dtype=np.float64, copy=True)
+    for i in range(c2w.shape[0]):
+        rot = quat_xyzw_to_rot(0.0, math.sin(math.radians(yaws[i]) / 2.0), 0.0,
+                               math.cos(math.radians(yaws[i]) / 2.0))
+        out[i, :3, :3] = rot @ c2w[i, :3, :3]
+        out[i, :3, 3] = scales[i] * (rot @ c2w[i, :3, 3]) + trans[i]
+    return out
+
+
+def build_joint_gauge_targets(
+    seq_name: str,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict[str, torch.Tensor] | None:
+    """One per-frame gauge, expressed as a target for every geometry head.
+
+    Applying g_i: X -> s_i R_i X + t_i to the world as frame i sees it moves each
+    head in a determined way. A world point at camera-frame depth d appears at
+    T_i'^-1 g_i(X) = s_i (R_i^c)^T (X - p_i), i.e. the camera-frame coordinates
+    scale by s_i and nothing else changes, so
+
+        pose_i  -> g_i . T_i          depth_i -> s_i . d_i
+        point_i -> g_i(P_i)
+
+    These are built from the *clean prediction*, not from ground truth, so that the
+    three targets inherit the model's own head agreement rather than introducing a
+    fresh inconsistency: the clean prediction already disagrees between depth and
+    point heads by ~0.9% of the scene radius, and g_i carries that along scaled by
+    s_i while the radius scales the same way. Verified: the relative disagreement
+    of the target is 0.50-0.99x the clean value across families and magnitudes, so
+    an attack that lands on this target is no more detectable by a cross-head check
+    than the clean output is.
+    """
+    if not args.clean_vggt_output_root or not args.piecewise_gauge_family:
+        return None
+    npz_path = Path(args.clean_vggt_output_root) / seq_name / "vggt_outputs.npz"
+    if not npz_path.exists():
+        return None
+    with np.load(npz_path) as data:
+        if not {"extrinsic", "depth", "point_map"} <= set(data.files):
+            return None
+        clean_c2w = extrinsics_to_c2w(np.asarray(data["extrinsic"]))
+        clean_depth = np.asarray(data["depth"], dtype=np.float64)
+        clean_points = np.asarray(data["point_map"], dtype=np.float64)
+    if clean_depth.ndim == 4 and clean_depth.shape[-1] == 1:
+        clean_depth = clean_depth[..., 0]
+
+    n = clean_c2w.shape[0]
+    scales, yaws, trans = piecewise_gauge_schedule(
+        args.piecewise_gauge_family, n, args.piecewise_gauge_magnitude,
+        positions=clean_c2w[:, :3, 3],
+        order=args.orthogonal_mode_order, axis=args.orthogonal_mode_axis)
+
+    pose_t = np.array(clean_c2w, dtype=np.float64, copy=True)
+    depth_t = np.array(clean_depth, dtype=np.float64, copy=True)
+    points_t = np.array(clean_points, dtype=np.float64, copy=True)
+    for i in range(n):
+        rot = quat_xyzw_to_rot(0.0, math.sin(math.radians(yaws[i]) / 2.0), 0.0,
+                               math.cos(math.radians(yaws[i]) / 2.0))
+        pose_t[i, :3, :3] = rot @ clean_c2w[i, :3, :3]
+        pose_t[i, :3, 3] = scales[i] * (rot @ clean_c2w[i, :3, 3]) + trans[i]
+        depth_t[i] = scales[i] * clean_depth[i]
+        points_t[i] = scales[i] * (clean_points[i] @ rot.T) + trans[i]
+
+    return {
+        "pose_rel": c2w_numpy_to_relative_tensor(pose_t, device),
+        "depth": torch.from_numpy(depth_t).to(device=device, dtype=torch.float32),
+        "points": torch.from_numpy(points_t).to(device=device, dtype=torch.float32),
+    }
+
+
+def scale_invariant_depth_loss(pred: torch.Tensor, target: torch.Tensor,
+                               eps: float = 1e-6) -> torch.Tensor:
+    """Depth distance that ignores one global scale, because the evaluator does.
+
+    `utils/depth.py::depth_evaluation` fits a single scale (median or IRLS) before
+    scoring, so a uniform factor on the prediction is invisible to it and chasing
+    one would be the same wasted gradient the pose losses used to spend. Dividing
+    each side by its own median leaves only the per-frame pattern, which is what a
+    frame-varying gauge actually asks for.
+    """
+    pred_med = pred.detach().flatten().median().clamp_min(eps)
+    tgt_med = target.flatten().median().clamp_min(eps)
+    p = pred / pred_med
+    t = target / tgt_med
+    return ((p - t).abs() / t.clamp_min(eps)).mean()
+
+
+def aligned_point_residual(pred: torch.Tensor, target: torch.Tensor,
+                           stride: int = 4, eps: float = 1e-6) -> torch.Tensor:
+    """Point-map distance measured after the Sim(3) that mv_recon's eval would fit.
+
+    `mv_recon/eval.py` runs Umeyama then ICP before computing Acc/Comp, so the
+    global placement of the point cloud is not part of the score. Aligning here
+    first means the loss only sees the part of the disagreement that survives.
+    Sub-sampled because the full map is 2M points per sequence.
+    """
+    p = pred.reshape(-1, 3)[::stride]
+    t = target.reshape(-1, 3)[::stride]
+    ok = torch.isfinite(p).all(-1) & torch.isfinite(t).all(-1)
+    p, t = p[ok], t[ok]
+    if p.shape[0] < 16:
+        return pred.new_zeros(())
+    with torch.no_grad():
+        scale, rot, trans = umeyama_sim3_torch(p, t, eps)
+    aligned = scale * (p @ rot.transpose(-1, -2)) + trans
+    radius = (t - t.mean(0, keepdim=True)).pow(2).sum(-1).mean().clamp_min(eps * eps).sqrt()
+    return (aligned - t).pow(2).sum(-1).mean().clamp_min(0.0).sqrt() / radius
+
+
+def forward_all_geometry_heads(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """Camera, depth and point heads in one pass, with the two DPT heads checkpointed.
+
+    Running the whole model the way forward_vggt does needs more memory than the
+    camera-only path and overflows a 46 GiB card at 10 frames: the DPT decoders keep
+    full-resolution activations for both depth and point maps on top of the
+    aggregator's. Checkpointing recomputes those two heads during the backward pass
+    instead of storing them, which is numerically identical and brings the peak back
+    under the card. The aggregator itself is shared and runs once either way.
+    """
+    images_b = images if images.ndim == 5 else images[None]
+    # The aggregator's own activations are the bulk of the cost -- the camera-only
+    # path already sits near 32 GiB with them -- so checkpointing only the two DPT
+    # heads is not enough and still overflows. Checkpointing the aggregator as well
+    # trades one recomputation in the backward pass for the memory, and
+    # patch_start_idx is a fixed model attribute (1 + num_register_tokens) rather
+    # than something the forward discovers, so nothing is lost by dropping it from
+    # the checkpointed return.
+    patch_start_idx = model.aggregator.patch_start_idx
+
+    def run_aggregator(imgs):
+        with autocast_context(imgs.device, dtype):
+            tokens_list, _ = model.aggregator(imgs)
+        return tuple(tokens_list)
+
+    tokens = list(torch.utils.checkpoint.checkpoint(
+        run_aggregator, images_b, use_reentrant=False))
+
+    out: dict[str, torch.Tensor] = {}
+    with torch.cuda.amp.autocast(enabled=False):
+        out["pose_enc"] = model.camera_head(tokens)[-1]
+
+        def run_head(head):
+            def fn(*tensors):
+                return head(list(tensors), images=images_b, patch_start_idx=patch_start_idx)
+            return torch.utils.checkpoint.checkpoint(fn, *tokens, use_reentrant=False)
+
+        depth, depth_conf = run_head(model.depth_head)
+        out["depth"], out["depth_conf"] = depth, depth_conf
+        points, points_conf = run_head(model.point_head)
+        out["world_points"], out["world_points_conf"] = points, points_conf
+    return out
+
+
+def geometry_joint_gauge_loss(
+    preds: dict,
+    item: dict,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Push pose, depth and point map at one per-frame gauge target together."""
+    targets = item.get("joint_gauge_targets")
+    if targets is None:
+        raise RuntimeError("geometry_joint_gauge_targeted needs --piecewise_gauge_family "
+                           "and --clean_vggt_output_root")
+    pred_rel = pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
+    pose_loss, pose_terms = pose_aligned_residual_mse(pred_rel, targets["pose_rel"], args)
+
+    depth_pred = preds["depth"]
+    if depth_pred.ndim == 5:
+        depth_pred = depth_pred[0]
+    if depth_pred.shape[-1] == 1:
+        depth_pred = depth_pred[..., 0]
+    depth_loss = scale_invariant_depth_loss(depth_pred.float(), targets["depth"])
+
+    points_pred = preds["world_points"]
+    if points_pred.ndim == 5:
+        points_pred = points_pred[0]
+    point_loss = aligned_point_residual(points_pred.float(), targets["points"],
+                                        args.joint_point_stride)
+
+    total = (args.joint_pose_weight * pose_loss
+             + args.joint_depth_weight * depth_loss
+             + args.joint_point_weight * point_loss)
+    return total, {
+        "pose_loss": float(total.detach().cpu()),
+        "joint_pose_term": float(pose_loss.detach().cpu()),
+        "joint_depth_term": float(depth_loss.detach().cpu()),
+        "joint_point_term": float(point_loss.detach().cpu()),
+        "pose_rot_mse": pose_terms["pose_rot_mse"],
+        "pose_trans_mse": pose_terms["pose_trans_mse"],
+    }
+
+
 def should_cache_clean_pose(args: argparse.Namespace) -> bool:
     return args.attack_loss == "pose_clean_untargeted" or (
         args.attack_loss == "pose_reverse_targeted" and args.pose_reverse_reference == "clean"
@@ -2605,6 +2908,29 @@ def attack_objective_loss(
         loss, terms = pose_scale_invariant_mse(pred_rel, target_rel, args)
         terms["pose_reference"] = "gt"
         return loss, terms, True
+
+    if args.attack_loss == "geometry_joint_gauge_targeted":
+        # Needs every geometry head, not just the camera.
+        preds = forward_all_geometry_heads(model, adv_images, dtype)
+        loss, terms = geometry_joint_gauge_loss(preds, item, args)
+        terms["pose_reference"] = "piecewise_gauge_clean"
+        terms["piecewise_gauge_family"] = args.piecewise_gauge_family
+        terms["piecewise_gauge_magnitude"] = args.piecewise_gauge_magnitude
+        return loss, terms, False
+
+    if args.attack_loss == "pose_piecewise_gauge_targeted":
+        target_rel = item.get("pose_piecewise_rel")
+        if target_rel is None:
+            raise RuntimeError("pose_piecewise_gauge_targeted needs --piecewise_gauge_family")
+        # Scored through the aligned residual, i.e. the evaluator's own Sim(3) fit,
+        # so the objective is "match this target up to the gauge the metric removes"
+        # rather than "match it exactly in an arbitrary frame". Minimised, not
+        # maximised: this is a targeted attack.
+        loss, terms = pose_aligned_residual_mse(pred_rel, target_rel, args)
+        terms["pose_reference"] = "piecewise_gauge_gt"
+        terms["piecewise_gauge_family"] = args.piecewise_gauge_family
+        terms["piecewise_gauge_magnitude"] = args.piecewise_gauge_magnitude
+        return loss, terms, False
 
     if args.attack_loss == "pose_pairwise_relative_mse":
         target_rel = item["pose_gt_rel"]
@@ -2660,6 +2986,13 @@ def load_tum_sequence(
     gt_c2w = tum_rows_to_c2w(read_tum_rows(seq_dir / gt_name), frame_indices)
     c2w = gt_c2w.copy()
     pose_gt_rel = c2w_numpy_to_relative_tensor(gt_c2w, device)
+    # Built here rather than in the loss because the per-frame gauge acts in the
+    # world frame, and only the absolute GT trajectory is available at this point.
+    pose_piecewise_rel = c2w_numpy_to_relative_tensor(
+        apply_piecewise_gauge(gt_c2w, args.piecewise_gauge_family,
+                              args.piecewise_gauge_magnitude),
+        device,
+    ) if getattr(args, "piecewise_gauge_family", None) else None
     local_intrinsics = intrinsics
     old_vggt_points = getattr(args, "_active_vggt_points", None)
     old_vggt_point_map_grid = getattr(args, "_active_vggt_point_map_grid", None)
@@ -2729,6 +3062,9 @@ def load_tum_sequence(
         "c2w_gt": gt_c2w,
         "c2w_geometry": c2w,
         "pose_gt_rel": pose_gt_rel,
+        "pose_piecewise_rel": pose_piecewise_rel,
+        "joint_gauge_targets": build_joint_gauge_targets(seq_dir.name, args, device)
+        if args.attack_loss == "geometry_joint_gauge_targeted" else None,
         "pose_clean_rel": clean_pose_rel,
         "geometry_intrinsics": np.asarray(local_intrinsics).astype(float).tolist(),
         "geometry_source": geom_meta.get("geometry_source", "tum_gt_geometry"),
@@ -3285,6 +3621,8 @@ def parse_args() -> argparse.Namespace:
             "pose_scale_invariant_mse",
             "pose_pairwise_relative_mse",
             "pose_aligned_residual_mse",
+            "pose_piecewise_gauge_targeted",
+            "geometry_joint_gauge_targeted",
             "pose_clean_untargeted",
             "pose_reverse_targeted",
             "pose_drift_targeted",
@@ -3314,6 +3652,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose_yaw_degrees", type=float, default=30.0)
     parser.add_argument("--pose_rotation_weight", type=float, default=1.0)
     parser.add_argument("--pose_translation_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--piecewise_gauge_family",
+        default=None,
+        choices=("scale_ramp", "scale_sine", "scale_split", "yaw_ramp", "yaw_sine",
+                 "trans_ramp", "trans_sine", "orthogonal_mode"),
+        help="per-frame gauge used to build the target for pose_piecewise_gauge_targeted. "
+        "A constant gauge is removed exactly by the evaluator, so only frame-varying "
+        "ones leave measurable error; see scripts/diag_piecewise_gauge.py for what each "
+        "family is worth. scale_sine is the most consistent across sequences "
+        "(68-87% of the ATE ceiling) at a frame-to-frame jump of 0.35 versus 1.0 for a "
+        "hard split.",
+    )
+    parser.add_argument("--piecewise_gauge_magnitude", type=float, default=1.0)
+    parser.add_argument("--orthogonal_mode_order", type=int, default=2,
+                        help="cosine order for --piecewise_gauge_family orthogonal_mode. "
+                             "Order 2 is the sweet spot: 89-93%% of the ATE ceiling at a "
+                             "jump of 0.30-0.37, while order 5 buys almost nothing in ATE "
+                             "and jumps 0.69-0.77")
+    parser.add_argument("--orthogonal_mode_axis", type=int, default=0, choices=(0, 1, 2),
+                        help="which world axis the displacement runs along; the best "
+                             "choice is sequence dependent (x for sitting_xyz, y for "
+                             "halfsphere and static)")
+    parser.add_argument("--joint_pose_weight", type=float, default=1.0)
+    parser.add_argument("--joint_depth_weight", type=float, default=1.0)
+    parser.add_argument("--joint_point_weight", type=float, default=1.0)
+    parser.add_argument("--joint_point_stride", type=int, default=4,
+                        help="sub-sampling for the point-map term; the full map is 2M "
+                             "points per sequence")
     parser.add_argument(
         "--pose_scale_invariant_eps",
         type=float,
