@@ -136,6 +136,8 @@ def composite_patch(
     alpha: float,
     label: str,
     visibility_mask: np.ndarray | None = None,
+    draw_outline: bool = True,
+    draw_text_label: bool = True,
 ) -> Image.Image:
     out = base.convert("RGBA")
     warped, quad_mask = warp_texture_to_quad(texture, quad, out.size)
@@ -147,13 +149,14 @@ def composite_patch(
             mode="L",
         )
     out = Image.composite(warped, out, alpha_mask(mask, alpha))
-    if visibility_mask is not None:
+    if draw_outline and visibility_mask is not None:
         out = draw_visible_mask_outline(out, mask, outline_width=2)
-    else:
+    elif draw_outline:
         draw = ImageDraw.Draw(out)
         points = [tuple(map(float, p)) for p in quad.tolist()]
         draw.line(points + [points[0]], fill=(255, 40, 40, 255), width=3)
-    draw_label(out, label)
+    if draw_text_label:
+        draw_label(out, label)
     return out.convert("RGB")
 
 
@@ -226,6 +229,9 @@ def visualize_sequence(
     contact_columns: int,
     thumb_width: int,
     contact_sheet_only: bool,
+    draw_outline: bool,
+    draw_text_label: bool,
+    save_outline_frames: bool,
 ) -> int:
     summary_path = seq_dir / "attack_summary.json"
     with summary_path.open("r", encoding="utf-8") as f:
@@ -248,7 +254,8 @@ def visualize_sequence(
     seq_out.mkdir(parents=True, exist_ok=True)
     if not contact_sheet_only:
         overlay_dir.mkdir(parents=True, exist_ok=True)
-        outline_dir.mkdir(parents=True, exist_ok=True)
+        if save_outline_frames:
+            outline_dir.mkdir(parents=True, exist_ok=True)
 
     sheet_images = []
     for i in selected:
@@ -257,12 +264,22 @@ def visualize_sequence(
         label = f"{seq_dir.name} | frame={frame_indices[i]} | cov={coverages[i]:.4f}"
 
         visibility_mask = masks[i] if masks is not None else None
-        over = composite_patch(base, texture, quad, alpha, label, visibility_mask)
+        over = composite_patch(
+            base,
+            texture,
+            quad,
+            alpha,
+            label,
+            visibility_mask,
+            draw_outline=draw_outline,
+            draw_text_label=draw_text_label,
+        )
         if not contact_sheet_only:
-            outline = outline_only(base, quad, label, visibility_mask)
             stem = f"{i:02d}_frame_{int(frame_indices[i]):06d}"
             over.save(overlay_dir / f"{stem}_patch.png")
-            outline.save(outline_dir / f"{stem}_outline.png")
+            if save_outline_frames:
+                outline = outline_only(base, quad, label, visibility_mask)
+                outline.save(outline_dir / f"{stem}_outline.png")
         sheet_images.append(over)
 
     sheet = contact_sheet(sheet_images, contact_columns, thumb_width)
@@ -288,6 +305,9 @@ def main() -> None:
     parser.add_argument("--contact_columns", type=int, default=5)
     parser.add_argument("--thumb_width", type=int, default=260)
     parser.add_argument("--contact_sheet_only", action="store_true")
+    parser.add_argument("--no_outline", action="store_true", help="Do not draw red patch/debug outlines on composited images.")
+    parser.add_argument("--no_label", action="store_true", help="Do not draw the black text label on composited images.")
+    parser.add_argument("--no_outline_frames", action="store_true", help="Do not save separate outline-only debug frames.")
     parser.add_argument(
         "--texture_path",
         default=None,
@@ -322,6 +342,9 @@ def main() -> None:
             args.contact_columns,
             args.thumb_width,
             args.contact_sheet_only,
+            not args.no_outline,
+            not args.no_label,
+            not args.no_outline_frames,
         )
         total += count
         print(f"[visualized] {seq_dir.name}: {count} frame(s)")

@@ -47,6 +47,27 @@ ORTHOGONAL_MODE_AXIS="${ORTHOGONAL_MODE_AXIS:-0}"
 JOINT_POSE_WEIGHT="${JOINT_POSE_WEIGHT:-1.0}"
 JOINT_DEPTH_WEIGHT="${JOINT_DEPTH_WEIGHT:-1.0}"
 JOINT_POINT_WEIGHT="${JOINT_POINT_WEIGHT:-1.0}"
+JOINT_DEPTH_CONF_WEIGHT="${JOINT_DEPTH_CONF_WEIGHT:-0.0}"
+JOINT_POINT_CONF_WEIGHT="${JOINT_POINT_CONF_WEIGHT:-0.0}"
+JOINT_TRACK_WEIGHT="${JOINT_TRACK_WEIGHT:-0.0}"
+JOINT_TRACK_GRID_ROWS="${JOINT_TRACK_GRID_ROWS:-6}"
+JOINT_TRACK_GRID_COLS="${JOINT_TRACK_GRID_COLS:-8}"
+JOINT_TRACK_QUERY_MARGIN="${JOINT_TRACK_QUERY_MARGIN:-0.10}"
+JOINT_TRACK_ITERS="${JOINT_TRACK_ITERS:-2}"
+JOINT_TRACK_MIN_VISIBILITY="${JOINT_TRACK_MIN_VISIBILITY:-0.20}"
+JOINT_TRACK_VISIBILITY_WEIGHT="${JOINT_TRACK_VISIBILITY_WEIGHT:-0.10}"
+JOINT_TRACK_CONFIDENCE_WEIGHT="${JOINT_TRACK_CONFIDENCE_WEIGHT:-0.10}"
+FILTER_BUDGET_JSON="${FILTER_BUDGET_JSON:-$VGGT_ROOT/configs/tum10_filter_budgets.json}"
+FILTER_BUDGET_FRACTION="${FILTER_BUDGET_FRACTION:-0.80}"
+BUDGET_CONSTRAINTS="${BUDGET_CONSTRAINTS:-conf_std,conf_frac_floor,head_disagree_rel,reproj_rel_err,track}"
+BUDGET_POSE_OBJECTIVE="${BUDGET_POSE_OBJECTIVE:-untargeted_gt}"
+BUDGET_DUAL_INIT="${BUDGET_DUAL_INIT:-0.0}"
+BUDGET_DUAL_LR="${BUDGET_DUAL_LR:-1.0}"
+BUDGET_DUAL_MAX="${BUDGET_DUAL_MAX:-100.0}"
+BUDGET_RHO="${BUDGET_RHO:-1.0}"
+BUDGET_CONF_FLOOR_TEMPERATURE="${BUDGET_CONF_FLOOR_TEMPERATURE:-0.02}"
+BUDGET_REPROJ_STRIDE="${BUDGET_REPROJ_STRIDE:-8}"
+BUDGET_TRACK_PIXELS="${BUDGET_TRACK_PIXELS:-2.0}"
 POSE_ROTATION_WEIGHT="${POSE_ROTATION_WEIGHT:-1.0}"
 POSE_TRANSLATION_WEIGHT="${POSE_TRANSLATION_WEIGHT:-1.0}"
 SEED="${SEED:-0}"
@@ -119,6 +140,11 @@ EOT_BRIGHTNESS="${EOT_BRIGHTNESS:-0.15}"
 EOT_CONTRAST="${EOT_CONTRAST:-0.15}"
 EOT_GAMMA="${EOT_GAMMA:-0.10}"
 EOT_NOISE_STD="${EOT_NOISE_STD:-0.01}"
+EOT_WARMUP_FRACTION="${EOT_WARMUP_FRACTION:-0.25}"
+EOT_GEO_TRANSLATE="${EOT_GEO_TRANSLATE:-0.02}"
+EOT_GEO_SCALE="${EOT_GEO_SCALE:-0.03}"
+EOT_GEO_ROTATE_DEGREES="${EOT_GEO_ROTATE_DEGREES:-2.0}"
+EOT_GEO_PERSPECTIVE="${EOT_GEO_PERSPECTIVE:-0.01}"
 TV_WEIGHT="${TV_WEIGHT:-0.0}"
 PRINTABILITY_WEIGHT="${PRINTABILITY_WEIGHT:-0.0}"
 PRINTABLE_COLOR_LEVELS="${PRINTABLE_COLOR_LEVELS:-8}"
@@ -164,6 +190,7 @@ echo "texture_size=$TEXTURE_SIZE texture_init=$TEXTURE_INIT freeze_texture=$FREE
 echo "texture_init_image=$TEXTURE_INIT_IMAGE"
 echo "activation_checkpoint=$ACTIVATION_CHECKPOINT"
 echo "attack_loss=$ATTACK_LOSS pose_reverse_reference=$POSE_REVERSE_REFERENCE pose_weights=(rot:$POSE_ROTATION_WEIGHT,trans:$POSE_TRANSLATION_WEIGHT)"
+echo "filter_budget json=$FILTER_BUDGET_JSON fraction=$FILTER_BUDGET_FRACTION constraints=$BUDGET_CONSTRAINTS pose_objective=$BUDGET_POSE_OBJECTIVE"
 echo "pose_bad_reference=$POSE_BAD_REFERENCE drift=($POSE_DRIFT_X_M,$POSE_DRIFT_Y_M,$POSE_DRIFT_Z_M)m drift_yaw=$POSE_DRIFT_YAW_DEGREES scale=$POSE_TRANSLATION_SCALE yaw=$POSE_YAW_DEGREES"
 echo "plane_width=$PLANE_WIDTH plane_height=$PLANE_HEIGHT plane_distance=$PLANE_DISTANCE"
 echo "plane_center=($PLANE_CENTER_X,$PLANE_CENTER_Y)"
@@ -178,7 +205,8 @@ echo "surface_orientation_filter=$SURFACE_ORIENTATION_FILTER max_tilt=$SURFACE_M
 echo "surface_support_check=$SURFACE_SUPPORT_CHECK abs_tol=$SURFACE_SUPPORT_ABS_TOLERANCE rel_tol=$SURFACE_SUPPORT_REL_TOLERANCE min_support=$SURFACE_MIN_SUPPORT_RATIO"
 echo "surface_strength_search=$SURFACE_STRENGTH_SEARCH candidates=$SURFACE_STRENGTH_CANDIDATES steps=$SURFACE_STRENGTH_STEPS strength_lr=$SURFACE_STRENGTH_LR"
 echo "natural_auto_relax=$NATURAL_AUTO_RELAX max_coverage=$NATURAL_RELAX_MAX_COVERAGE min_visible_frames=$NATURAL_RELAX_MIN_VISIBLE_FRAMES min_visibility=$NATURAL_RELAX_MIN_VISIBILITY_RATIO orientation=$NATURAL_RELAX_ORIENTATION_FILTER"
-echo "physical_eot=$PHYSICAL_EOT print=[$PRINT_MIN,$PRINT_MAX] brightness=$EOT_BRIGHTNESS contrast=$EOT_CONTRAST gamma=$EOT_GAMMA noise_std=$EOT_NOISE_STD"
+echo "physical_eot=$PHYSICAL_EOT print=[$PRINT_MIN,$PRINT_MAX] brightness=$EOT_BRIGHTNESS contrast=$EOT_CONTRAST gamma=$EOT_GAMMA noise_std=$EOT_NOISE_STD warmup_fraction=$EOT_WARMUP_FRACTION"
+echo "eot_geo translate=$EOT_GEO_TRANSLATE scale=$EOT_GEO_SCALE rotate=$EOT_GEO_ROTATE_DEGREES perspective=$EOT_GEO_PERSPECTIVE"
 echo "regularization tv=$TV_WEIGHT printability=$PRINTABILITY_WEIGHT levels=$PRINTABLE_COLOR_LEVELS low_frequency=$LOW_FREQUENCY_WEIGHT kernel=$LOW_FREQUENCY_KERNEL"
 echo "natural_reference image=$NATURAL_REFERENCE_IMAGE weight=$NATURAL_REFERENCE_WEIGHT"
 echo "run_eval=$RUN_EVAL run_gauge_diag=$RUN_GAUGE_DIAG run_consistency_check=$RUN_CONSISTENCY_CHECK"
@@ -290,6 +318,27 @@ fi
   --joint_pose_weight "$JOINT_POSE_WEIGHT" \
   --joint_depth_weight "$JOINT_DEPTH_WEIGHT" \
   --joint_point_weight "$JOINT_POINT_WEIGHT" \
+  --joint_depth_conf_weight "$JOINT_DEPTH_CONF_WEIGHT" \
+  --joint_point_conf_weight "$JOINT_POINT_CONF_WEIGHT" \
+  --joint_track_weight "$JOINT_TRACK_WEIGHT" \
+  --joint_track_grid_rows "$JOINT_TRACK_GRID_ROWS" \
+  --joint_track_grid_cols "$JOINT_TRACK_GRID_COLS" \
+  --joint_track_query_margin "$JOINT_TRACK_QUERY_MARGIN" \
+  --joint_track_iters "$JOINT_TRACK_ITERS" \
+  --joint_track_min_visibility "$JOINT_TRACK_MIN_VISIBILITY" \
+  --joint_track_visibility_weight "$JOINT_TRACK_VISIBILITY_WEIGHT" \
+  --joint_track_confidence_weight "$JOINT_TRACK_CONFIDENCE_WEIGHT" \
+  --filter_budget_json "$FILTER_BUDGET_JSON" \
+  --filter_budget_fraction "$FILTER_BUDGET_FRACTION" \
+  --budget_constraints "$BUDGET_CONSTRAINTS" \
+  --budget_pose_objective "$BUDGET_POSE_OBJECTIVE" \
+  --budget_dual_init "$BUDGET_DUAL_INIT" \
+  --budget_dual_lr "$BUDGET_DUAL_LR" \
+  --budget_dual_max "$BUDGET_DUAL_MAX" \
+  --budget_rho "$BUDGET_RHO" \
+  --budget_conf_floor_temperature "$BUDGET_CONF_FLOOR_TEMPERATURE" \
+  --budget_reproj_stride "$BUDGET_REPROJ_STRIDE" \
+  --budget_track_pixels "$BUDGET_TRACK_PIXELS" \
   --pose_rotation_weight "$POSE_ROTATION_WEIGHT" \
   --pose_translation_weight "$POSE_TRANSLATION_WEIGHT" \
   --plane_width "$PLANE_WIDTH" \
@@ -353,6 +402,11 @@ fi
   --eot_contrast "$EOT_CONTRAST" \
   --eot_gamma "$EOT_GAMMA" \
   --eot_noise_std "$EOT_NOISE_STD" \
+  --eot_warmup_fraction "$EOT_WARMUP_FRACTION" \
+  --eot_geo_translate "$EOT_GEO_TRANSLATE" \
+  --eot_geo_scale "$EOT_GEO_SCALE" \
+  --eot_geo_rotate_degrees "$EOT_GEO_ROTATE_DEGREES" \
+  --eot_geo_perspective "$EOT_GEO_PERSPECTIVE" \
   --tv_weight "$TV_WEIGHT" \
   --printability_weight "$PRINTABILITY_WEIGHT" \
   --printable_color_levels "$PRINTABLE_COLOR_LEVELS" \

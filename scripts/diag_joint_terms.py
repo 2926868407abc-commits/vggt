@@ -1,4 +1,4 @@
-"""Are the three joint-loss terms on comparable scales, or is one drowning the others?
+"""Are the four joint-loss terms on comparable scales, or is one drowning the others?
 
 Q4 produced near-zero ATE (3.7% and 5.3%, against clean baselines of 3.9% and
 3.2%) while the consistency filters read cleaner than clean. That pattern says the
@@ -45,6 +45,9 @@ def build_args(scene: str, axis: int) -> argparse.Namespace:
         "--piecewise_gauge_magnitude", "3.0",
         "--orthogonal_mode_order", "2", "--orthogonal_mode_axis", str(axis),
         "--pose_rotation_weight", "5.0", "--pose_translation_weight", "1.0",
+        "--joint_depth_conf_weight", "1.0", "--joint_point_conf_weight", "1.0",
+        "--joint_track_weight", "1.0", "--joint_track_grid_rows", "4",
+        "--joint_track_grid_cols", "6", "--joint_track_iters", "2",
         "--plane_mode", "fused_depth_surface",
         "--plane_width", "0.30", "--plane_height", "0.20",
         "--clean_vggt_output_root",
@@ -108,7 +111,10 @@ def main() -> None:
     texture = A.initialize_texture(args, device, requires_grad=True)
     adv = A.apply_geometry_patch(item["images"], texture, item["grids"], item["masks"],
                                  args, training=True)
-    preds = A.forward_all_geometry_heads(model, adv, dtype)
+    track_target = item["joint_track_targets"]
+    preds = A.forward_all_geometry_heads(
+        model, adv, dtype, query_points=track_target["query_points"],
+        track_iters=args.joint_track_iters)
 
     pred_rel = A.pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
     pose_term, _ = A.pose_aligned_residual_mse(pred_rel, targets["pose_rel"], args)
@@ -126,21 +132,40 @@ def main() -> None:
     point_term = A.aligned_point_residual(ppred.float(), targets["points"],
                                           args.joint_point_stride)
 
+    depth_conf_term = A.confidence_preservation_loss(
+        A.dense_scalar_head(preds["depth_conf"]),
+        A.dense_scalar_head(targets["depth_conf"]))
+    point_conf_term = A.confidence_preservation_loss(
+        A.dense_scalar_head(preds["world_points_conf"]),
+        A.dense_scalar_head(targets["point_conf"]))
+
+    track_term, track_parts = A.track_consistency_loss(
+        preds["track"], track_target["track"], preds["track_vis"], track_target["vis"],
+        preds.get("track_conf"), track_target.get("conf"), item["tensor_hw"],
+        args.joint_track_min_visibility, args.joint_track_visibility_weight,
+        args.joint_track_confidence_weight)
+
     print(f"{'term':<10}{'value':>12}{'|grad|':>14}{'share of total grad':>22}")
     print("-" * 58)
     grads = {}
-    for name, term in (("pose", pose_term), ("depth", depth_term), ("point", point_term)):
+    terms = (("pose", pose_term), ("depth", depth_term), ("point", point_term),
+             ("depth_conf", depth_conf_term), ("point_conf", point_conf_term),
+             ("track", track_term))
+    for name, term in terms:
         g = torch.autograd.grad(term, texture, retain_graph=True)[0]
         grads[name] = float(g.norm())
     tot = sum(grads.values())
-    for name, term in (("pose", pose_term), ("depth", depth_term), ("point", point_term)):
+    for name, term in terms:
         print(f"{name:<10}{float(term):>12.6f}{grads[name]:>14.4e}"
               f"{grads[name]/tot*100:>21.1f}%")
+    print(f"  track pieces: coord={float(track_parts['track_coord']):.6g} "
+          f"vis={float(track_parts['track_vis']):.6g} "
+          f"conf={float(track_parts['track_conf']):.6g}")
 
     print(f"\nratios: pose/depth {grads['pose']/max(grads['depth'],1e-30):.3g}   "
           f"pose/point {grads['pose']/max(grads['point'],1e-30):.3g}")
-    print("\nWeights that would equalise the three gradients, relative to pose=1:")
-    for name in ("depth", "point"):
+    print("\nWeights that would equalise all gradients, relative to pose=1:")
+    for name in ("depth", "point", "depth_conf", "point_conf", "track"):
         print(f"  JOINT_{name.upper()}_WEIGHT = "
               f"{grads['pose']/max(grads[name],1e-30):.4g}")
 

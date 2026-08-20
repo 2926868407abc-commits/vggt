@@ -13,6 +13,9 @@ VIS_CONTACT_COLUMNS="${VIS_CONTACT_COLUMNS:-5}"
 VIS_THUMB_WIDTH="${VIS_THUMB_WIDTH:-260}"
 VIS_CONTACT_SHEET_ONLY="${VIS_CONTACT_SHEET_ONLY:-0}"
 VIS_TEXTURE_PATH="${VIS_TEXTURE_PATH:-}"
+VIS_NO_OUTLINE="${VIS_NO_OUTLINE:-0}"
+VIS_NO_LABEL="${VIS_NO_LABEL:-0}"
+VIS_NO_OUTLINE_FRAMES="${VIS_NO_OUTLINE_FRAMES:-0}"
 
 log() {
   printf '\n[%s] %s\n' "$(date '+%F %T')" "$*"
@@ -42,6 +45,9 @@ echo "out_dir=$VIS_OUT_DIR"
 echo "scene_pattern=$VIS_SCENE_PATTERN"
 echo "frames=$VIS_FRAMES"
 echo "contact_sheet_only=$VIS_CONTACT_SHEET_ONLY"
+echo "no_outline=$VIS_NO_OUTLINE"
+echo "no_label=$VIS_NO_LABEL"
+echo "no_outline_frames=$VIS_NO_OUTLINE_FRAMES"
 echo "texture_path=${VIS_TEXTURE_PATH:-$GEOMETRY_OUTPUT_ROOT/geometry_patch/geometry_patch_texture.png}"
 
 visualization_args=()
@@ -50,6 +56,15 @@ if [[ "$VIS_CONTACT_SHEET_ONLY" == "1" ]]; then
 fi
 if [[ -n "$VIS_TEXTURE_PATH" ]]; then
   visualization_args+=(--texture_path "$VIS_TEXTURE_PATH")
+fi
+if [[ "$VIS_NO_OUTLINE" == "1" ]]; then
+  visualization_args+=(--no_outline)
+fi
+if [[ "$VIS_NO_LABEL" == "1" ]]; then
+  visualization_args+=(--no_label)
+fi
+if [[ "$VIS_NO_OUTLINE_FRAMES" == "1" ]]; then
+  visualization_args+=(--no_outline_frames)
 fi
 
 "$VGGT_PY" "$VGGT_ROOT/scripts/visualize_tum10_geometry_patch.py" \

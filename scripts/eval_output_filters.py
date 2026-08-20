@@ -16,10 +16,13 @@ directly to its outputs, with no ground truth and no extra model:
                  with the predicted poses, and compare against frame j's own depth.
                  This is the check that a tracking front end effectively performs.
 
-Thresholds are calibrated on the clean run's own scenes rather than picked by
-hand, so "detected" means "outside the range this model produces when unattacked".
-The clean sequences also give the false-positive rate, which is the cost side of
-the question.
+Thresholds are calibrated against the *matching clean sequence*.  The old version
+pooled one scalar from eight very different TUM motions and applied mean +/- 3
+standard deviations globally.  That made ``conf_std``'s lower threshold negative,
+so that check could never fire, and let sequence identity dominate the threshold.
+Here each feature is measured per frame (or per adjacent pair for reprojection),
+and an attacked sequence is compared with the empirical clean distribution from
+the same sequence.  No ground truth or attacked sample is used for calibration.
 """
 
 from __future__ import annotations
@@ -50,24 +53,31 @@ def load(run: str, scene: str):
     return out
 
 
-def feat_conf(d) -> dict:
+def samples_conf(d, reference=None) -> dict[str, np.ndarray]:
     c = d["depth_conf"]
-    lo = c.min()
+    ref = c if reference is None else reference["depth_conf"]
+    # VGGT confidence has an exact activation floor.  Use the clean sequence's
+    # floor for both clean and attacked outputs; using each attack's own minimum
+    # would silently change the statistic being compared.
+    floor = float(ref.min()) + 1e-6
+    flat = c.reshape(c.shape[0], -1)
     return {
-        "conf_mean": float(c.mean()),
-        "conf_std": float(c.std()),
-        "conf_frac_floor": float((c <= lo + 1e-6).mean()),
+        "conf_std": flat.std(axis=1),
+        "conf_frac_floor": (flat <= floor).mean(axis=1),
     }
 
 
-def feat_head(d) -> dict:
+def samples_head(d) -> dict[str, np.ndarray]:
     diff = np.linalg.norm(d["point_map"] - d["point_cloud_unproj"], axis=-1)
-    flat = d["point_map"].reshape(-1, 3)
-    radius = float(np.sqrt(((flat - flat.mean(0)) ** 2).sum(1).mean()))
-    return {"head_disagree_rel": float(np.median(diff)) / radius if radius > 0 else float("nan")}
+    points = d["point_map"].reshape(d["point_map"].shape[0], -1, 3)
+    center = points.mean(axis=1, keepdims=True)
+    radius = np.sqrt(((points - center) ** 2).sum(axis=-1).mean(axis=1))
+    med = np.median(diff.reshape(diff.shape[0], -1), axis=1)
+    values = np.divide(med, radius, out=np.full_like(med, np.nan), where=radius > 0)
+    return {"head_disagree_rel": values}
 
 
-def feat_reproj(d, stride: int = 4) -> dict:
+def samples_reproj(d, stride: int = 4) -> dict[str, np.ndarray]:
     """Unproject frame i, move into frame j with the predicted poses, compare depth."""
     depth = d["depth"][..., 0] if d["depth"].ndim == 4 else d["depth"]
     n, h, w = depth.shape
@@ -102,7 +112,43 @@ def feat_reproj(d, stride: int = 4) -> dict:
         if m.sum() < 50:
             continue
         errs.append(np.median(np.abs(z_expect[m] - z_actual[m]) / z_actual[m]))
-    return {"reproj_rel_err": float(np.median(errs)) if errs else float("nan")}
+    return {"reproj_rel_err": np.asarray(errs, dtype=np.float64)}
+
+
+def feature_samples(d, reference=None) -> dict[str, np.ndarray]:
+    out = {}
+    out.update(samples_conf(d, reference))
+    out.update(samples_head(d))
+    out.update(samples_reproj(d))
+    return out
+
+
+def summarize_samples(samples: dict[str, np.ndarray]) -> dict[str, float]:
+    row = {}
+    for name in FEATURES:
+        values = np.asarray(samples.get(name, []), dtype=np.float64)
+        values = values[np.isfinite(values)]
+        row[name] = float(np.median(values)) if values.size else float("nan")
+    return row
+
+
+def matched_thresholds(samples: dict[str, np.ndarray], quantile: float) -> dict[str, float]:
+    thresholds = {}
+    for name in FEATURES:
+        values = np.asarray(samples.get(name, []), dtype=np.float64)
+        values = values[np.isfinite(values)]
+        if not values.size:
+            thresholds[name] = float("nan")
+            continue
+        q = 1.0 - quantile if WORSE_IS[name] == "low" else quantile
+        thresholds[name] = float(np.quantile(values, q))
+    return thresholds
+
+
+def fires(value: float, threshold: float, feature: str) -> bool:
+    if not np.isfinite(value) or not np.isfinite(threshold):
+        return False
+    return value < threshold if WORSE_IS[feature] == "low" else value > threshold
 
 
 FEATURES = ["conf_std", "conf_frac_floor", "head_disagree_rel", "reproj_rel_err"]
@@ -116,6 +162,14 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--runs", default="", help="comma list; default = all cal_* runs")
     p.add_argument("--out_csv", default="/tmp/output_filters.csv")
+    p.add_argument("--out_budget_json", default=None,
+                   help="optional machine-readable matched-clean thresholds for the "
+                        "budgeted attack objective")
+    p.add_argument("--calibration", choices=("matched", "global"), default="matched",
+                   help="matched uses per-frame clean statistics from the same sequence; "
+                        "global preserves the old pooled-scene 3-sigma protocol")
+    p.add_argument("--matched_quantile", type=float, default=0.95,
+                   help="one-sided empirical clean quantile for matched calibration")
     p.add_argument("--n_sigma", type=float, default=3.0)
     return p.parse_args()
 
@@ -125,24 +179,41 @@ def main():
     clean_scenes = sorted(p.name for p in (ROOT / CLEAN_RUN).iterdir()
                           if p.is_dir() and p.name.startswith("rgbd_"))
 
-    print("=== calibrating on the clean run's own scenes ===")
+    if not 0.5 < args.matched_quantile < 1.0:
+        raise ValueError("--matched_quantile must be between 0.5 and 1")
+
+    print(f"=== calibration: {args.calibration} ===")
     clean_rows = []
+    clean_data = {}
+    clean_samples = {}
+    matched_thr = {}
     for scene in clean_scenes:
         d = load(CLEAN_RUN, scene)
         if d is None:
             continue
+        clean_data[scene] = d
+        sample = feature_samples(d, d)
+        clean_samples[scene] = sample
+        matched_thr[scene] = matched_thresholds(sample, args.matched_quantile)
         row = {"run": CLEAN_RUN, "seq": scene, "attacked": 0}
-        row.update(feat_conf(d)); row.update(feat_head(d)); row.update(feat_reproj(d))
+        row.update(summarize_samples(sample))
+        row["conf_mean"] = float(d["depth_conf"].mean())
         clean_rows.append(row)
-        print(f"  {scene:<44} " + "  ".join(f"{k}={row[k]:.4g}" for k in FEATURES))
+        detail = []
+        for f in FEATURES:
+            direction = "<" if WORSE_IS[f] == "low" else ">"
+            detail.append(f"{f}={row[f]:.4g} [{direction}{matched_thr[scene][f]:.4g}]")
+        print(f"  {scene:<44} " + "  ".join(detail))
 
-    thr = {}
+    global_thr = {}
     for f in FEATURES:
         v = np.array([r[f] for r in clean_rows if np.isfinite(r[f])])
         mu, sd = v.mean(), v.std()
-        thr[f] = (mu - args.n_sigma * sd) if WORSE_IS[f] == "low" else (mu + args.n_sigma * sd)
-        print(f"\n  {f:<20} clean {mu:.5g} +- {sd:.5g}  -> threshold "
-              f"{'<' if WORSE_IS[f]=='low' else '>'} {thr[f]:.5g}")
+        global_thr[f] = ((mu - args.n_sigma * sd) if WORSE_IS[f] == "low"
+                         else (mu + args.n_sigma * sd))
+        if args.calibration == "global":
+            print(f"\n  {f:<20} clean {mu:.5g} +- {sd:.5g}  -> threshold "
+                  f"{'<' if WORSE_IS[f]=='low' else '>'} {global_thr[f]:.5g}")
 
     runs = ([s.strip() for s in args.runs.split(",") if s.strip()] or
             sorted(p.name for p in ROOT.iterdir() if p.is_dir() and p.name.startswith("cal_")))
@@ -158,10 +229,18 @@ def main():
             d = load(run, scene)
             if d is None:
                 continue
+            reference = clean_data.get(scene)
+            if reference is None:
+                print(f"  SKIP {run}/{scene}: no matching clean sequence")
+                continue
             row = {"run": run, "seq": scene, "attacked": 1}
-            row.update(feat_conf(d)); row.update(feat_head(d)); row.update(feat_reproj(d))
-            fired = [f for f in FEATURES if np.isfinite(row[f]) and
-                     (row[f] < thr[f] if WORSE_IS[f] == "low" else row[f] > thr[f])]
+            row.update(summarize_samples(feature_samples(d, reference)))
+            row["conf_mean"] = float(d["depth_conf"].mean())
+            thresholds = matched_thr[scene] if args.calibration == "matched" else global_thr
+            fired = [f for f in FEATURES if fires(row[f], thresholds[f], f)]
+            for f in FEATURES:
+                row[f"threshold_{f}"] = thresholds[f]
+            row["calibration"] = args.calibration
             row["fired"] = ";".join(fired)
             rows.append(row)
             print(f"{run:<34}" + "".join(f"{row[f]:>11.4g}" for f in FEATURES)
@@ -170,21 +249,63 @@ def main():
     att = [r for r in rows if r["attacked"]]
     print(f"\n=== detection rate over {len(att)} attacked runs ===")
     for f in FEATURES:
-        hit = sum(1 for r in att if np.isfinite(r[f]) and
-                  (r[f] < thr[f] if WORSE_IS[f] == "low" else r[f] > thr[f]))
-        fp = sum(1 for r in clean_rows if np.isfinite(r[f]) and
-                 (r[f] < thr[f] if WORSE_IS[f] == "low" else r[f] > thr[f]))
-        print(f"  {f:<20} detects {hit}/{len(att)} ({hit/len(att)*100:5.1f}%)   "
-              f"false positives on clean {fp}/{len(clean_rows)}")
+        hit = 0
+        for r in att:
+            thresholds = matched_thr[r["seq"]] if args.calibration == "matched" else global_thr
+            hit += int(fires(r[f], thresholds[f], f))
+        # Cost estimate at frame/pair level.  The sequence median used for detection
+        # is intentionally more conservative than this empirical tail rate.
+        tail_hits = tail_total = 0
+        for scene, sample in clean_samples.items():
+            threshold = matched_thr[scene][f] if args.calibration == "matched" else global_thr[f]
+            values = np.asarray(sample[f], dtype=np.float64)
+            values = values[np.isfinite(values)]
+            tail_hits += sum(fires(float(v), threshold, f) for v in values)
+            tail_total += len(values)
+        rate = hit / len(att) * 100 if att else 0.0
+        tail_rate = tail_hits / tail_total * 100 if tail_total else 0.0
+        print(f"  {f:<20} detects {hit}/{len(att)} ({rate:5.1f}%)   "
+              f"clean frame/pair tail {tail_hits}/{tail_total} ({tail_rate:4.1f}%)")
     anyhit = sum(1 for r in att if r["fired"])
     print(f"  {'ANY of them':<20} detects {anyhit}/{len(att)} ({anyhit/len(att)*100:5.1f}%)")
 
     out = Path(args.out_csv)
     with out.open("w", newline="", encoding="utf-8") as fh:
-        wr = csv.DictWriter(fh, fieldnames=["run", "seq", "attacked", *FEATURES,
-                                            "conf_mean", "fired"], extrasaction="ignore")
+        threshold_fields = [f"threshold_{f}" for f in FEATURES]
+        wr = csv.DictWriter(fh, fieldnames=["run", "seq", "attacked", "calibration",
+                                            *FEATURES, *threshold_fields, "conf_mean", "fired"],
+                            extrasaction="ignore")
         wr.writeheader(); wr.writerows(rows)
     print(f"\nSaved -> {out}")
+
+    if args.out_budget_json:
+        if args.calibration != "matched":
+            raise ValueError("--out_budget_json requires --calibration matched")
+        payload = {
+            "version": 1,
+            "clean_run": CLEAN_RUN,
+            "matched_quantile": args.matched_quantile,
+            "features": FEATURES,
+            "worse_is": WORSE_IS,
+            "sequences": {},
+        }
+        for row in clean_rows:
+            scene = row["seq"]
+            payload["sequences"][scene] = {
+                "depth_conf_floor": float(clean_data[scene]["depth_conf"].min()) + 1e-6,
+                "metrics": {
+                    name: {
+                        "clean": float(row[name]),
+                        "threshold": float(matched_thr[scene][name]),
+                        "worse": WORSE_IS[name],
+                    }
+                    for name in FEATURES
+                },
+            }
+        budget_out = Path(args.out_budget_json)
+        budget_out.parent.mkdir(parents=True, exist_ok=True)
+        budget_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Saved matched budgets -> {budget_out}")
 
 
 if __name__ == "__main__":

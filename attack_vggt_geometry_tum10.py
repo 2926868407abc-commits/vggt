@@ -2158,25 +2158,81 @@ def select_candidate_by_feature_probe(
     return best[1], best[2]
 
 
-def prepare_texture_for_render(texture: torch.Tensor, args: argparse.Namespace | None, training: bool) -> torch.Tensor:
+def prepare_texture_for_render(texture: torch.Tensor, args: argparse.Namespace | None,
+                               training: bool, n_frames: int = 1) -> torch.Tensor:
+    """Photometric EOT, sampled independently per frame.
+
+    The factors used to be single scalars applied before the texture was expanded
+    across frames, so every frame in a sequence got the identical perturbation.
+    That is not expectation over transformation, it is one transformation per step:
+    the attack could tune to whatever brightness happened to be drawn instead of
+    having to work across the range, which is how a large patch ends up leaning on
+    the augmentation rather than being made robust by it. Sampling per frame makes
+    each step average over ten draws instead of one.
+    """
     if args is None:
-        return texture.clamp(0.0, 1.0)
+        return texture.clamp(0.0, 1.0).expand(n_frames, -1, -1, -1)
 
     rendered = texture.clamp(args.print_min, args.print_max)
+    rendered = rendered.expand(n_frames, -1, -1, -1)
     if not training or not args.physical_eot:
         return rendered
 
+    strength = float(np.clip(getattr(args, "_eot_strength", 1.0), 0.0, 1.0))
+
+    def per_frame(spread: float) -> torch.Tensor:
+        spread *= strength
+        return torch.empty((n_frames, 1, 1, 1), device=texture.device).uniform_(
+            1.0 - spread, 1.0 + spread)
+
     if args.eot_brightness > 0:
-        factor = torch.empty((), device=texture.device).uniform_(1.0 - args.eot_brightness, 1.0 + args.eot_brightness)
-        rendered = rendered * factor
+        rendered = rendered * per_frame(args.eot_brightness)
     if args.eot_contrast > 0:
-        factor = torch.empty((), device=texture.device).uniform_(1.0 - args.eot_contrast, 1.0 + args.eot_contrast)
         mean = rendered.mean(dim=(-2, -1), keepdim=True)
-        rendered = (rendered - mean) * factor + mean
+        rendered = (rendered - mean) * per_frame(args.eot_contrast) + mean
     if args.eot_gamma > 0:
-        gamma = torch.empty((), device=texture.device).uniform_(1.0 - args.eot_gamma, 1.0 + args.eot_gamma)
-        rendered = rendered.clamp(1e-5, 1.0).pow(gamma)
+        rendered = rendered.clamp(1e-5, 1.0).pow(per_frame(args.eot_gamma))
     return rendered.clamp(args.print_min, args.print_max)
+
+
+def jitter_sampling_grids(grids: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    """Per-frame near-identity homography on the texture sampling grid.
+
+    The rendering pipeline had no geometric EOT at all: the homography H_t was
+    reproduced exactly every step, so the optimised texture only ever had to work
+    at one precise alignment. Physically the printed patch sits on the surface with
+    some placement and orientation error, the surface is not perfectly planar, and
+    the camera calibration is approximate. Perturbing the grid in normalised texture
+    coordinates covers all three without touching the mask, i.e. the patch occupies
+    the same image region but its content shifts slightly within it.
+    """
+    n = grids.shape[0]
+    device, dtype = grids.device, grids.dtype
+    strength = float(np.clip(getattr(args, "_eot_strength", 1.0), 0.0, 1.0))
+
+    def uniform(spread: float) -> torch.Tensor:
+        spread *= strength
+        if spread <= 0:
+            return torch.zeros((n,), device=device, dtype=dtype)
+        return torch.empty((n,), device=device, dtype=dtype).uniform_(-spread, spread)
+
+    angle = uniform(math.radians(args.eot_geo_rotate_degrees))
+    scale = 1.0 + uniform(args.eot_geo_scale)
+    tx, ty = uniform(args.eot_geo_translate), uniform(args.eot_geo_translate)
+    px, py = uniform(args.eot_geo_perspective), uniform(args.eot_geo_perspective)
+
+    cos, sin = torch.cos(angle) * scale, torch.sin(angle) * scale
+    h = torch.zeros((n, 3, 3), device=device, dtype=dtype)
+    h[:, 0, 0], h[:, 0, 1], h[:, 0, 2] = cos, -sin, tx
+    h[:, 1, 0], h[:, 1, 1], h[:, 1, 2] = sin, cos, ty
+    h[:, 2, 0], h[:, 2, 1], h[:, 2, 2] = px, py, 1.0
+
+    flat = grids.reshape(n, -1, 2)
+    homo = torch.cat([flat, torch.ones_like(flat[..., :1])], dim=-1)
+    warped = torch.bmm(homo, h.transpose(1, 2))
+    denom = warped[..., 2:3]
+    denom = torch.where(denom.abs() < 1e-6, torch.full_like(denom, 1e-6), denom)
+    return (warped[..., :2] / denom).reshape_as(grids)
 
 
 def apply_geometry_patch(
@@ -2188,9 +2244,11 @@ def apply_geometry_patch(
     training: bool = False,
 ) -> torch.Tensor:
     n_frames = images.shape[0]
-    rendered_texture = prepare_texture_for_render(texture, args, training)
+    rendered_texture = prepare_texture_for_render(texture, args, training, n_frames)
+    if args is not None and training and args.physical_eot:
+        grids = jitter_sampling_grids(grids, args)
     sampled = F.grid_sample(
-        rendered_texture.expand(n_frames, -1, -1, -1),
+        rendered_texture,
         grids,
         mode="bilinear",
         padding_mode="zeros",
@@ -2198,8 +2256,28 @@ def apply_geometry_patch(
     )
     patched = (images * (1.0 - masks) + sampled * masks).clamp(0.0, 1.0)
     if args is not None and training and args.physical_eot and args.eot_noise_std > 0:
-        patched = (patched + torch.randn_like(patched) * args.eot_noise_std).clamp(0.0, 1.0)
+        # Whole-image white noise changes millions of pixels that the patch cannot
+        # control.  On VGGT-1B its stochastic backbone gradient overwhelmed the
+        # expected patch gradient and all three 1000-step EOT runs stayed at their
+        # clean-to-target distance (~0.93).  Model print/surface noise where it
+        # belongs: on the rendered patch.  Camera-wide noise remains an evaluation
+        # stress test, not an optimisation variable.
+        strength = float(np.clip(getattr(args, "_eot_strength", 1.0), 0.0, 1.0))
+        noise = torch.randn_like(sampled) * (args.eot_noise_std * strength)
+        patched = (patched + noise * masks).clamp(0.0, 1.0)
     return patched
+
+
+def scheduled_eot_strength(update_idx: int, total_updates: int,
+                           warmup_fraction: float) -> float:
+    """Start from the solvable clean objective, then progressively robustify it."""
+    if total_updates <= 1:
+        return 1.0
+    progress = float(update_idx) / float(total_updates - 1)
+    start = float(np.clip(warmup_fraction, 0.0, 0.95))
+    if progress <= start:
+        return 0.0
+    return float(np.clip((progress - start) / max(1.0 - start, 1e-12), 0.0, 1.0))
 
 
 def c2w_numpy_to_relative_tensor(c2w: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -2251,6 +2329,66 @@ def forward_camera_pose_only(
     with torch.cuda.amp.autocast(enabled=False):
         pose_enc_list = model.camera_head(aggregated_tokens_list)
     return {"pose_enc": pose_enc_list[-1], "pose_enc_list": pose_enc_list}
+
+
+def make_track_query_points(image_hw: tuple[int, int], rows: int, cols: int,
+                            margin: float, device: torch.device) -> torch.Tensor:
+    """Deterministic first-frame queries shared by clean and attacked forwards."""
+    h, w = image_hw
+    margin = float(np.clip(margin, 0.0, 0.45))
+    ys = torch.linspace(margin * (h - 1), (1.0 - margin) * (h - 1), rows,
+                        device=device)
+    xs = torch.linspace(margin * (w - 1), (1.0 - margin) * (w - 1), cols,
+                        device=device)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    return torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1).float()
+
+
+def forward_tracking_only(model: torch.nn.Module, images: torch.Tensor,
+                          query_points: torch.Tensor, dtype: torch.dtype,
+                          iters: int) -> dict[str, torch.Tensor]:
+    if model.track_head is None:
+        raise RuntimeError("VGGT model has no track_head")
+    images_b = images if images.ndim == 5 else images[None]
+    query_b = query_points if query_points.ndim == 3 else query_points[None]
+    with autocast_context(images_b.device, dtype):
+        tokens, patch_start_idx = model.aggregator(images_b)
+    track_list, vis, conf = model.track_head(
+        tokens, images=images_b, patch_start_idx=patch_start_idx,
+        query_points=query_b, iters=iters)
+    return {"track": track_list[-1], "track_vis": vis, "track_conf": conf}
+
+
+def clean_track_targets(seq_name: str, images: torch.Tensor, image_hw: tuple[int, int],
+                        model: torch.nn.Module, dtype: torch.dtype,
+                        args: argparse.Namespace) -> dict[str, torch.Tensor]:
+    """Cache the clean track-head output; a gauge leaves 2-D correspondences fixed.
+
+    For every frame i, projecting ``g_i X`` through camera ``g_i T_i`` cancels
+    ``g_i`` exactly.  The fourth head therefore cannot have a non-trivial gauge
+    target: its correct role is to stay at the clean tracks while pose/point-map
+    move.  Calling this an attacked tracking target would be mathematically false.
+    """
+    key = (seq_name, tuple(image_hw), args.joint_track_grid_rows,
+           args.joint_track_grid_cols, args.joint_track_iters,
+           float(args.joint_track_query_margin))
+    cache = getattr(args, "_joint_track_target_cache", None)
+    if cache is None:
+        cache = {}
+        args._joint_track_target_cache = cache
+    if key not in cache:
+        query = make_track_query_points(
+            image_hw, args.joint_track_grid_rows, args.joint_track_grid_cols,
+            args.joint_track_query_margin, images.device)
+        with torch.no_grad():
+            pred = forward_tracking_only(model, images, query, dtype, args.joint_track_iters)
+        cache[key] = {
+            "query_points": query.detach(),
+            "track": pred["track"].detach(),
+            "vis": pred["track_vis"].detach(),
+            "conf": pred["track_conf"].detach() if pred["track_conf"] is not None else None,
+        }
+    return cache[key]
 
 
 def normalize_c2w_to_first(c2w: torch.Tensor) -> torch.Tensor:
@@ -2709,6 +2847,10 @@ def build_joint_gauge_targets(
         clean_c2w = extrinsics_to_c2w(np.asarray(data["extrinsic"]))
         clean_depth = np.asarray(data["depth"], dtype=np.float64)
         clean_points = np.asarray(data["point_map"], dtype=np.float64)
+        clean_depth_conf = (np.asarray(data["depth_conf"], dtype=np.float64)
+                            if "depth_conf" in data else None)
+        clean_point_conf = (np.asarray(data["point_conf"], dtype=np.float64)
+                            if "point_conf" in data else None)
     if clean_depth.ndim == 4 and clean_depth.shape[-1] == 1:
         clean_depth = clean_depth[..., 0]
 
@@ -2729,11 +2871,21 @@ def build_joint_gauge_targets(
         depth_t[i] = scales[i] * clean_depth[i]
         points_t[i] = scales[i] * (clean_points[i] @ rot.T) + trans[i]
 
-    return {
+    targets = {
         "pose_rel": c2w_numpy_to_relative_tensor(pose_t, device),
         "depth": torch.from_numpy(depth_t).to(device=device, dtype=torch.float32),
         "points": torch.from_numpy(points_t).to(device=device, dtype=torch.float32),
     }
+    # Confidence is a property of the prediction, not a geometric coordinate, so
+    # a gauge transformation must leave it unchanged. Preserve it explicitly:
+    # otherwise a head can reduce confidence while approaching the geometry target.
+    if clean_depth_conf is not None:
+        targets["depth_conf"] = torch.from_numpy(clean_depth_conf).to(
+            device=device, dtype=torch.float32)
+    if clean_point_conf is not None:
+        targets["point_conf"] = torch.from_numpy(clean_point_conf).to(
+            device=device, dtype=torch.float32)
+    return targets
 
 
 def scale_invariant_depth_loss(pred: torch.Tensor, target: torch.Tensor,
@@ -2751,6 +2903,195 @@ def scale_invariant_depth_loss(pred: torch.Tensor, target: torch.Tensor,
     p = pred / pred_med
     t = target / tgt_med
     return ((p - t).abs() / t.clamp_min(eps)).mean()
+
+
+def confidence_preservation_loss(pred: torch.Tensor, target: torch.Tensor,
+                                 eps: float = 1e-6) -> torch.Tensor:
+    """Preserve clean head confidence without letting extreme pixels dominate."""
+    target = target.detach().to(device=pred.device, dtype=pred.dtype)
+    if pred.shape != target.shape:
+        raise RuntimeError(
+            f"Confidence target shape mismatch: pred={tuple(pred.shape)} "
+            f"target={tuple(target.shape)}")
+    pred_log = pred.float().clamp_min(eps).log()
+    target_log = target.float().clamp_min(eps).log()
+    return F.smooth_l1_loss(pred_log, target_log)
+
+
+def dense_scalar_head(tensor: torch.Tensor) -> torch.Tensor:
+    """Drop VGGT's optional batch and singleton-channel axes."""
+    if tensor.ndim == 5:
+        tensor = tensor[0]
+    # Confidence heads return [B,T,H,W], unlike depth's [B,T,H,W,1].
+    if tensor.ndim == 4 and tensor.shape[0] == 1 and tensor.shape[-1] != 1:
+        tensor = tensor[0]
+    if tensor.ndim == 4 and tensor.shape[-1] == 1:
+        tensor = tensor[..., 0]
+    return tensor
+
+
+def batched_scalar_head(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a scalar VGGT head as [B,T,H,W] without losing batch semantics."""
+    if tensor.ndim == 5 and tensor.shape[-1] == 1:
+        return tensor[..., 0]
+    if tensor.ndim == 4 and tensor.shape[-1] == 1:
+        return tensor[..., 0].unsqueeze(0)
+    if tensor.ndim == 4:
+        return tensor
+    if tensor.ndim == 3:
+        return tensor.unsqueeze(0)
+    raise RuntimeError(f"Expected scalar head with 3-5 dims, got {tuple(tensor.shape)}")
+
+
+def differentiable_median(values: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """NumPy-compatible median (average the middle pair for even lengths)."""
+    ordered = values.sort(dim=dim).values
+    n = ordered.shape[dim]
+    if n == 0:
+        raise RuntimeError("median of an empty tensor")
+    if n % 2:
+        return ordered.select(dim, n // 2)
+    return 0.5 * (ordered.select(dim, n // 2 - 1) + ordered.select(dim, n // 2))
+
+
+def torch_unproject_depth_world(depth: torch.Tensor, extrinsic: torch.Tensor,
+                                intrinsic: torch.Tensor) -> torch.Tensor:
+    """Differentiable equivalent of VGGT's official depth-to-world export."""
+    b, t, h, w = depth.shape
+    ys, xs = torch.meshgrid(
+        torch.arange(h, device=depth.device, dtype=depth.dtype),
+        torch.arange(w, device=depth.device, dtype=depth.dtype), indexing="ij")
+    xs = xs.view(1, 1, h, w)
+    ys = ys.view(1, 1, h, w)
+    fx = intrinsic[..., 0, 0, None, None]
+    fy = intrinsic[..., 1, 1, None, None]
+    cx = intrinsic[..., 0, 2, None, None]
+    cy = intrinsic[..., 1, 2, None, None]
+    cam = torch.stack(((xs - cx) * depth / fx.clamp_min(1e-6),
+                       (ys - cy) * depth / fy.clamp_min(1e-6), depth), dim=-1)
+    c2w = w2c_3x4_to_c2w(extrinsic)
+    world = torch.einsum("bthwj,btij->bthwi", cam, c2w[..., :3, :3])
+    return world + c2w[..., None, None, :3, 3]
+
+
+def differentiable_reprojection_metric(depth: torch.Tensor, extrinsic: torch.Tensor,
+                                       intrinsic: torch.Tensor, stride: int = 4,
+                                       eps: float = 1e-6) -> torch.Tensor:
+    """Adjacent-frame depth reprojection with bilinear sampling for pose gradients."""
+    b, t, h, w = depth.shape
+    c2w = w2c_3x4_to_c2w(extrinsic)
+    ys, xs = torch.meshgrid(
+        torch.arange(0, h, stride, device=depth.device, dtype=depth.dtype),
+        torch.arange(0, w, stride, device=depth.device, dtype=depth.dtype), indexing="ij")
+    xs = xs[None]
+    ys = ys[None]
+    pair_errors = []
+    for i in range(t - 1):
+        j = i + 1
+        z = depth[:, i, ::stride, ::stride]
+        ki, kj = intrinsic[:, i], intrinsic[:, j]
+        x = (xs - ki[:, 0, 2, None, None]) * z / ki[:, 0, 0, None, None].clamp_min(eps)
+        y = (ys - ki[:, 1, 2, None, None]) * z / ki[:, 1, 1, None, None].clamp_min(eps)
+        cam_i = torch.stack((x, y, z), dim=-1)
+        world = torch.einsum("bhwj,bij->bhwi", cam_i, c2w[:, i, :3, :3])
+        world = world + c2w[:, i, None, None, :3, 3]
+        cam_j = torch.einsum("bhwj,bij->bhwi", world, extrinsic[:, j, :3, :3])
+        cam_j = cam_j + extrinsic[:, j, None, None, :3, 3]
+        zj = cam_j[..., 2]
+        u = kj[:, 0, 0, None, None] * cam_j[..., 0] / zj.clamp_min(eps) + kj[:, 0, 2, None, None]
+        v = kj[:, 1, 1, None, None] * cam_j[..., 1] / zj.clamp_min(eps) + kj[:, 1, 2, None, None]
+        grid = torch.stack((2.0 * u / max(w - 1, 1) - 1.0,
+                            2.0 * v / max(h - 1, 1) - 1.0), dim=-1)
+        sampled = F.grid_sample(depth[:, j, None], grid, mode="bilinear",
+                                padding_mode="zeros", align_corners=True)[:, 0]
+        # Visibility is a discrete selection rule in the evaluator. Detaching the
+        # mask keeps the selected support fixed while retaining gradients through
+        # projected depth and sub-pixel coordinates.
+        valid = ((z.detach() > eps) & (zj.detach() > eps) &
+                 (u.detach() >= 0) & (u.detach() < w - 1) &
+                 (v.detach() >= 0) & (v.detach() < h - 1) &
+                 (sampled.detach() > eps))
+        err = (zj - sampled).abs() / sampled.clamp_min(eps)
+        if valid.any():
+            pair_errors.append(differentiable_median(err[valid].flatten()))
+    if not pair_errors:
+        return depth.new_zeros(())
+    return differentiable_median(torch.stack(pair_errors))
+
+
+def differentiable_filter_metrics(preds: dict, item: dict,
+                                  args: argparse.Namespace) -> dict[str, torch.Tensor]:
+    """Differentiable sequence summaries matching eval_output_filters.py."""
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(preds["pose_enc"], item["tensor_hw"])
+    extrinsic = extrinsic.float()
+    intrinsic = intrinsic.float()
+    depth = batched_scalar_head(preds["depth"]).float()
+    conf = batched_scalar_head(preds["depth_conf"]).float()
+    points = preds["world_points"].float()
+    if points.ndim == 4:
+        points = points.unsqueeze(0)
+
+    flat_conf = conf.flatten(2)
+    conf_std = differentiable_median(flat_conf.std(dim=2, unbiased=False), dim=1).mean()
+    floor = conf.new_tensor(float(item["filter_budget"]["depth_conf_floor"]))
+    temperature = max(float(args.budget_conf_floor_temperature), 1e-6)
+    soft_floor = torch.sigmoid((floor - conf) / temperature)
+    hard_floor = (conf <= floor).to(conf.dtype)
+    floor_st = hard_floor.detach() + soft_floor - soft_floor.detach()
+    conf_frac = differentiable_median(floor_st.flatten(2).mean(dim=2), dim=1).mean()
+
+    unprojected = torch_unproject_depth_world(depth, extrinsic, intrinsic)
+    diff = (points - unprojected).norm(dim=-1).flatten(2)
+    center = points.flatten(2, 3).mean(dim=2, keepdim=True)
+    radius = (points.flatten(2, 3) - center).pow(2).sum(-1).mean(-1).clamp_min(1e-12).sqrt()
+    head = differentiable_median(
+        differentiable_median(diff, dim=2) / radius, dim=1).mean()
+    reproj = differentiable_reprojection_metric(
+        depth, extrinsic, intrinsic, stride=args.budget_reproj_stride)
+    return {
+        "conf_std": conf_std,
+        "conf_frac_floor": conf_frac,
+        "head_disagree_rel": head,
+        "reproj_rel_err": reproj,
+    }
+
+
+def load_filter_budget(seq_name: str, args: argparse.Namespace) -> dict:
+    path = Path(args.filter_budget_json)
+    cache = getattr(args, "_filter_budget_cache", None)
+    if cache is None:
+        if not path.exists():
+            raise RuntimeError(f"filter budget JSON not found: {path}")
+        cache = json.loads(path.read_text(encoding="utf-8"))
+        args._filter_budget_cache = cache
+    try:
+        return cache["sequences"][seq_name]
+    except KeyError as exc:
+        raise RuntimeError(f"no matched filter budget for sequence {seq_name}") from exc
+
+
+def budget_safe_value_and_violation(value: torch.Tensor, spec: dict,
+                                    fraction: float, eps: float = 1e-8
+                                    ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert an empirical clean-to-threshold interval into a normalized hinge."""
+    clean = value.new_tensor(float(spec["clean"]))
+    threshold = value.new_tensor(float(spec["threshold"]))
+    fraction = float(np.clip(fraction, 0.0, 1.0))
+    safe = clean + fraction * (threshold - clean)
+    span = (threshold - clean).abs().clamp_min(eps)
+    if spec["worse"] == "high":
+        violation = F.relu((value - safe) / span)
+    elif spec["worse"] == "low":
+        violation = F.relu((safe - value) / span)
+    else:
+        raise ValueError(f"Unknown budget direction: {spec['worse']}")
+    return safe, violation
+
+
+def budget_track_error_pixels(preds: dict, target: dict, min_visibility: float) -> torch.Tensor:
+    mask = target["vis"][:, 1:] >= min_visibility
+    error = (preds["track"][:, 1:] - target["track"][:, 1:]).pow(2).sum(-1).sqrt()
+    return error[mask].mean() if mask.any() else error.mean()
 
 
 def aligned_point_residual(pred: torch.Tensor, target: torch.Tensor,
@@ -2779,8 +3120,10 @@ def forward_all_geometry_heads(
     model: torch.nn.Module,
     images: torch.Tensor,
     dtype: torch.dtype,
+    query_points: torch.Tensor | None = None,
+    track_iters: int = 4,
 ) -> dict[str, torch.Tensor]:
-    """Camera, depth and point heads in one pass, with the two DPT heads checkpointed.
+    """Geometry heads in one pass, with memory-heavy heads checkpointed.
 
     Running the whole model the way forward_vggt does needs more memory than the
     camera-only path and overflows a 46 GiB card at 10 frames: the DPT decoders keep
@@ -2820,7 +3163,47 @@ def forward_all_geometry_heads(
         out["depth"], out["depth_conf"] = depth, depth_conf
         points, points_conf = run_head(model.point_head)
         out["world_points"], out["world_points_conf"] = points, points_conf
+
+        if query_points is not None:
+            if model.track_head is None:
+                raise RuntimeError("joint track loss requested but model has no track_head")
+            query_b = query_points if query_points.ndim == 3 else query_points[None]
+
+            def run_track(*tensors):
+                coord_list, vis, conf = model.track_head(
+                    list(tensors), images=images_b, patch_start_idx=patch_start_idx,
+                    query_points=query_b, iters=track_iters)
+                return coord_list[-1], vis, conf
+
+            track, vis, conf = torch.utils.checkpoint.checkpoint(
+                run_track, *tokens, use_reentrant=False)
+            out["track"], out["track_vis"], out["track_conf"] = track, vis, conf
     return out
+
+
+def track_consistency_loss(pred_track: torch.Tensor, target_track: torch.Tensor,
+                           pred_vis: torch.Tensor, target_vis: torch.Tensor,
+                           pred_conf: torch.Tensor | None, target_conf: torch.Tensor | None,
+                           image_hw: tuple[int, int], min_visibility: float,
+                           visibility_weight: float, confidence_weight: float,
+                           eps: float = 1e-6) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Keep gauge-invariant 2-D tracks and their confidence at the clean output."""
+    h, w = image_hw
+    diagonal = math.sqrt(float(h * h + w * w))
+    # Frame zero is forcibly equal to the query by the track head, so including it
+    # would dilute the useful temporal constraint.
+    mask = target_vis[:, 1:] >= min_visibility
+    coord_error = (pred_track[:, 1:] - target_track[:, 1:]).pow(2).sum(-1).sqrt()
+    if mask.any():
+        coord = coord_error[mask].mean() / max(diagonal, eps)
+    else:
+        coord = coord_error.mean() / max(diagonal, eps)
+    vis = F.smooth_l1_loss(pred_vis[:, 1:], target_vis[:, 1:])
+    conf = pred_track.new_zeros(())
+    if pred_conf is not None and target_conf is not None:
+        conf = F.smooth_l1_loss(pred_conf[:, 1:], target_conf[:, 1:])
+    total = coord + visibility_weight * vis + confidence_weight * conf
+    return total, {"track_coord": coord, "track_vis": vis, "track_conf": conf}
 
 
 def geometry_joint_gauge_loss(
@@ -2836,12 +3219,17 @@ def geometry_joint_gauge_loss(
     pred_rel = pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
     pose_loss, pose_terms = pose_aligned_residual_mse(pred_rel, targets["pose_rel"], args)
 
-    depth_pred = preds["depth"]
-    if depth_pred.ndim == 5:
-        depth_pred = depth_pred[0]
-    if depth_pred.shape[-1] == 1:
-        depth_pred = depth_pred[..., 0]
+    depth_pred = dense_scalar_head(preds["depth"])
     depth_loss = scale_invariant_depth_loss(depth_pred.float(), targets["depth"])
+
+    depth_conf_loss = pose_loss.new_zeros(())
+    if args.joint_depth_conf_weight > 0:
+        if "depth_conf" not in targets:
+            raise RuntimeError("joint_depth_conf_weight > 0 needs clean depth_conf")
+        depth_conf_loss = confidence_preservation_loss(
+            dense_scalar_head(preds["depth_conf"]),
+            dense_scalar_head(targets["depth_conf"]),
+        )
 
     points_pred = preds["world_points"]
     if points_pred.ndim == 5:
@@ -2849,17 +3237,138 @@ def geometry_joint_gauge_loss(
     point_loss = aligned_point_residual(points_pred.float(), targets["points"],
                                         args.joint_point_stride)
 
+    point_conf_loss = pose_loss.new_zeros(())
+    if args.joint_point_conf_weight > 0:
+        if "point_conf" not in targets:
+            raise RuntimeError("joint_point_conf_weight > 0 needs clean point_conf")
+        point_conf_loss = confidence_preservation_loss(
+            dense_scalar_head(preds["world_points_conf"]),
+            dense_scalar_head(targets["point_conf"]),
+        )
+
+    track_loss = pose_loss.new_zeros(())
+    track_terms = {"track_coord": track_loss, "track_vis": track_loss,
+                   "track_conf": track_loss}
+    if args.joint_track_weight > 0:
+        track_target = item.get("joint_track_targets")
+        if track_target is None or "track" not in preds:
+            raise RuntimeError("joint_track_weight > 0 needs cached clean tracks and track output")
+        track_loss, track_terms = track_consistency_loss(
+            preds["track"], track_target["track"], preds["track_vis"], track_target["vis"],
+            preds.get("track_conf"), track_target.get("conf"), item["tensor_hw"],
+            args.joint_track_min_visibility, args.joint_track_visibility_weight,
+            args.joint_track_confidence_weight)
+
     total = (args.joint_pose_weight * pose_loss
              + args.joint_depth_weight * depth_loss
-             + args.joint_point_weight * point_loss)
+             + args.joint_point_weight * point_loss
+             + args.joint_depth_conf_weight * depth_conf_loss
+             + args.joint_point_conf_weight * point_conf_loss
+             + args.joint_track_weight * track_loss)
     return total, {
         "pose_loss": float(total.detach().cpu()),
         "joint_pose_term": float(pose_loss.detach().cpu()),
         "joint_depth_term": float(depth_loss.detach().cpu()),
         "joint_point_term": float(point_loss.detach().cpu()),
+        "joint_depth_conf_term": float(depth_conf_loss.detach().cpu()),
+        "joint_point_conf_term": float(point_conf_loss.detach().cpu()),
+        "joint_track_term": float(track_loss.detach().cpu()),
+        "joint_track_coord": float(track_terms["track_coord"].detach().cpu()),
+        "joint_track_vis": float(track_terms["track_vis"].detach().cpu()),
+        "joint_track_conf": float(track_terms["track_conf"].detach().cpu()),
         "pose_rot_mse": pose_terms["pose_rot_mse"],
         "pose_trans_mse": pose_terms["pose_trans_mse"],
     }
+
+
+def geometry_joint_gauge_budgeted_loss(
+    preds: dict,
+    item: dict,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Optimise pose damage while spending only the calibrated consistency budget.
+
+    Unlike geometry_joint_gauge_loss, this does not pull every auxiliary output
+    back to its exact clean value. Each output may move freely inside the matching
+    clean sequence's empirical acceptance interval. A normalized hinge activates
+    only near that interval's boundary, and dual ascent raises the multiplier only
+    for constraints the current patch actually violates.
+    """
+    pred_rel = pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
+    if args.budget_pose_objective == "untargeted_gt":
+        pose_score, pose_terms = pose_aligned_residual_mse(pred_rel, item["pose_gt_rel"], args)
+        primary = -pose_score
+    else:
+        targets = item.get("joint_gauge_targets")
+        if targets is None:
+            raise RuntimeError("targeted_gauge budget objective needs joint gauge targets")
+        pose_score, pose_terms = pose_aligned_residual_mse(pred_rel, targets["pose_rel"], args)
+        primary = pose_score
+
+    metrics = differentiable_filter_metrics(preds, item, args)
+    selected = {s.strip() for s in args.budget_constraints.split(",") if s.strip()}
+    duals = getattr(args, "_budget_duals", None)
+    if duals is None:
+        duals = {}
+        args._budget_duals = duals
+    penalty = primary.new_zeros(())
+    terms: dict[str, float] = {
+        "pose_loss": 0.0,
+        "budget_primary_pose": float(pose_score.detach().cpu()),
+        "pose_rot_mse": pose_terms["pose_rot_mse"],
+        "pose_trans_mse": pose_terms["pose_trans_mse"],
+    }
+    specs = item["filter_budget"]["metrics"]
+    for name, value in metrics.items():
+        terms[f"budget_metric_{name}"] = float(value.detach().cpu())
+        if name not in selected:
+            continue
+        safe, violation = budget_safe_value_and_violation(
+            value, specs[name], args.filter_budget_fraction)
+        dual = float(duals.setdefault(name, args.budget_dual_init))
+        penalty = penalty + dual * violation + 0.5 * args.budget_rho * violation.pow(2)
+        terms[f"budget_safe_{name}"] = float(safe.detach().cpu())
+        terms[f"budget_violation_{name}"] = float(violation.detach().cpu())
+        terms[f"budget_dual_{name}"] = dual
+
+    track_target = item.get("joint_track_targets")
+    if "track" in selected:
+        if track_target is None or "track" not in preds:
+            raise RuntimeError("track budget needs clean track targets and track output")
+        track_px = budget_track_error_pixels(
+            preds, track_target, args.joint_track_min_visibility)
+        track_spec = {"clean": 0.0, "threshold": args.budget_track_pixels, "worse": "high"}
+        safe, violation = budget_safe_value_and_violation(
+            track_px, track_spec, args.filter_budget_fraction)
+        dual = float(duals.setdefault("track", args.budget_dual_init))
+        penalty = penalty + dual * violation + 0.5 * args.budget_rho * violation.pow(2)
+        terms["budget_metric_track"] = float(track_px.detach().cpu())
+        terms["budget_safe_track"] = float(safe.detach().cpu())
+        terms["budget_violation_track"] = float(violation.detach().cpu())
+        terms["budget_dual_track"] = dual
+
+    total = primary + penalty
+    terms["budget_penalty"] = float(penalty.detach().cpu())
+    terms["pose_loss"] = float(total.detach().cpu())
+    return total, terms
+
+
+def update_budget_duals(args: argparse.Namespace,
+                        attack_term_values: dict[str, list[float]]) -> None:
+    """One projected dual-ascent update after each patch optimiser update."""
+    if args.attack_loss != "geometry_joint_gauge_budgeted":
+        return
+    duals = getattr(args, "_budget_duals", None)
+    if duals is None:
+        return
+    for key, values in attack_term_values.items():
+        prefix = "budget_violation_"
+        if not key.startswith(prefix) or not values:
+            continue
+        name = key[len(prefix):]
+        old = float(duals.get(name, args.budget_dual_init))
+        duals[name] = float(np.clip(
+            old + args.budget_dual_lr * float(np.mean(values)), 0.0, args.budget_dual_max))
 
 
 def should_cache_clean_pose(args: argparse.Namespace) -> bool:
@@ -2889,6 +3398,23 @@ def attack_objective_loss(
         loss, terms = feature_l1_loss(adv_features, item["clean_features"])
         return loss, terms, True
 
+    if args.attack_loss in ("geometry_joint_gauge_targeted", "geometry_joint_gauge_budgeted"):
+        # Needs all requested heads.  Handle it before the camera-only forward;
+        # the old ordering ran the 1B aggregator twice per update for no reason.
+        track_target = item.get("joint_track_targets")
+        query = track_target["query_points"] if track_target is not None else None
+        preds = forward_all_geometry_heads(
+            model, adv_images, dtype, query_points=query,
+            track_iters=args.joint_track_iters)
+        if args.attack_loss == "geometry_joint_gauge_budgeted":
+            loss, terms = geometry_joint_gauge_budgeted_loss(preds, item, args)
+        else:
+            loss, terms = geometry_joint_gauge_loss(preds, item, args)
+        terms["pose_reference"] = "piecewise_gauge_clean"
+        terms["piecewise_gauge_family"] = args.piecewise_gauge_family
+        terms["piecewise_gauge_magnitude"] = args.piecewise_gauge_magnitude
+        return loss, terms, False
+
     preds = forward_camera_pose_only(
         model,
         adv_images,
@@ -2908,15 +3434,6 @@ def attack_objective_loss(
         loss, terms = pose_scale_invariant_mse(pred_rel, target_rel, args)
         terms["pose_reference"] = "gt"
         return loss, terms, True
-
-    if args.attack_loss == "geometry_joint_gauge_targeted":
-        # Needs every geometry head, not just the camera.
-        preds = forward_all_geometry_heads(model, adv_images, dtype)
-        loss, terms = geometry_joint_gauge_loss(preds, item, args)
-        terms["pose_reference"] = "piecewise_gauge_clean"
-        terms["piecewise_gauge_family"] = args.piecewise_gauge_family
-        terms["piecewise_gauge_magnitude"] = args.piecewise_gauge_magnitude
-        return loss, terms, False
 
     if args.attack_loss == "pose_piecewise_gauge_targeted":
         target_rel = item.get("pose_piecewise_rel")
@@ -3052,6 +3569,16 @@ def load_tum_sequence(
         args._active_vggt_point_valid_grid = old_vggt_point_valid_grid
         args._active_vggt_geometry_source = old_vggt_source
         args._intrinsics_in_tensor_space = old_tensor_intrinsics
+    joint_track_targets = None
+    needs_strict_track = (args.attack_loss == "geometry_joint_gauge_targeted"
+                          and args.joint_track_weight > 0)
+    needs_budget_track = (args.attack_loss == "geometry_joint_gauge_budgeted"
+                          and "track" in {s.strip() for s in args.budget_constraints.split(",")})
+    if needs_strict_track or needs_budget_track:
+        if model is None or dtype is None:
+            raise RuntimeError("four-head joint loss needs model/dtype to cache clean tracks")
+        joint_track_targets = clean_track_targets(
+            seq_dir.name, images, tensor_hw, model, dtype, args)
     return {
         "seq": seq_dir.name,
         "seq_dir": seq_dir,
@@ -3064,7 +3591,11 @@ def load_tum_sequence(
         "pose_gt_rel": pose_gt_rel,
         "pose_piecewise_rel": pose_piecewise_rel,
         "joint_gauge_targets": build_joint_gauge_targets(seq_dir.name, args, device)
-        if args.attack_loss == "geometry_joint_gauge_targeted" else None,
+        if args.attack_loss in ("geometry_joint_gauge_targeted",
+                                "geometry_joint_gauge_budgeted") else None,
+        "joint_track_targets": joint_track_targets,
+        "filter_budget": load_filter_budget(seq_dir.name, args)
+        if args.attack_loss == "geometry_joint_gauge_budgeted" else None,
         "pose_clean_rel": clean_pose_rel,
         "geometry_intrinsics": np.asarray(local_intrinsics).astype(float).tolist(),
         "geometry_source": geom_meta.get("geometry_source", "tum_gt_geometry"),
@@ -3080,6 +3611,20 @@ def load_tum_sequence(
 def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for group in optimizer.param_groups:
         group["lr"] = lr
+
+
+def assert_texture_only_optimizer(optimizer: torch.optim.Optimizer | None,
+                                  texture: torch.Tensor,
+                                  model: torch.nn.Module) -> None:
+    """Make the threat model executable: victim weights must never be optimised."""
+    if optimizer is None:
+        return
+    optimised = {id(param) for group in optimizer.param_groups for param in group["params"]}
+    model_params = {id(param) for param in model.parameters()}
+    if optimised != {id(texture)}:
+        raise RuntimeError("Adversarial-patch optimiser must contain only the texture tensor")
+    if optimised & model_params:
+        raise RuntimeError("Victim-model parameter leaked into the patch optimiser")
 
 
 def initialize_texture(
@@ -3216,6 +3761,7 @@ def train_geometry_patch(
     rng = np.random.default_rng(args.seed)
     texture = initialize_texture(args, device, requires_grad=not args.freeze_texture)
     optimizer = None if args.freeze_texture else torch.optim.AdamW([texture], lr=args.patch_lr)
+    assert_texture_only_optimizer(optimizer, texture, model)
 
     patch_dir = output_dir / "geometry_patch"
     patch_dir.mkdir(parents=True, exist_ok=True)
@@ -3254,6 +3800,10 @@ def train_geometry_patch(
         for iteration in range(args.iterations):
             if args.freeze_texture:
                 break
+            args._eot_strength = (
+                scheduled_eot_strength(update_idx, total_updates, args.eot_warmup_fraction)
+                if args.physical_eot else 0.0
+            )
             scene_indices = rng.choice(
                 len(scene_dirs),
                 size=min(args.scenes_per_iteration, len(scene_dirs)),
@@ -3290,6 +3840,10 @@ def train_geometry_patch(
                     total_updates,
                     warmup_updates,
                     args.scheduler,
+                )
+                args._eot_strength = (
+                    scheduled_eot_strength(update_idx, total_updates, args.eot_warmup_fraction)
+                    if args.physical_eot else 0.0
                 )
                 set_optimizer_lr(optimizer, current_lr)
                 losses = []
@@ -3340,6 +3894,7 @@ def train_geometry_patch(
                 optimizer.step()
                 with torch.no_grad():
                     texture.clamp_(args.print_min, args.print_max)
+                update_budget_duals(args, attack_term_values)
 
                 update_idx += 1
                 last_loss = float(np.mean(losses))
@@ -3356,10 +3911,14 @@ def train_geometry_patch(
                     "printability": float(np.mean(printable_terms)) if printable_terms else 0.0,
                     "natural_reference": float(np.mean(natural_reference_terms)) if natural_reference_terms else 0.0,
                     "mask_coverage_mean": float(np.mean(coverages)),
+                    "eot_strength": float(getattr(args, "_eot_strength", 0.0)),
                     "scenes": [item["seq"] for item in batch],
                 }
                 for key, values in attack_term_values.items():
                     record[key] = float(np.mean(values))
+                if args.attack_loss == "geometry_joint_gauge_budgeted":
+                    for name, value in getattr(args, "_budget_duals", {}).items():
+                        record[f"budget_dual_after_{name}"] = float(value)
                 history_file.write(json.dumps(record) + "\n")
                 if update_idx == 1 or update_idx % args.log_every == 0 or update_idx == total_updates:
                     print(
@@ -3392,11 +3951,47 @@ def train_geometry_patch(
         "pose_rotation_weight": args.pose_rotation_weight,
         "pose_translation_weight": args.pose_translation_weight,
         "pose_scale_invariant_eps": args.pose_scale_invariant_eps,
+        "joint_gauge": {
+            "family": args.piecewise_gauge_family,
+            "magnitude": args.piecewise_gauge_magnitude,
+            "orthogonal_mode_order": args.orthogonal_mode_order,
+            "orthogonal_mode_axis": args.orthogonal_mode_axis,
+            "pose_weight": args.joint_pose_weight,
+            "depth_weight": args.joint_depth_weight,
+            "point_weight": args.joint_point_weight,
+            "depth_conf_weight": args.joint_depth_conf_weight,
+            "point_conf_weight": args.joint_point_conf_weight,
+            "point_stride": args.joint_point_stride,
+            "track_weight": args.joint_track_weight,
+            "track_grid_rows": args.joint_track_grid_rows,
+            "track_grid_cols": args.joint_track_grid_cols,
+            "track_query_margin": args.joint_track_query_margin,
+            "track_iters": args.joint_track_iters,
+            "track_min_visibility": args.joint_track_min_visibility,
+            "track_visibility_weight": args.joint_track_visibility_weight,
+            "track_confidence_weight": args.joint_track_confidence_weight,
+        },
+        "filter_budget": {
+            "json": args.filter_budget_json,
+            "fraction": args.filter_budget_fraction,
+            "constraints": args.budget_constraints,
+            "pose_objective": args.budget_pose_objective,
+            "dual_init": args.budget_dual_init,
+            "dual_lr": args.budget_dual_lr,
+            "dual_max": args.budget_dual_max,
+            "rho": args.budget_rho,
+            "conf_floor_temperature": args.budget_conf_floor_temperature,
+            "reproj_stride": args.budget_reproj_stride,
+            "track_pixels": args.budget_track_pixels,
+            "final_duals": dict(getattr(args, "_budget_duals", {})),
+        },
         "feature_layer": args.feature_layer,
         "texture_shape": list(texture.shape),
         "texture_init": args.texture_init,
         "texture_init_image": args.texture_init_image,
         "freeze_texture": bool(args.freeze_texture),
+        "optimizer_target": "texture_only",
+        "victim_model_weights_updated": False,
         "patch_lr": args.patch_lr,
         "scheduler": args.scheduler,
         "warmup_iterations": args.warmup_iterations,
@@ -3420,6 +4015,12 @@ def train_geometry_patch(
             "contrast": args.eot_contrast,
             "gamma": args.eot_gamma,
             "noise_std": args.eot_noise_std,
+            "noise_scope": "patch_only",
+            "warmup_fraction": args.eot_warmup_fraction,
+            "geo_translate": args.eot_geo_translate,
+            "geo_scale": args.eot_geo_scale,
+            "geo_rotate_degrees": args.eot_geo_rotate_degrees,
+            "geo_perspective": args.eot_geo_perspective,
         },
         "regularization": {
             "tv_weight": args.tv_weight,
@@ -3623,6 +4224,7 @@ def parse_args() -> argparse.Namespace:
             "pose_aligned_residual_mse",
             "pose_piecewise_gauge_targeted",
             "geometry_joint_gauge_targeted",
+            "geometry_joint_gauge_budgeted",
             "pose_clean_untargeted",
             "pose_reverse_targeted",
             "pose_drift_targeted",
@@ -3677,9 +4279,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint_pose_weight", type=float, default=1.0)
     parser.add_argument("--joint_depth_weight", type=float, default=1.0)
     parser.add_argument("--joint_point_weight", type=float, default=1.0)
+    parser.add_argument("--joint_depth_conf_weight", type=float, default=0.0,
+                        help="preserve clean depth-head confidence; zero reproduces old runs")
+    parser.add_argument("--joint_point_conf_weight", type=float, default=0.0,
+                        help="preserve clean point-head confidence; zero reproduces old runs")
+    parser.add_argument("--joint_track_weight", type=float, default=0.0,
+                        help="preserve the gauge-invariant clean track head; zero keeps "
+                             "the historical three-head objective")
+    parser.add_argument("--joint_track_grid_rows", type=int, default=6)
+    parser.add_argument("--joint_track_grid_cols", type=int, default=8)
+    parser.add_argument("--joint_track_query_margin", type=float, default=0.10)
+    parser.add_argument("--joint_track_iters", type=int, default=2,
+                        help="tracker refinements; 2 is the memory-conscious training default")
+    parser.add_argument("--joint_track_min_visibility", type=float, default=0.20)
+    parser.add_argument("--joint_track_visibility_weight", type=float, default=0.10)
+    parser.add_argument("--joint_track_confidence_weight", type=float, default=0.10)
     parser.add_argument("--joint_point_stride", type=int, default=4,
                         help="sub-sampling for the point-map term; the full map is 2M "
                              "points per sequence")
+    parser.add_argument("--filter_budget_json", default=None,
+                        help="matched-clean thresholds emitted by eval_output_filters.py")
+    parser.add_argument("--filter_budget_fraction", type=float, default=0.80,
+                        help="fraction of the clean-to-filter interval the attack may spend")
+    parser.add_argument("--budget_constraints",
+                        default="conf_std,conf_frac_floor,head_disagree_rel,reproj_rel_err,track")
+    parser.add_argument("--budget_pose_objective",
+                        choices=("targeted_gauge", "untargeted_gt"), default="untargeted_gt")
+    parser.add_argument("--budget_dual_init", type=float, default=0.0)
+    parser.add_argument("--budget_dual_lr", type=float, default=1.0)
+    parser.add_argument("--budget_dual_max", type=float, default=100.0)
+    parser.add_argument("--budget_rho", type=float, default=1.0,
+                        help="quadratic augmented-Lagrangian weight on normalized violation")
+    parser.add_argument("--budget_conf_floor_temperature", type=float, default=0.02)
+    parser.add_argument("--budget_reproj_stride", type=int, default=8)
+    parser.add_argument("--budget_track_pixels", type=float, default=2.0)
     parser.add_argument(
         "--pose_scale_invariant_eps",
         type=float,
@@ -3838,6 +4471,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eot_contrast", type=float, default=0.15)
     parser.add_argument("--eot_gamma", type=float, default=0.10)
     parser.add_argument("--eot_noise_std", type=float, default=0.01)
+    parser.add_argument("--eot_warmup_fraction", type=float, default=0.25,
+                        help="fraction of updates trained without EOT before its "
+                             "strength ramps linearly to full; avoids burying the "
+                             "initial targeted gradient in augmentation noise")
+    # Geometric EOT. Previously absent entirely, which left the texture optimised
+    # for one exact alignment; the MDE attack literature randomises viewpoint and
+    # placement and reports EOT *helping* by ~40%, against the 64% train/test drop
+    # the photometric-only version produced here on a large patch.
+    parser.add_argument("--eot_geo_translate", type=float, default=0.02,
+                        help="patch-relative placement jitter, in normalised texture "
+                             "coordinates where the patch spans [-1, 1]")
+    parser.add_argument("--eot_geo_scale", type=float, default=0.03,
+                        help="relative size jitter of the printed patch")
+    parser.add_argument("--eot_geo_rotate_degrees", type=float, default=2.0,
+                        help="in-plane orientation error of the printed patch")
+    parser.add_argument("--eot_geo_perspective", type=float, default=0.01,
+                        help="slight out-of-plane tilt, covering surface non-planarity "
+                             "and camera calibration error")
     return parser.parse_args()
 
 

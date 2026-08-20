@@ -23,6 +23,22 @@ scores ~0.0281 (90% of it), so an attacked ATE of 0.0285 is indistinguishable
 from noise. `ate_frac_of_ceiling` and `ate_random_baseline` make that visible
 instead of leaving it for a reader to work out.
 
+That saturation is not a property of the sequence and cannot be escaped by picking
+a wider one: measured across all eight fr3 sequences, whose GT radii span 24x
+(0.025 m on walking_static to 0.604 m on walking_halfsphere), the random baseline
+sits at 90.3-93.8% of ceiling everywhere, because the ceiling *is* the GT radius
+and both sides of the ratio scale together. More frames makes it worse, not
+better (sitting_xyz: 84.7% at 5 frames, 93.8% at 10, 99.2% at 90) since the only
+thing holding a random prediction below the ceiling is spurious correlation in a
+short window.
+
+The tie-breaker for saturated runs is RPE rotation, which compares frame-to-frame
+relative motion and so does not cancel a global Sim(3) the way the aligned ATE
+does. `rpe_rot_clean_deg` and `rpe_rot_vs_clean` put it on the same footing as the
+ATE columns: on sitting_halfsphere the clean floor is 0.45 deg, and two runs whose
+ATE fractions were an indistinguishable 90.4% and 93.5% separate cleanly into 8x
+and 180x of that floor.
+
 This script does NOT modify or re-implement the evaluation. It imports
 recons_eval's own functions through scripts/diag_gauge_invariance.py, and writes
 only its own CSV. The ATE column here is the same estimator the production eval
@@ -164,7 +180,11 @@ def main() -> None:
         ceiling = ate_ceiling(gt_c2w)
         rand_ate = random_prediction_ate(rec, gt_traj, len(run["frame_indices"]),
                                          args.random_baseline_draws, args.random_baseline_seed)
-        clean_ate = rec.ate(rec.evo_utils.get_tum_poses(clean["c2w"]), gt_traj, True, True)
+        clean_traj = rec.evo_utils.get_tum_poses(clean["c2w"])
+        clean_ate = rec.ate(clean_traj, gt_traj, True, True)
+        # the RPE floor this model already has before any attack, so rpe_rot_deg is
+        # readable without going and looking up a separate clean run
+        _, rpe_rot_clean = rec.rpe(clean_traj, gt_traj, True, True)
         dev_abs, dev_rel = deviation_from_clean(run["c2w"], clean["c2w"])
 
         row = {
@@ -177,6 +197,9 @@ def main() -> None:
             "ATE_noalign": rec.ate(traj, gt_traj, False, False),
             "RPE_trans": rpe_trans,
             "RPE_rot_deg": rpe_rot,
+            "rpe_rot_clean_deg": rpe_rot_clean,
+            "rpe_rot_vs_clean": (rpe_rot / rpe_rot_clean
+                                 if rpe_rot_clean > 0 else float("nan")),
             "ate_ceiling": ceiling,
             "ate_frac_of_ceiling": ate / ceiling if ceiling > 0 else float("nan"),
             "ate_clean_frac_of_ceiling": clean_ate / ceiling if ceiling > 0 else float("nan"),
@@ -198,9 +221,16 @@ def main() -> None:
             f"gauge_absorbed={row['gauge_absorbed_frac']:.4f}  "
             f"sim3_scale_vs_clean={row['sim3_scale_vs_clean']:.4f}"
         )
+        print(
+            f"    RPE_rot={rpe_rot:.2f} deg ({row['rpe_rot_vs_clean']:.0f}x the "
+            f"{rpe_rot_clean:.2f} deg clean floor)  RPE_trans={rpe_trans:.4f}"
+        )
         if row["ate_frac_of_ceiling"] >= row["ate_random_frac_of_ceiling"] - 0.05:
-            print(f"    WARNING: {scene} ATE is at or near the no-information level "
-                  f"-- this sequence cannot distinguish this attack from noise.")
+            print(f"    WARNING: {scene} ATE is at or near the no-information level, "
+                  f"so it cannot be ranked against another saturated run. Compare "
+                  f"RPE_rot ({rpe_rot:.2f} deg) instead -- a global Sim(3) does not "
+                  f"cancel in it. Picking a wider sequence does not help: the random "
+                  f"baseline is 90-94% of ceiling on all eight fr3 sequences.")
 
     if len(rows) > 1:
         mean_row = {"model": args.model_name, "dataset": "tum10", "seq": "MEAN",

@@ -1,0 +1,219 @@
+{
+  "version": 1,
+  "clean_run": "tum10_clean_uniform_l3",
+  "matched_quantile": 0.95,
+  "features": [
+    "conf_std",
+    "conf_frac_floor",
+    "head_disagree_rel",
+    "reproj_rel_err"
+  ],
+  "worse_is": {
+    "conf_std": "low",
+    "conf_frac_floor": "high",
+    "head_disagree_rel": "high",
+    "reproj_rel_err": "high"
+  },
+  "sequences": {
+    "rgbd_dataset_freiburg3_sitting_halfsphere": {
+      "depth_conf_floor": 1.000001,
+      "metrics": {
+        "conf_std": {
+          "clean": 5.048426312555257,
+          "threshold": 4.719196270976604,
+          "worse": "low"
+        },
+        "conf_frac_floor": {
+          "clean": 0.2750325033488299,
+          "threshold": 0.39090817311480575,
+          "worse": "high"
+        },
+        "head_disagree_rel": {
+          "clean": 0.004728478813610611,
+          "threshold": 0.012877030182169905,
+          "worse": "high"
+        },
+        "reproj_rel_err": {
+          "clean": 0.005099585643408089,
+          "threshold": 0.006914327172046538,
+          "worse": "high"
+        }
+      }
+    },
+    "rgbd_dataset_freiburg3_sitting_rpy": {
+      "depth_conf_floor": 1.000001,
+      "metrics": {
+        "conf_std": {
+          "clean": 0.21205555604572335,
+          "threshold": 0.04395935963163802,
+          "worse": "low"
+        },
+        "conf_frac_floor": {
+          "clean": 0.5325944567015996,
+          "threshold": 0.819137331573556,
+          "worse": "high"
+        },
+        "head_disagree_rel": {
+          "clean": 0.023407681528097957,
+          "threshold": 0.10023010182506885,
+          "worse": "high"
+        },
+        "reproj_rel_err": {
+          "clean": 0.011712051412802234,
+          "threshold": 0.023071155332437265,
+          "worse": "high"
+        }
+      }
+    },
+    "rgbd_dataset_freiburg3_sitting_static": {
+      "depth_conf_floor": 1.000001,
+      "metrics": {
+        "conf_std": {
+          "clean": 0.2778024183972809,
+          "threshold": 0.2515162059813105,
+          "worse": "low"
+        },
+        "conf_frac_floor": {
+          "clean": 0.28118844062721615,
+          "threshold": 0.32861845993223543,
+          "worse": "high"
+        },
+        "head_disagree_rel": {
+          "clean": 0.008320314838423371,
+          "threshold": 0.00965978013930316,
+          "worse": "high"
+        },
+        "reproj_rel_err": {
+          "clean": 0.0060945656489273395,
+          "threshold": 0.011245908608971629,
+          "worse": "high"
+        }
+      }
+    },
+    "rgbd_dataset_freiburg3_sitting_xyz": {
+      "depth_conf_floor": 1.000001,
+      "metrics": {
+        "conf_std": {
+          "clean": 0.5652859217506656,
+          "threshold": 0.5140415964853028,
+          "worse": "low"
+        },
+        "conf_frac_floor": {
+          "clean": 0.191688499724214,
+          "threshold": 0.2460055354188007,
+          "worse": "high"
+        },
+        "head_disagree_rel": {
+          "clean": 0.008545795761076017,
+          "threshold": 0.013748516553489956,
+          "worse": "high"
+        },
+        "reproj_rel_err": {
+          "clean": 0.007440497886960915,
+          "threshold": 0.008465237920444778,
+          "worse": "high"
+        }
+      }
+    },
+    "rgbd_dataset_freiburg3_walking_halfsphere": {
+      "depth_conf_floor": 1.000001,
+      "metrics": {
+        "conf_std": {
+          "clean": 0.22140335982020282,
+          "threshold": 0.07646185671778899,
+          "worse": "low"
+        },
+        "conf_frac_floor": {
+          "clean": 0.4463251516822946,
+          "threshold": 0.7614345303758567,
+          "worse": "high"
+        },
+        "head_disagree_rel": {
+          "clean": 0.013716578729280974,
+          "threshold": 0.019269997934885874,
+          "worse": "high"
+        },
+        "reproj_rel_err": {
+          "clean": 0.03344286114803911,
+          "threshold": 0.3209880209563359,
+          "worse": "high"
+        }
+      }
+    },
+    "rgbd_dataset_freiburg3_walking_rpy": {
+      "depth_conf_floor": 1.000001,
+      "metrics": {
+        "conf_std": {
+          "clean": 0.11911574549281041,
+          "threshold": 0.05013257746734913,
+          "worse": "low"
+        },
+        "conf_frac_floor": {
+          "clean": 0.4513163856276101,
+          "threshold": 0.7302084154124968,
+          "worse": "high"
+        },
+        "head_disagree_rel": {
+          "clean": 0.014224133076295485,
+          "threshold": 0.03324826672444581,
+          "worse": "high"
+        },
+        "reproj_rel_err": {
+          "clean": 0.03439113778458447,
+          "threshold": 0.13569000985443033,
+          "worse": "high"
+        }
+      }
+    },
+    "rgbd_dataset_freiburg3_walking_static": {
+      "depth_conf_floor": 1.000001,
+      "metrics": {
+        "conf_std": {
+          "clean": 0.16829203152359618,
+          "threshold": 0.13258176229065569,
+          "worse": "low"
+        },
+        "conf_frac_floor": {
+          "clean": 0.3393497360334095,
+          "threshold": 0.46167387321724046,
+          "worse": "high"
+        },
+        "head_disagree_rel": {
+          "clean": 0.012352485595869326,
+          "threshold": 0.016079698152224976,
+          "worse": "high"
+        },
+        "reproj_rel_err": {
+          "clean": 0.010499319294981681,
+          "threshold": 0.03499909755900788,
+          "worse": "high"
+        }
+      }
+    },
+    "rgbd_dataset_freiburg3_walking_xyz": {
+      "depth_conf_floor": 1.000001,
+      "metrics": {
+        "conf_std": {
+          "clean": 0.1777342835681368,
+          "threshold": 0.11750840365163442,
+          "worse": "low"
+        },
+        "conf_frac_floor": {
+          "clean": 0.3615332716098022,
+          "threshold": 0.5228626585769443,
+          "worse": "high"
+        },
+        "head_disagree_rel": {
+          "clean": 0.015250494754105465,
+          "threshold": 0.036816226652526096,
+          "worse": "high"
+        },
+        "reproj_rel_err": {
+          "clean": 0.03140077167565959,
+          "threshold": 0.03799828814590503,
+          "worse": "high"
+        }
+      }
+    }
+  }
+}
