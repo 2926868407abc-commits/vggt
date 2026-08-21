@@ -145,6 +145,7 @@ EOT_GEO_TRANSLATE="${EOT_GEO_TRANSLATE:-0.02}"
 EOT_GEO_SCALE="${EOT_GEO_SCALE:-0.03}"
 EOT_GEO_ROTATE_DEGREES="${EOT_GEO_ROTATE_DEGREES:-2.0}"
 EOT_GEO_PERSPECTIVE="${EOT_GEO_PERSPECTIVE:-0.01}"
+EOT_SAMPLES="${EOT_SAMPLES:-1}"
 TV_WEIGHT="${TV_WEIGHT:-0.0}"
 PRINTABILITY_WEIGHT="${PRINTABILITY_WEIGHT:-0.0}"
 PRINTABLE_COLOR_LEVELS="${PRINTABLE_COLOR_LEVELS:-8}"
@@ -206,7 +207,7 @@ echo "surface_support_check=$SURFACE_SUPPORT_CHECK abs_tol=$SURFACE_SUPPORT_ABS_
 echo "surface_strength_search=$SURFACE_STRENGTH_SEARCH candidates=$SURFACE_STRENGTH_CANDIDATES steps=$SURFACE_STRENGTH_STEPS strength_lr=$SURFACE_STRENGTH_LR"
 echo "natural_auto_relax=$NATURAL_AUTO_RELAX max_coverage=$NATURAL_RELAX_MAX_COVERAGE min_visible_frames=$NATURAL_RELAX_MIN_VISIBLE_FRAMES min_visibility=$NATURAL_RELAX_MIN_VISIBILITY_RATIO orientation=$NATURAL_RELAX_ORIENTATION_FILTER"
 echo "physical_eot=$PHYSICAL_EOT print=[$PRINT_MIN,$PRINT_MAX] brightness=$EOT_BRIGHTNESS contrast=$EOT_CONTRAST gamma=$EOT_GAMMA noise_std=$EOT_NOISE_STD warmup_fraction=$EOT_WARMUP_FRACTION"
-echo "eot_geo translate=$EOT_GEO_TRANSLATE scale=$EOT_GEO_SCALE rotate=$EOT_GEO_ROTATE_DEGREES perspective=$EOT_GEO_PERSPECTIVE"
+echo "eot_geo translate=$EOT_GEO_TRANSLATE scale=$EOT_GEO_SCALE rotate=$EOT_GEO_ROTATE_DEGREES perspective=$EOT_GEO_PERSPECTIVE samples=$EOT_SAMPLES"
 echo "regularization tv=$TV_WEIGHT printability=$PRINTABILITY_WEIGHT levels=$PRINTABLE_COLOR_LEVELS low_frequency=$LOW_FREQUENCY_WEIGHT kernel=$LOW_FREQUENCY_KERNEL"
 echo "natural_reference image=$NATURAL_REFERENCE_IMAGE weight=$NATURAL_REFERENCE_WEIGHT"
 echo "run_eval=$RUN_EVAL run_gauge_diag=$RUN_GAUGE_DIAG run_consistency_check=$RUN_CONSISTENCY_CHECK"
@@ -407,6 +408,7 @@ fi
   --eot_geo_scale "$EOT_GEO_SCALE" \
   --eot_geo_rotate_degrees "$EOT_GEO_ROTATE_DEGREES" \
   --eot_geo_perspective "$EOT_GEO_PERSPECTIVE" \
+  --eot_samples "$EOT_SAMPLES" \
   --tv_weight "$TV_WEIGHT" \
   --printability_weight "$PRINTABILITY_WEIGHT" \
   --printable_color_levels "$PRINTABLE_COLOR_LEVELS" \

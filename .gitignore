@@ -147,3 +147,16 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+# heavy experiment artefacts -- regenerable, and far too large for git
+# (measured 2026-08: outputs 36G, data 132G, checkpoints 9.4G)
+/outputs/
+/outputs_attack/
+/outputs_attack_geometry_aware_nrgbd/
+/outputs_attack_geometry_aware_tum10/
+/outputs_attack_vla_style/
+/outputs_attack_vla_style_s1_tum10/
+/outputs_attack_vla_style_smoke/
+/checkpoints/
+/data/
+/reports/
