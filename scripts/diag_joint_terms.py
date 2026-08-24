@@ -27,7 +27,16 @@ sys.path.insert(0, str(VG))
 import attack_vggt_geometry_tum10 as A  # noqa: E402
 
 
-def build_args(scene: str, axis: int) -> argparse.Namespace:
+def build_args(scene: str, axis: int, texture_size: int = 128,
+               quad: str | None = None) -> argparse.Namespace:
+    """Build one training-step config.
+
+    Defaults reproduce the original 128x128 + automatic-surface run this script was
+    written for. Pass texture_size / quad to point it at the current setup instead:
+    the head weights it derives only apply to the configuration it measured, and
+    the 128-era numbers do not transfer (the placement and the texture resolution
+    both changed).
+    """
     argv = [
         "attack.py",
         "--tum_root", "/mnt/data/wangqq/recons_eval/data/tum",
@@ -36,7 +45,7 @@ def build_args(scene: str, axis: int) -> argparse.Namespace:
         "--frame_manifest", str(VG / "data/tum_dynamics_10frame_individual_scenes"
                                     "/tum10_frame_manifest.json"),
         "--ckpt", str(VG / "checkpoints/VGGT-1B"),
-        "--texture_size", "128", "--texture_init", "image",
+        "--texture_size", str(texture_size), "--texture_init", "image",
         "--texture_init_image", str(VG / "assets/hazard_textures/mde_attack_warnning.png"),
         "--iterations", "1", "--inner_loop", "1", "--scenes_per_iteration", "1",
         "--patch_lr", "0.002", "--feature_layer", "aggregator_final",
@@ -48,17 +57,11 @@ def build_args(scene: str, axis: int) -> argparse.Namespace:
         "--joint_depth_conf_weight", "1.0", "--joint_point_conf_weight", "1.0",
         "--joint_track_weight", "1.0", "--joint_track_grid_rows", "4",
         "--joint_track_grid_cols", "6", "--joint_track_iters", "2",
-        "--plane_mode", "fused_depth_surface",
-        "--plane_width", "0.30", "--plane_height", "0.20",
         "--clean_vggt_output_root",
         str(VG / "outputs_attack_geometry_aware_tum10/tum10_clean_uniform_l3"),
-        "--surface_score_mode", "coverage",
-        "--surface_coverage_min", "0.005", "--surface_coverage_max", "0.06",
-        "--surface_min_visible_frames", "8", "--surface_min_visibility_ratio", "0.80",
         "--surface_min_support_ratio", "0.50",
         "--surface_support_abs_tolerance", "0.10",
-        "--surface_support_rel_tolerance", "0.06",
-        "--fused_max_plane_residual", "0.12", "--visibility_depth_margin", "0.08",
+        "--visibility_depth_margin", "0.08",
         "--tv_weight", "0.001", "--printability_weight", "0.001",
         "--printable_color_levels", "2", "--low_frequency_weight", "0.0",
         "--natural_reference_weight", "0.05",
@@ -66,6 +69,29 @@ def build_args(scene: str, axis: int) -> argparse.Namespace:
         "--seed", "0",
         "--use_depth_visibility", "--optimize_geometry", "--surface_support_check",
     ]
+    if quad:
+        argv += [
+            "--plane_mode", "depth_manual_quad_surface",
+            "--manual_quad_xy", quad, "--manual_quad_coordinates", "normalized",
+            "--manual_quad_depth_sample_stride", "1", "--manual_quad_fit_shrink", "0.75",
+            "--manual_quad_plane_inlier_tolerance", "0.06",
+            "--manual_quad_min_inlier_ratio", "0.60",
+            "--surface_support_rel_tolerance", "0.01",
+            "--fused_max_plane_residual", "0.02",
+            "--surface_score_mode", "coverage",
+            "--surface_coverage_min", "0.002", "--surface_coverage_max", "0.08",
+            "--surface_min_visible_frames", "4", "--surface_min_visibility_ratio", "0.30",
+        ]
+    else:
+        argv += [
+            "--plane_mode", "fused_depth_surface",
+            "--plane_width", "0.30", "--plane_height", "0.20",
+            "--surface_score_mode", "coverage",
+            "--surface_coverage_min", "0.005", "--surface_coverage_max", "0.06",
+            "--surface_min_visible_frames", "8", "--surface_min_visibility_ratio", "0.80",
+            "--surface_support_rel_tolerance", "0.06",
+            "--fused_max_plane_residual", "0.12",
+        ]
     saved, sys.argv = sys.argv, argv
     try:
         return A.parse_args()
@@ -77,9 +103,14 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--scene", default="rgbd_dataset_freiburg3_sitting_xyz")
     p.add_argument("--axis", type=int, default=0)
+    p.add_argument("--texture_size", type=int, default=128)
+    p.add_argument("--quad", default=None,
+                   help="normalised MANUAL_QUAD_XY; switches placement to the "
+                        "hand-marked monitor quad. Omit to keep the original "
+                        "automatic-surface configuration.")
     cli = p.parse_args()
 
-    args = build_args(cli.scene, cli.axis)
+    args = build_args(cli.scene, cli.axis, cli.texture_size, cli.quad)
     device = torch.device("cuda")
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     model = A.load_model(args, device)

@@ -3367,8 +3367,13 @@ def update_budget_duals(args: argparse.Namespace,
             continue
         name = key[len(prefix):]
         old = float(duals.get(name, args.budget_dual_init))
+        # The hinge keeps `values` non-negative, so without a decay a multiplier can
+        # only ever rise: a violation that is fixed early still penalises every later
+        # step. Decay 1.0 reproduces that original behaviour exactly.
+        decay = float(getattr(args, "budget_dual_decay", 1.0))
         duals[name] = float(np.clip(
-            old + args.budget_dual_lr * float(np.mean(values)), 0.0, args.budget_dual_max))
+            decay * old + args.budget_dual_lr * float(np.mean(values)),
+            0.0, args.budget_dual_max))
 
 
 def should_cache_clean_pose(args: argparse.Namespace) -> bool:
@@ -3378,6 +3383,110 @@ def should_cache_clean_pose(args: argparse.Namespace) -> bool:
         args.attack_loss in ("pose_drift_targeted", "pose_scale_targeted", "pose_yaw_targeted")
         and args.pose_bad_reference == "clean"
     )
+
+
+def mirage_coupled_loss(
+    preds: dict,
+    item: dict,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Outline eq. (3)-(7): dimensionless per-task terms with worst-task weighting.
+
+    Pose, depth and point map are pulled toward one per-frame gauge target, so those
+    three stay mutually consistent. Tracking cannot be: a gauge-derived track target
+    equals the clean tracks exactly, so that term is untargeted and pushes away from
+    clean instead.
+
+    Every term is normalised to be scale-free before the weights are formed --
+    otherwise the weighting in eq. (7) would just rank the units.
+    """
+    targets = item.get("joint_gauge_targets")
+    if targets is None:
+        raise RuntimeError("mirage_coupled needs --piecewise_gauge_family "
+                           "and --clean_vggt_output_root")
+
+    pred_rel = pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
+    pose_loss, pose_terms = pose_aligned_residual_mse(pred_rel, targets["pose_rel"], args)
+
+    depth_pred = dense_scalar_head(preds["depth"])
+    depth_loss = scale_invariant_depth_loss(depth_pred.float(), targets["depth"])
+
+    points_pred = preds["world_points"]
+    if points_pred.ndim == 5:
+        points_pred = points_pred[0]
+    point_loss = aligned_point_residual(points_pred.float(), targets["points"],
+                                        args.joint_point_stride)
+    # eq. (5): normalise by the clean cloud's median radius so the term is unitless
+    rho = float(item.get("clean_point_radius", 1.0)) or 1.0
+    point_loss = point_loss / (rho ** 2)
+
+    # eq. (6), untargeted: distance from the clean tracks, in units of the image
+    # diagonal, so it is comparable with the other three
+    track_loss = pose_loss.new_zeros(())
+    n_track = 0
+    if args.mirage_track_weight > 0:
+        track_target = item.get("joint_track_targets")
+        if track_target is None or "track" not in preds:
+            raise RuntimeError("mirage_track_weight > 0 needs cached clean tracks")
+        h, w = item["tensor_hw"]
+        diag = float((h * w) ** 0.5)
+        vis = track_target["vis"]
+        keep = (vis > args.joint_track_min_visibility).float()
+        # frame 0 carries the query points themselves and cannot move
+        keep = keep[:, 1:] if keep.ndim == 3 else keep[1:]
+        pt = preds["track"][:, 1:] if preds["track"].ndim == 4 else preds["track"][1:]
+        tt = (track_target["track"][:, 1:] if track_target["track"].ndim == 4
+              else track_target["track"][1:])
+        d2 = (pt - tt).pow(2).sum(-1) / (diag ** 2)
+        denom = keep.sum().clamp_min(1.0)
+        n_track = int(denom.item())
+        # negated: this term is maximised while the other three are minimised
+        track_loss = -(d2 * keep).sum() / denom
+
+    raw = {"pose": pose_loss, "depth": depth_loss, "point": point_loss,
+           "track": track_loss}
+    base = {"pose": args.joint_pose_weight, "depth": args.joint_depth_weight,
+            "point": args.joint_point_weight, "track": args.mirage_track_weight}
+    active = [k for k in raw if base[k] > 0]
+    vals = {k: float(raw[k].detach().cpu()) for k in raw}
+
+    # Per-task self-normalisation. The constants in eq. (3)-(6) fix each term's
+    # units but not its magnitude: measured raw, the four spanned 1.86e6, so the
+    # sum was decided entirely by the pose term. Dividing by a running maximum of
+    # each term's own absolute value puts all four near 1, which is the condition
+    # eq. (7) needs in order to be comparing progress rather than units.
+    scales = getattr(args, "_mirage_scales", None)
+    if scales is None:
+        scales = {}
+        args._mirage_scales = scales
+    for k in active:
+        scales[k] = max(scales.get(k, 0.0), abs(vals[k]), 1e-8)
+    norm = {k: raw[k] / scales[k] for k in active}
+    nvals = {k: vals[k] / scales[k] for k in active}
+
+    # eq. (7), direction corrected. Reading L_k^max as the max across tasks gave the
+    # biggest weight to the task with the smallest loss -- i.e. to whichever task was
+    # already easiest, the opposite of the stated intent. Weight now rises with how
+    # much of its own range a task still has to go.
+    import math as _math
+    ws = {k: base[k] * _math.exp(args.mirage_kappa * abs(nvals[k])) for k in active}
+    zsum = sum(ws.values()) or 1.0
+    ws = {k: v / zsum for k, v in ws.items()}
+
+    total = sum(ws[k] * norm[k] for k in active)
+    terms = {
+        "pose_loss": float(total.detach().cpu()),
+        "mirage_pose": vals["pose"], "mirage_depth": vals["depth"],
+        "mirage_point": vals["point"], "mirage_track": vals["track"],
+        "mirage_n_pose": nvals.get("pose", 0.0), "mirage_n_depth": nvals.get("depth", 0.0),
+        "mirage_n_point": nvals.get("point", 0.0), "mirage_n_track": nvals.get("track", 0.0),
+        "mirage_w_pose": ws.get("pose", 0.0), "mirage_w_depth": ws.get("depth", 0.0),
+        "mirage_w_point": ws.get("point", 0.0), "mirage_w_track": ws.get("track", 0.0),
+        "mirage_track_points": float(n_track),
+        "pose_rot_mse": pose_terms["pose_rot_mse"],
+        "pose_trans_mse": pose_terms["pose_trans_mse"],
+    }
+    return total, terms
 
 
 def attack_objective_loss(
@@ -3398,7 +3507,9 @@ def attack_objective_loss(
         loss, terms = feature_l1_loss(adv_features, item["clean_features"])
         return loss, terms, True
 
-    if args.attack_loss in ("geometry_joint_gauge_targeted", "geometry_joint_gauge_budgeted"):
+    if args.attack_loss in ("geometry_joint_gauge_targeted",
+                            "geometry_joint_gauge_budgeted",
+            "mirage_coupled"):
         # Needs all requested heads.  Handle it before the camera-only forward;
         # the old ordering ran the 1B aggregator twice per update for no reason.
         track_target = item.get("joint_track_targets")
@@ -3408,6 +3519,8 @@ def attack_objective_loss(
             track_iters=args.joint_track_iters)
         if args.attack_loss == "geometry_joint_gauge_budgeted":
             loss, terms = geometry_joint_gauge_budgeted_loss(preds, item, args)
+        elif args.attack_loss == "mirage_coupled":
+            loss, terms = mirage_coupled_loss(preds, item, args)
         else:
             loss, terms = geometry_joint_gauge_loss(preds, item, args)
         terms["pose_reference"] = "piecewise_gauge_clean"
@@ -3570,7 +3683,8 @@ def load_tum_sequence(
         args._active_vggt_geometry_source = old_vggt_source
         args._intrinsics_in_tensor_space = old_tensor_intrinsics
     joint_track_targets = None
-    needs_strict_track = (args.attack_loss == "geometry_joint_gauge_targeted"
+    needs_strict_track = (args.attack_loss in ("geometry_joint_gauge_targeted",
+                                              "mirage_coupled")
                           and args.joint_track_weight > 0)
     needs_budget_track = (args.attack_loss == "geometry_joint_gauge_budgeted"
                           and "track" in {s.strip() for s in args.budget_constraints.split(",")})
@@ -3591,7 +3705,7 @@ def load_tum_sequence(
         "pose_gt_rel": pose_gt_rel,
         "pose_piecewise_rel": pose_piecewise_rel,
         "joint_gauge_targets": build_joint_gauge_targets(seq_dir.name, args, device)
-        if args.attack_loss in ("geometry_joint_gauge_targeted",
+        if args.attack_loss in ("geometry_joint_gauge_targeted", "mirage_coupled",
                                 "geometry_joint_gauge_budgeted") else None,
         "joint_track_targets": joint_track_targets,
         "filter_budget": load_filter_budget(seq_dir.name, args)
@@ -4245,6 +4359,7 @@ def parse_args() -> argparse.Namespace:
             "pose_piecewise_gauge_targeted",
             "geometry_joint_gauge_targeted",
             "geometry_joint_gauge_budgeted",
+            "mirage_coupled",
             "pose_clean_untargeted",
             "pose_reverse_targeted",
             "pose_drift_targeted",
@@ -4314,6 +4429,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint_track_min_visibility", type=float, default=0.20)
     parser.add_argument("--joint_track_visibility_weight", type=float, default=0.10)
     parser.add_argument("--joint_track_confidence_weight", type=float, default=0.10)
+    parser.add_argument("--mirage_kappa", type=float, default=1.0,
+                        help="worst-task weighting sharpness, eq. (7). 0 reproduces "
+                             "the fixed weights.")
+    parser.add_argument("--mirage_track_weight", type=float, default=1.0,
+                        help="weight on the untargeted tracking term; 0 disables it")
     parser.add_argument("--joint_point_stride", type=int, default=4,
                         help="sub-sampling for the point-map term; the full map is 2M "
                              "points per sequence")
@@ -4328,6 +4448,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--budget_dual_init", type=float, default=0.0)
     parser.add_argument("--budget_dual_lr", type=float, default=1.0)
     parser.add_argument("--budget_dual_max", type=float, default=100.0)
+    parser.add_argument("--budget_dual_decay", type=float, default=1.0,
+                        help="multiplier applied to each dual before the ascent step. "
+                             "1.0 (default) is the original non-decaying behaviour, where "
+                             "a constraint violated early stays penalised forever. Values "
+                             "below 1 let a multiplier relax once its constraint is slack; "
+                             "0.99 halves it in ~69 steps.")
     parser.add_argument("--budget_rho", type=float, default=1.0,
                         help="quadratic augmented-Lagrangian weight on normalized violation")
     parser.add_argument("--budget_conf_floor_temperature", type=float, default=0.02)
