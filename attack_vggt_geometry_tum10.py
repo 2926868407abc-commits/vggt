@@ -1870,6 +1870,26 @@ def choose_patch_plane_world(
     args: argparse.Namespace,
     depth_maps: list[np.ndarray | None],
 ) -> tuple[np.ndarray, dict]:
+    if (args.plane_mode == "explicit_world_quad"
+            and getattr(args, "explicit_quad_world", None)):
+        # Corners supplied directly. The caller already chose the plane, so surface
+        # selection is skipped entirely and the renderer downstream is untouched --
+        # which is what keeps a scan comparable with the manual-quad baseline.
+        vals = [float(x) for x in str(args.explicit_quad_world).split(",")]
+        if len(vals) != 12:
+            raise ValueError("--explicit_quad_world needs 12 numbers (4 corners x xyz)")
+        quad = np.asarray(vals, dtype=np.float64).reshape(4, 3)
+        e1, e2 = quad[1] - quad[0], quad[3] - quad[0]
+        nrm = np.cross(e1, e2)
+        nrm = nrm / max(float(np.linalg.norm(nrm)), 1e-12)
+        return quad, {
+            "placement_mode": "explicit_world_quad",
+            "width_m": float(np.linalg.norm(e1)),
+            "height_m": float(np.linalg.norm(e2)),
+            "plane_normal_world": nrm.tolist(),
+            "plane_center_world": quad.mean(0).tolist(),
+        }
+
     cache = getattr(args, "_plane_world_cache", None)
     if cache is None:
         cache = {}
@@ -3353,6 +3373,23 @@ def geometry_joint_gauge_budgeted_loss(
     return total, terms
 
 
+def update_floor_duals(args: argparse.Namespace,
+                       attack_term_values: dict[str, list[float]]) -> None:
+    """Dual ascent on the damage floor, with decay so a satisfied constraint relaxes."""
+    if args.attack_loss != "mirage_floor":
+        return
+    duals = getattr(args, "_floor_duals", None)
+    if duals is None:
+        return
+    vals = attack_term_values.get("floor_shortfall")
+    if not vals:
+        return
+    short = float(np.mean(vals))
+    decay = float(getattr(args, "budget_dual_decay", 1.0))
+    new = duals["track"] * decay + args.budget_dual_lr * short
+    duals["track"] = float(min(max(new, 0.0), args.budget_dual_max))
+
+
 def update_budget_duals(args: argparse.Namespace,
                         attack_term_values: dict[str, list[float]]) -> None:
     """One projected dual-ascent update after each patch optimiser update."""
@@ -3437,7 +3474,8 @@ def mirage_coupled_loss(
         pt = preds["track"][:, 1:] if preds["track"].ndim == 4 else preds["track"][1:]
         tt = (track_target["track"][:, 1:] if track_target["track"].ndim == 4
               else track_target["track"][1:])
-        d2 = (pt - tt).pow(2).sum(-1) / (diag ** 2)
+        # kept in squared pixels; the reference below turns it into progress
+        d2 = (pt - tt).pow(2).sum(-1)
         denom = keep.sum().clamp_min(1.0)
         n_track = int(denom.item())
         # negated: this term is maximised while the other three are minimised
@@ -3450,26 +3488,28 @@ def mirage_coupled_loss(
     active = [k for k in raw if base[k] > 0]
     vals = {k: float(raw[k].detach().cpu()) for k in raw}
 
-    # Per-task self-normalisation. The constants in eq. (3)-(6) fix each term's
-    # units but not its magnitude: measured raw, the four spanned 1.86e6, so the
-    # sum was decided entirely by the pose term. Dividing by a running maximum of
-    # each term's own absolute value puts all four near 1, which is the condition
-    # eq. (7) needs in order to be comparing progress rather than units.
-    scales = getattr(args, "_mirage_scales", None)
-    if scales is None:
-        scales = {}
-        args._mirage_scales = scales
-    for k in active:
-        scales[k] = max(scales.get(k, 0.0), abs(vals[k]), 1e-8)
-    norm = {k: raw[k] / scales[k] for k in active}
-    nvals = {k: vals[k] / scales[k] for k in active}
+    # Fixed references, captured once, so each term reads as progress in [0, 1].
+    # A running extremum cannot serve here: for the maximised track term it grows
+    # with the quantity it normalises and the ratio pins at 1 forever, which is
+    # exactly what hid whether tracking was being attacked.
+    ref = getattr(args, "_mirage_ref", None)
+    if ref is None:
+        ref = {k: max(abs(vals[k]), 1e-8) for k in ("pose", "depth", "point")}
+        # track is measured against a displacement the attack is trying to reach,
+        # not against its own starting value, which is ~0 by construction
+        ref["track"] = float(args.mirage_track_ref_px) ** 2
+        args._mirage_ref = ref
 
-    # eq. (7), direction corrected. Reading L_k^max as the max across tasks gave the
-    # biggest weight to the task with the smallest loss -- i.e. to whichever task was
-    # already easiest, the opposite of the stated intent. Weight now rises with how
-    # much of its own range a task still has to go.
+    norm = {k: raw[k] / ref[k] for k in active}
+    nvals = {k: vals[k] / ref[k] for k in active}
+    # minimised terms start at 1 and fall; the maximised one starts at 0 and grows
+    progress = {k: (1.0 - nvals[k]) if k != "track" else min(abs(nvals[k]), 1.0)
+                for k in active}
+
+    # eq. (7): the step goes to whichever task has advanced least.
     import math as _math
-    ws = {k: base[k] * _math.exp(args.mirage_kappa * abs(nvals[k])) for k in active}
+    ws = {k: base[k] * _math.exp(args.mirage_kappa * (1.0 - progress[k]))
+          for k in active}
     zsum = sum(ws.values()) or 1.0
     ws = {k: v / zsum for k, v in ws.items()}
 
@@ -3480,6 +3520,11 @@ def mirage_coupled_loss(
         "mirage_point": vals["point"], "mirage_track": vals["track"],
         "mirage_n_pose": nvals.get("pose", 0.0), "mirage_n_depth": nvals.get("depth", 0.0),
         "mirage_n_point": nvals.get("point", 0.0), "mirage_n_track": nvals.get("track", 0.0),
+        "mirage_p_pose": progress.get("pose", 0.0),
+        "mirage_p_depth": progress.get("depth", 0.0),
+        "mirage_p_point": progress.get("point", 0.0),
+        "mirage_p_track": progress.get("track", 0.0),
+        "mirage_track_rms_px": float(abs(vals["track"]) ** 0.5),
         "mirage_w_pose": ws.get("pose", 0.0), "mirage_w_depth": ws.get("depth", 0.0),
         "mirage_w_point": ws.get("point", 0.0), "mirage_w_track": ws.get("track", 0.0),
         "mirage_track_points": float(n_track),
@@ -3487,6 +3532,308 @@ def mirage_coupled_loss(
         "pose_trans_mse": pose_terms["pose_trans_mse"],
     }
     return total, terms
+
+
+def mirage_floor_loss(
+    preds: dict,
+    item: dict,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Maximise pose damage subject to a floor on how far tracking has moved.
+
+    Returned value is minimised by the caller, so the pose term enters negated.
+    The constraint is one-sided: no penalty once tracking has moved past the floor,
+    so a satisfied constraint stops competing with the attack instead of continuing
+    to pull on it.
+    """
+    pred_rel = pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
+    pose_score, pose_terms = pose_aligned_residual_mse(pred_rel, item["pose_gt_rel"], args)
+    primary = -pose_score
+
+    track_target = item.get("joint_track_targets")
+    if track_target is None or "track" not in preds:
+        raise RuntimeError("mirage_floor needs cached clean tracks and the track head")
+    # Visibility gate raised above the training default: at 0.2 the population
+    # includes points the evaluation never scores, where displacement is free.
+    keep = (track_target["vis"] > args.mirage_floor_vis).float()
+    keep = keep[:, 1:] if keep.ndim == 3 else keep[1:]
+    pt = preds["track"][:, 1:] if preds["track"].ndim == 4 else preds["track"][1:]
+    tt = (track_target["track"][:, 1:] if track_target["track"].ndim == 4
+          else track_target["track"][1:])
+    # mean L2, not RMS of squares: measured on the previous run, RMS read 46.07 px
+    # while the median was 0.90 px, so a tenth of the points carried the whole floor
+    d = (pt - tt).pow(2).sum(-1).clamp_min(1e-12).sqrt()
+    denom = keep.sum().clamp_min(1.0)
+    track_rms = (d * keep).sum() / denom
+
+    floor = float(args.mirage_floor_track_px)
+    shortfall = (floor - track_rms).clamp_min(0.0) / max(floor, 1e-6)
+
+    duals = getattr(args, "_floor_duals", None)
+    if duals is None:
+        duals = {"track": float(args.budget_dual_init)}
+        args._floor_duals = duals
+    dual = duals["track"]
+    penalty = dual * shortfall + 0.5 * args.budget_rho * shortfall.pow(2)
+
+    total = primary + penalty
+    return total, {
+        "pose_loss": float(total.detach().cpu()),
+        "floor_primary_pose": float(pose_score.detach().cpu()),
+        "floor_track_rms_px": float(track_rms.detach().cpu()),
+        "floor_shortfall": float(shortfall.detach().cpu()),
+        "floor_dual_track": dual,
+        "pose_rot_mse": pose_terms["pose_rot_mse"],
+        "pose_trans_mse": pose_terms["pose_trans_mse"],
+    }
+
+
+def load_mirage_projected_gt(
+    seq_name: str,
+    frame_indices: list[int],
+    tensor_hw: tuple[int, int],
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Load the four TUM GT tasks once for projected multi-objective training."""
+    cache = getattr(args, "_mirage_projected_gt_cache", None)
+    if cache is None:
+        cache = {}
+        args._mirage_projected_gt_cache = cache
+    if seq_name in cache:
+        return cache[seq_name]
+
+    path = Path(args.mirage_projected_gt_dir) / f"{seq_name}_gt.npz"
+    if not path.exists():
+        raise RuntimeError(f"mirage_projected GT not found: {path}")
+    with np.load(path, allow_pickle=True) as data:
+        raw = {key: data[key] for key in data.files}
+    saved_frames = np.asarray(raw["frame_indices"], dtype=np.int64).tolist()
+    if saved_frames != [int(index) for index in frame_indices]:
+        raise RuntimeError(
+            f"mirage_projected GT frames {saved_frames} != run frames {frame_indices}"
+        )
+    saved_hw = tuple(int(value) for value in np.asarray(raw["tensor_hw"]).tolist())
+    if saved_hw != tuple(tensor_hw):
+        raise RuntimeError(f"mirage_projected GT grid {saved_hw} != run grid {tensor_hw}")
+
+    points_np = np.asarray(raw["point_map"], dtype=np.float32)
+    valid_np = np.asarray(raw["point_valid"], dtype=bool)
+    c2w_np = np.asarray(raw["gt_c2w"], dtype=np.float64)
+    depth_np = np.zeros(valid_np.shape, dtype=np.float32)
+    for frame in range(points_np.shape[0]):
+        rotation = c2w_np[frame, :3, :3]
+        translation = c2w_np[frame, :3, 3]
+        camera = (points_np[frame].astype(np.float64) - translation) @ rotation
+        z = camera[..., 2]
+        keep = valid_np[frame] & np.isfinite(z) & (z > 1e-6)
+        depth_np[frame, keep] = z[keep]
+
+    points = torch.from_numpy(points_np).to(device=device)
+    valid = torch.from_numpy(valid_np).to(device=device)
+    points = points.clone()
+    points[~valid] = float("nan")
+    target = {
+        "depth": torch.from_numpy(depth_np).to(device=device),
+        "point_map": points,
+        "point_valid": valid,
+        "query_points": torch.from_numpy(
+            np.asarray(raw["query_points"], dtype=np.float32)
+        ).to(device=device),
+        "tracks": torch.from_numpy(np.asarray(raw["tracks"], dtype=np.float32)).to(
+            device=device
+        ),
+        "track_visible": torch.from_numpy(
+            np.asarray(raw["track_visible"], dtype=bool)
+        ).to(device=device),
+        "track_known": torch.from_numpy(
+            np.asarray(raw["track_known"], dtype=bool)
+        ).to(device=device),
+    }
+    cache[seq_name] = target
+    return target
+
+
+def mirage_projected_depth_score(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Production-like median-scale-aligned AbsRel; larger means worse."""
+    keep = valid & torch.isfinite(pred) & (pred > eps) & (target > eps)
+    if int(keep.sum()) < 100:
+        raise RuntimeError(f"Only {int(keep.sum())} valid projected-loss depth pixels")
+    p, g = pred[keep].float(), target[keep].float()
+    with torch.no_grad():
+        scale = g.median() / p.median().clamp_min(eps)
+    return ((p * scale - g).abs() / g.clamp_min(eps)).mean()
+
+
+def mirage_projected_track_score(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    visible: torch.Tensor,
+    known: torch.Tensor,
+    cap_px: float,
+) -> torch.Tensor:
+    """Capped reprojection-GT EPE so a few outliers cannot carry the objective."""
+    if pred.ndim == 4:
+        pred = pred[0]
+    keep = visible[1:] & known[1:]
+    distance = (pred[1:] - target[1:]).float().pow(2).sum(-1).clamp_min(1e-12).sqrt()
+    values = distance[keep]
+    if values.numel() == 0:
+        raise RuntimeError("No visible reprojection-GT tracks for mirage_projected")
+    cap = max(float(cap_px), 1e-6)
+    return cap * torch.tanh(values / cap).mean()
+
+
+def mirage_projected_task_scores(
+    preds: dict[str, torch.Tensor],
+    item: dict,
+    args: argparse.Namespace,
+) -> dict[str, torch.Tensor]:
+    """Larger-is-worse task scores aligned with the production evaluation.
+
+    The original mode treats camera pose as one task whose gradient direction is
+    set by ``pose_rotation_weight:pose_translation_weight``.  The split-pose mode
+    exposes aligned translation and aligned rotation as separate max-min
+    objectives, removing that within-pose coefficient from the search direction.
+    """
+    gt = item.get("mirage_projected_gt")
+    if gt is None:
+        raise RuntimeError("mirage_projected needs the synthesized TUM four-task GT")
+
+    pred_rel = pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
+    split_pose = args.attack_loss == "mirage_projected_split_pose"
+    if split_pose:
+        trans_args = copy.copy(args)
+        trans_args.pose_rotation_weight = 0.0
+        trans_args.pose_translation_weight = 1.0
+        pose_trans, _ = pose_aligned_residual_mse(
+            pred_rel, item["pose_gt_rel"], trans_args
+        )
+        rot_args = copy.copy(args)
+        rot_args.pose_rotation_weight = 1.0
+        rot_args.pose_translation_weight = 0.0
+        pose_rot, _ = pose_aligned_residual_mse(
+            pred_rel, item["pose_gt_rel"], rot_args
+        )
+    else:
+        pose, _ = pose_aligned_residual_mse(pred_rel, item["pose_gt_rel"], args)
+
+    depth_pred = dense_scalar_head(preds["depth"]).float()
+    depth = mirage_projected_depth_score(
+        depth_pred, gt["depth"], gt["point_valid"]
+    )
+
+    point_pred = preds["world_points"]
+    if point_pred.ndim == 5:
+        point_pred = point_pred[0]
+    point = aligned_point_residual(
+        point_pred.float(), gt["point_map"], stride=args.joint_point_stride
+    )
+
+    track = mirage_projected_track_score(
+        preds["track"], gt["tracks"], gt["track_visible"], gt["track_known"],
+        args.mirage_projected_track_cap_px,
+    )
+    if split_pose:
+        return {
+            "pose_trans": pose_trans,
+            "pose_rot": pose_rot,
+            "depth": depth,
+            "point": point,
+            "track": track,
+        }
+    return {"pose": pose, "depth": depth, "point": point, "track": track}
+
+
+def maximin_gradient_weights(unit_gradients: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+    """LP weights maximizing the worst cosine gain among four unit gradients."""
+    from scipy.optimize import linprog
+
+    gram = (unit_gradients @ unit_gradients.transpose(0, 1)).double().cpu().numpy()
+    n_tasks = gram.shape[0]
+    objective = np.r_[np.zeros(n_tasks), -1.0]
+    # gram @ weights >= margin
+    a_ub = np.c_[-gram, np.ones(n_tasks)]
+    b_ub = np.zeros(n_tasks)
+    a_eq = np.asarray([[1.0] * n_tasks + [0.0]])
+    b_eq = np.asarray([1.0])
+    result = linprog(
+        objective,
+        A_ub=a_ub,
+        b_ub=b_ub,
+        A_eq=a_eq,
+        b_eq=b_eq,
+        bounds=[(0.0, None)] * n_tasks + [(None, None)],
+        method="highs",
+    )
+    if not result.success:
+        raise RuntimeError(f"mirage_projected max-min LP failed: {result.message}")
+    return result.x[:n_tasks].astype(np.float64), (gram @ result.x[:n_tasks])
+
+
+def mirage_projected_texture_gradient(
+    model: torch.nn.Module,
+    adv_images: torch.Tensor,
+    texture: torch.Tensor,
+    item: dict,
+    args: argparse.Namespace,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Return a pose-scaled direction with positive first-order gain for all tasks."""
+    gt = item["mirage_projected_gt"]
+    preds = forward_all_geometry_heads(
+        model,
+        adv_images,
+        dtype,
+        query_points=gt["query_points"].unsqueeze(0),
+        track_iters=args.joint_track_iters,
+    )
+    scores = mirage_projected_task_scores(preds, item, args)
+    names = tuple(scores)
+    gradients = []
+    norms = []
+    for index, name in enumerate(names):
+        gradient = torch.autograd.grad(
+            scores[name], texture, retain_graph=index < len(names) - 1
+        )[0].detach().float()
+        norm = gradient.norm().clamp_min(1e-30)
+        gradients.append(gradient)
+        norms.append(norm)
+    units = torch.stack([gradient.flatten() / norm for gradient, norm in zip(gradients, norms)])
+    weights_np, gains_np = maximin_gradient_weights(units)
+    weights = torch.from_numpy(weights_np).to(device=texture.device, dtype=texture.dtype)
+    direction = sum(weights[index] * gradients[index] / norms[index]
+                    for index in range(len(names)))
+    direction = direction / direction.norm().clamp_min(1e-30)
+    # A fixed scale is required for coefficient ablations: otherwise changing the
+    # rotation coefficient also changes ||g_pose|| and therefore silently changes
+    # attack-vs-regularizer strength. Zero preserves the historical pose-norm rule.
+    fixed_scale = float(args.mirage_projected_direction_scale)
+    direction_scale = texture.new_tensor(fixed_scale) if fixed_scale > 0 else norms[0]
+    direction = direction * direction_scale
+
+    terms = {f"projected_{name}_score": float(scores[name].detach().cpu())
+             for name in names}
+    for index, name in enumerate(names):
+        terms[f"projected_{name}_grad_norm"] = float(norms[index].cpu())
+        terms[f"projected_{name}_weight"] = float(weights_np[index])
+        terms[f"projected_{name}_gain"] = float(gains_np[index])
+    terms["projected_min_gain"] = float(np.min(gains_np))
+    terms["projected_direction_scale"] = float(direction_scale.detach().cpu())
+    if "pose" in scores:
+        terms["pose_loss"] = terms["projected_pose_score"]
+    else:
+        # Logging only; the split-pose search direction never differentiates this
+        # sum and therefore has no hidden rotation-vs-translation coefficient.
+        terms["pose_loss"] = (
+            terms["projected_pose_trans_score"] + terms["projected_pose_rot_score"]
+        )
+    return direction, terms
 
 
 def attack_objective_loss(
@@ -3509,7 +3856,7 @@ def attack_objective_loss(
 
     if args.attack_loss in ("geometry_joint_gauge_targeted",
                             "geometry_joint_gauge_budgeted",
-            "mirage_coupled"):
+            "mirage_coupled", "mirage_floor"):
         # Needs all requested heads.  Handle it before the camera-only forward;
         # the old ordering ran the 1B aggregator twice per update for no reason.
         track_target = item.get("joint_track_targets")
@@ -3519,6 +3866,8 @@ def attack_objective_loss(
             track_iters=args.joint_track_iters)
         if args.attack_loss == "geometry_joint_gauge_budgeted":
             loss, terms = geometry_joint_gauge_budgeted_loss(preds, item, args)
+        elif args.attack_loss == "mirage_floor":
+            loss, terms = mirage_floor_loss(preds, item, args)
         elif args.attack_loss == "mirage_coupled":
             loss, terms = mirage_coupled_loss(preds, item, args)
         else:
@@ -3684,7 +4033,7 @@ def load_tum_sequence(
         args._intrinsics_in_tensor_space = old_tensor_intrinsics
     joint_track_targets = None
     needs_strict_track = (args.attack_loss in ("geometry_joint_gauge_targeted",
-                                              "mirage_coupled")
+                                              "mirage_coupled", "mirage_floor")
                           and args.joint_track_weight > 0)
     needs_budget_track = (args.attack_loss == "geometry_joint_gauge_budgeted"
                           and "track" in {s.strip() for s in args.budget_constraints.split(",")})
@@ -3693,6 +4042,10 @@ def load_tum_sequence(
             raise RuntimeError("four-head joint loss needs model/dtype to cache clean tracks")
         joint_track_targets = clean_track_targets(
             seq_dir.name, images, tensor_hw, model, dtype, args)
+    mirage_projected_gt = (
+        load_mirage_projected_gt(seq_dir.name, frame_indices, tensor_hw, args, device)
+        if args.attack_loss in ("mirage_projected", "mirage_projected_split_pose") else None
+    )
     return {
         "seq": seq_dir.name,
         "seq_dir": seq_dir,
@@ -3706,8 +4059,10 @@ def load_tum_sequence(
         "pose_piecewise_rel": pose_piecewise_rel,
         "joint_gauge_targets": build_joint_gauge_targets(seq_dir.name, args, device)
         if args.attack_loss in ("geometry_joint_gauge_targeted", "mirage_coupled",
+                               "mirage_floor",
                                 "geometry_joint_gauge_budgeted") else None,
         "joint_track_targets": joint_track_targets,
+        "mirage_projected_gt": mirage_projected_gt,
         "filter_budget": load_filter_budget(seq_dir.name, args)
         if args.attack_loss == "geometry_joint_gauge_budgeted" else None,
         "pose_clean_rel": clean_pose_rel,
@@ -3986,16 +4341,36 @@ def train_geometry_patch(
                             args,
                             training=True,
                         )
-                        loss, terms, maximize_loss = attack_objective_loss(
-                            model,
-                            adv_images,
-                            item,
-                            args,
-                            dtype,
-                        )
                         reg_terms = patch_regularization_terms(texture, args)
-                        objective = (-loss if maximize_loss else loss) + reg_terms["regularization_total"]
-                        (objective / grad_divisor).backward()
+                        if args.attack_loss in ("mirage_projected", "mirage_projected_split_pose"):
+                            task_gradient, terms = mirage_projected_texture_gradient(
+                                model, adv_images, texture, item, args, dtype
+                            )
+                            reg_gradient = torch.autograd.grad(
+                                reg_terms["regularization_total"], texture,
+                                allow_unused=True,
+                            )[0]
+                            if reg_gradient is None:
+                                reg_gradient = torch.zeros_like(texture)
+                            # AdamW performs descent. Task scores are larger-is-worse,
+                            # hence their max-min direction enters with a minus sign;
+                            # physical regularizers retain the ordinary descent sign.
+                            contribution = (-task_gradient + reg_gradient) / grad_divisor
+                            if texture.grad is None:
+                                texture.grad = contribution.detach().clone()
+                            else:
+                                texture.grad.add_(contribution.detach())
+                        else:
+                            loss, terms, maximize_loss = attack_objective_loss(
+                                model,
+                                adv_images,
+                                item,
+                                args,
+                                dtype,
+                            )
+                            objective = ((-loss if maximize_loss else loss)
+                                         + reg_terms["regularization_total"])
+                            (objective / grad_divisor).backward()
                         metric_value = terms.get("feature_l1")
                         if metric_value is None:
                             metric_value = terms.get("pose_loss")
@@ -4039,6 +4414,8 @@ def train_geometry_patch(
                 }
                 for key, values in attack_term_values.items():
                     record[key] = float(np.mean(values))
+                if args.attack_loss == "mirage_floor":
+                    update_floor_duals(args, attack_term_values)
                 if args.attack_loss == "geometry_joint_gauge_budgeted":
                     for name, value in getattr(args, "_budget_duals", {}).items():
                         record[f"budget_dual_after_{name}"] = float(value)
@@ -4360,6 +4737,9 @@ def parse_args() -> argparse.Namespace:
             "geometry_joint_gauge_targeted",
             "geometry_joint_gauge_budgeted",
             "mirage_coupled",
+            "mirage_floor",
+            "mirage_projected",
+            "mirage_projected_split_pose",
             "pose_clean_untargeted",
             "pose_reverse_targeted",
             "pose_drift_targeted",
@@ -4432,8 +4812,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mirage_kappa", type=float, default=1.0,
                         help="worst-task weighting sharpness, eq. (7). 0 reproduces "
                              "the fixed weights.")
+    parser.add_argument("--mirage_floor_vis", type=float, default=0.5,
+                        help="clean visibility a point needs before it counts toward "
+                             "the tracking floor; the 0.2 training default admits "
+                             "points the evaluation never scores")
+    parser.add_argument("--mirage_floor_track_px", type=float, default=8.0,
+                        help="RMS tracking displacement the floor constraint demands. "
+                             "Clean EPE against GT is ~4.5 px.")
+    parser.add_argument("--mirage_track_ref_px", type=float, default=10.0,
+                        help="RMS pixel displacement that counts as full progress "
+                             "on the tracking term. Clean EPE is ~4.5 px.")
     parser.add_argument("--mirage_track_weight", type=float, default=1.0,
                         help="weight on the untargeted tracking term; 0 disables it")
+    parser.add_argument(
+        "--mirage_projected_gt_dir",
+        default=str(Path(__file__).resolve().parent / "outputs/tum_gt_point_track"),
+        help="GT point-map and reprojection-track NPZ directory used by "
+             "mirage_projected",
+    )
+    parser.add_argument(
+        "--mirage_projected_track_cap_px", type=float, default=20.0,
+        help="smooth EPE cap for mirage_projected; prevents a few track outliers "
+             "from carrying the whole objective",
+    )
+    parser.add_argument(
+        "--mirage_projected_direction_scale", type=float, default=0.0,
+        help="fixed norm of the max-min texture direction; <=0 preserves the "
+             "historical pose-gradient norm scaling",
+    )
     parser.add_argument("--joint_point_stride", type=int, default=4,
                         help="sub-sampling for the point-map term; the full map is 2M "
                              "points per sequence")
@@ -4494,9 +4900,15 @@ def parse_args() -> argparse.Namespace:
             "vggt_manual_anchor_surface",
             "depth_manual_anchor_surface",
             "depth_manual_quad_surface",
+            "explicit_world_quad",
         ),
         default="fixed",
     )
+    parser.add_argument("--explicit_quad_world", default=None,
+                        help="12 numbers: four world-space corners in "
+                             "order. Used with --plane_mode "
+                             "explicit_world_quad to place a patch at a "
+                             "chosen spot instead of deriving one.")
     parser.add_argument("--clean_vggt_output_root", default=None)
     parser.add_argument("--vggt_point_conf_percentile", type=float, default=40.0)
     parser.add_argument("--plane_width", type=float, default=0.6)
