@@ -32,16 +32,18 @@ GT_DIR = VG / "outputs/tum_gt_point_track"
 CLEAN = "tum10_clean_uniform_l3"
 
 
-def build_args(scene: str, texture_size: int, quad: str) -> argparse.Namespace:
+def build_args(scene: str, texture_size: int, quad: str,
+               manifest: str, clean: str,
+               explicit_quad: str = "") -> argparse.Namespace:
     argv = [
         "attack.py", "--tum_root", str(TUM), "--scene_pattern", scene,
         "--output_dir", "/tmp/four_task", "--ckpt", str(VG / "checkpoints/VGGT-1B"),
-        "--frame_manifest", str(VG / "data/tum_dynamics_10frame_individual_scenes"
-                                    "/tum10_frame_manifest.json"),
+        "--frame_manifest", manifest,
         "--texture_size", str(texture_size), "--texture_init", "image",
         "--texture_init_image", str(VG / "assets/hazard_textures/mde_attack_warnning.png"),
-        "--clean_vggt_output_root", str(R / CLEAN),
-        "--plane_mode", "depth_manual_quad_surface",
+        "--clean_vggt_output_root", clean,
+        "--plane_mode",
+        "explicit_world_quad" if explicit_quad else "depth_manual_quad_surface",
         "--manual_quad_xy", quad, "--manual_quad_coordinates", "normalized",
         "--manual_quad_depth_sample_stride", "1", "--manual_quad_fit_shrink", "0.75",
         "--manual_quad_plane_inlier_tolerance", "0.06",
@@ -56,6 +58,8 @@ def build_args(scene: str, texture_size: int, quad: str) -> argparse.Namespace:
         "--seed", "0", "--use_depth_visibility", "--optimize_geometry",
         "--surface_support_check",
     ]
+    if explicit_quad:
+        argv.append(f"--explicit_quad_world={explicit_quad}")
     saved, sys.argv = sys.argv, argv
     try:
         return A.parse_args()
@@ -71,10 +75,19 @@ def main() -> None:
                                       "0.3603,0.4795")
     ap.add_argument("--track_iters", type=int, default=4)
     ap.add_argument("--out_dir", default="/tmp/four_task_tracks")
+    ap.add_argument("--gt_dir", default=str(GT_DIR),
+                    help="帧子集需指向该子集自己的 GT")
+    ap.add_argument("--clean", default=str(R / CLEAN),
+                    help="帧子集需指向该子集自己的 clean run")
+    ap.add_argument("--manifest",
+                    default=str(VG / "data/tum_dynamics_10frame_individual_scenes"
+                                     "/tum10_frame_manifest.json"))
+    ap.add_argument("--explicit_quad_world", default="",
+                    help="给定则把平面钉死在该世界四角，而不是从图像 quad 重新拟合")
     cli = ap.parse_args()
 
     scene = cli.scene
-    gt = np.load(GT_DIR / f"{scene}_gt.npz", allow_pickle=True)
+    gt = np.load(Path(cli.gt_dir) / f"{scene}_gt.npz", allow_pickle=True)
     query_np = gt["query_points"]
 
     device = torch.device("cuda")
@@ -95,7 +108,9 @@ def main() -> None:
         else:
             tex_arr, tsize = None, 64
 
-        args = build_args(scene, int(tsize), cli.quad)
+        args = build_args(scene, int(tsize), cli.quad,
+                          cli.manifest, cli.clean,
+                          cli.explicit_quad_world)
         if model is None:
             model = A.load_model(args, device)
             for p in model.parameters():

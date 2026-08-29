@@ -66,10 +66,14 @@ def track_metrics(pred_xy, pred_vis, gt, min_pts: int) -> dict[str, float]:
     per_frame_n = sel.sum(axis=1)
     usable = per_frame_n >= min_pts
     if not usable.any():
-        return {"track_epe": np.nan, "track_vis_f1": np.nan,
+        return {"track_epe": np.nan, "track_epe_mean": np.nan, "track_vis_f1": np.nan,
                 "track_frames_used": 0, "track_points": 0}
     err = np.linalg.norm(pred_xy[1:] - tracks[1:], axis=-1)
-    epe = float(np.median(err[usable][sel[usable]]))
+    vals = err[usable][sel[usable]]
+    # both statistics: on the warm-start patches the median moved 4.49 -> 4.92 px
+    # while the mean moved 5.69 -> 19.31 px, so reporting either alone misleads
+    epe = float(np.median(vals))
+    epe_mean = float(vals.mean())
 
     # visibility F1 against the GT flag, on points whose GT status is known
     k = known[1:][usable]
@@ -79,7 +83,7 @@ def track_metrics(pred_xy, pred_vis, gt, min_pts: int) -> dict[str, float]:
     fp = float((pv & ~gv & k).sum())
     fn = float((~pv & gv).sum())
     f1 = 2 * tp / max(2 * tp + fp + fn, 1e-9)
-    return {"track_epe": epe, "track_vis_f1": float(f1),
+    return {"track_epe": epe, "track_epe_mean": epe_mean, "track_vis_f1": float(f1),
             "track_frames_used": int(usable.sum()),
             "track_points": int(sel[usable].sum())}
 
@@ -93,14 +97,18 @@ def main() -> None:
     ap.add_argument("--min_track_points", type=int, default=20)
     ap.add_argument("--icp_threshold", type=float, default=0.1)
     ap.add_argument("--out_csv", default="/tmp/four_tasks.csv")
+    ap.add_argument("--gt_dir", default=str(GT_DIR),
+                    help="帧子集需指向该子集自己的 GT")
+    ap.add_argument("--clean", default=CLEAN,
+                    help="帧子集需指向该子集自己的 clean run 名")
     cli = ap.parse_args()
 
     scene = cli.scene
-    gt = dict(np.load(GT_DIR / f"{scene}_gt.npz", allow_pickle=True))
+    gt = dict(np.load(Path(cli.gt_dir) / f"{scene}_gt.npz", allow_pickle=True))
     rec = ReconsEval(RECONS)
     work = Path("/tmp/four_task_work")
     work.mkdir(parents=True, exist_ok=True)
-    clean_run = load_run(R / CLEAN, scene)
+    clean_run = load_run(R / cli.clean, scene)
     gt_traj, _ = gt_traj_for(rec, TUM, scene, clean_run["frame_indices"],
                              "groundtruth_90.txt", work)
 
@@ -151,7 +159,8 @@ def main() -> None:
         flag = "" if row["render_ok"] else "  ⚠️ 重渲染与存档不符"
         print(f"{run:<20} ATE {ate:.4f}  RPE {rpe_rot:5.2f}°  "
               f"AbsRel {dm['depth_absrel']:.4f}  d1 {dm['depth_d1']:.3f}  "
-              f"Acc {row['point_acc']:.4f}  EPE {tm['track_epe']:.2f}px  "
+              f"Acc {row['point_acc']:.4f}  "
+              f"EPE中位 {tm['track_epe']:.2f} 均值 {tm['track_epe_mean']:.2f}px  "
               f"visF1 {tm['track_vis_f1']:.3f}{flag}")
 
     if rows:

@@ -45,6 +45,8 @@ from diag_gauge_invariance import (  # noqa: E402
 
 TUM_ROOT = Path("/mnt/data/wangqq/recons_eval/data/tum")
 CLEAN_ROOT = VG / "outputs_attack_geometry_aware_tum10/tum10_clean_uniform_l3"
+# build_for_scene reads frame indices from a clean run, so a frame subset needs
+# its own clean run rather than the default ten-frame one.
 
 
 def project_world_to_pixels(world: np.ndarray, c2w: np.ndarray,
@@ -82,8 +84,9 @@ def sample_depth(depth: np.ndarray, xy: np.ndarray) -> tuple[np.ndarray, np.ndar
 
 
 def build_for_scene(scene: str, rows: int, cols: int, margin: float,
-                    occl_tol: float, out_dir: Path) -> dict:
-    summary_path = CLEAN_ROOT / scene / "attack_summary.json"
+                    occl_tol: float, out_dir: Path,
+                    clean_root: Path | None = None) -> dict:
+    summary_path = (clean_root or CLEAN_ROOT) / scene / "attack_summary.json"
     if not summary_path.exists():
         return {"scene": scene, "status": "缺少 clean run"}
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -176,6 +179,8 @@ def main() -> None:
     ap.add_argument("--occl_tol", type=float, default=0.05,
                     help="重投影深度比目标帧自身深度深多少米才算被遮挡")
     ap.add_argument("--out_dir", default=str(VG / "outputs/tum_gt_point_track"))
+    ap.add_argument("--clean_root", default=str(CLEAN_ROOT),
+                    help="读取帧号的 clean run 根目录；帧子集需要指向该子集自己的 clean run")
     cli = ap.parse_args()
 
     if cli.scenes:
@@ -187,7 +192,8 @@ def main() -> None:
     out_dir = Path(cli.out_dir)
     results = []
     for scene in scenes:
-        r = build_for_scene(scene, cli.rows, cli.cols, cli.margin, cli.occl_tol, out_dir)
+        r = build_for_scene(scene, cli.rows, cli.cols, cli.margin,
+                            cli.occl_tol, out_dir, Path(cli.clean_root))
         results.append(r)
         if r["status"] != "ok":
             print(f"{scene:<46} {r['status']}")

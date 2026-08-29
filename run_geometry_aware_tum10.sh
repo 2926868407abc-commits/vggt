@@ -14,7 +14,7 @@ TUM_FRAME_COUNT="${TUM_FRAME_COUNT:-10}"
 SCENE_PATTERN="${SCENE_PATTERN:-rgbd_dataset_freiburg3_*}"
 
 OUT_BASE="${OUT_BASE:-$VGGT_ROOT/outputs_attack_geometry_aware_tum10}"
-TUM_CLEAN_OUT="$OUT_BASE/tum10_clean_uniform_l3"
+TUM_CLEAN_OUT="${TUM_CLEAN_OUT:-$OUT_BASE/tum10_clean_uniform_l3}"
 TUM_GEOM_RUN_NAME="${TUM_GEOM_RUN_NAME:-tum10_vggt_pointmap_geometry_feature_l3}"
 TUM_GEOM_OUT="$OUT_BASE/$TUM_GEOM_RUN_NAME"
 
@@ -57,6 +57,15 @@ JOINT_TRACK_ITERS="${JOINT_TRACK_ITERS:-2}"
 JOINT_TRACK_MIN_VISIBILITY="${JOINT_TRACK_MIN_VISIBILITY:-0.20}"
 JOINT_TRACK_VISIBILITY_WEIGHT="${JOINT_TRACK_VISIBILITY_WEIGHT:-0.10}"
 JOINT_TRACK_CONFIDENCE_WEIGHT="${JOINT_TRACK_CONFIDENCE_WEIGHT:-0.10}"
+EXPLICIT_QUAD_WORLD="${EXPLICIT_QUAD_WORLD:-}"
+MIRAGE_KAPPA="${MIRAGE_KAPPA:-1.0}"
+MIRAGE_TRACK_WEIGHT="${MIRAGE_TRACK_WEIGHT:-1.0}"
+MIRAGE_TRACK_REF_PX="${MIRAGE_TRACK_REF_PX:-10.0}"
+MIRAGE_PROJECTED_DIRECTION_SCALE="${MIRAGE_PROJECTED_DIRECTION_SCALE:-0.0}"
+MIRAGE_FLOOR_TRACK_PX="${MIRAGE_FLOOR_TRACK_PX:-8.0}"
+MIRAGE_FLOOR_VIS="${MIRAGE_FLOOR_VIS:-0.5}"
+MIRAGE_PROJECTED_GT_DIR="${MIRAGE_PROJECTED_GT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/outputs/tum_gt_point_track}"
+BUDGET_DUAL_DECAY="${BUDGET_DUAL_DECAY:-1.0}"
 FILTER_BUDGET_JSON="${FILTER_BUDGET_JSON:-$VGGT_ROOT/configs/tum10_filter_budgets.json}"
 FILTER_BUDGET_FRACTION="${FILTER_BUDGET_FRACTION:-0.80}"
 BUDGET_CONSTRAINTS="${BUDGET_CONSTRAINTS:-conf_std,conf_frac_floor,head_disagree_rel,reproj_rel_err,track}"
@@ -330,6 +339,15 @@ fi
   --joint_track_min_visibility "$JOINT_TRACK_MIN_VISIBILITY" \
   --joint_track_visibility_weight "$JOINT_TRACK_VISIBILITY_WEIGHT" \
   --joint_track_confidence_weight "$JOINT_TRACK_CONFIDENCE_WEIGHT" \
+  "--explicit_quad_world=$EXPLICIT_QUAD_WORLD" \
+  --mirage_kappa "$MIRAGE_KAPPA" \
+  --mirage_track_weight "$MIRAGE_TRACK_WEIGHT" \
+  --mirage_track_ref_px "$MIRAGE_TRACK_REF_PX" \
+  --mirage_projected_direction_scale "$MIRAGE_PROJECTED_DIRECTION_SCALE" \
+  --mirage_floor_track_px "$MIRAGE_FLOOR_TRACK_PX" \
+  --mirage_floor_vis "$MIRAGE_FLOOR_VIS" \
+  --mirage_projected_gt_dir "$MIRAGE_PROJECTED_GT_DIR" \
+  --budget_dual_decay "$BUDGET_DUAL_DECAY" \
   --filter_budget_json "$FILTER_BUDGET_JSON" \
   --filter_budget_fraction "$FILTER_BUDGET_FRACTION" \
   --budget_constraints "$BUDGET_CONSTRAINTS" \
