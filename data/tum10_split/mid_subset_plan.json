@@ -1,0 +1,74 @@
+[
+ {
+  "name": "mid00",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid00_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid00",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid00"
+ },
+ {
+  "name": "mid01",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid01_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid01",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid01"
+ },
+ {
+  "name": "mid02",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid02_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid02",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid02"
+ },
+ {
+  "name": "mid03",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid03_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid03",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid03"
+ },
+ {
+  "name": "mid04",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid04_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid04",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid04"
+ },
+ {
+  "name": "mid05",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid05_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid05",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid05"
+ },
+ {
+  "name": "mid06",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid06_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid06",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid06"
+ },
+ {
+  "name": "mid07",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid07_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid07",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid07"
+ },
+ {
+  "name": "mid08",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid08_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid08",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid08"
+ },
+ {
+  "name": "mid09",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid09_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid09",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid09"
+ },
+ {
+  "name": "mid10",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid10_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid10",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid10"
+ },
+ {
+  "name": "mid11",
+  "manifest": "/mnt/data/wangqq/vggt/data/tum10_split/mid11_manifest.json",
+  "clean_root": "/mnt/data/wangqq/vggt/outputs_attack_geometry_aware_tum10/clean_mid11",
+  "gt_dir": "/mnt/data/wangqq/vggt/outputs/tum_gt_point_track_mid11"
+ }
+]

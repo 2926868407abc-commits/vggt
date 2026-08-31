@@ -103,7 +103,7 @@ def build_for_scene(scene: str, rows: int, cols: int, margin: float,
         return {"scene": scene, "status": f"深度关联失败于帧 {missing}"}
 
     # tensor grid comes from the clean prediction, so GT and prediction share it
-    pred = np.load(CLEAN_ROOT / scene / "vggt_outputs.npz")
+    pred = np.load((clean_root or CLEAN_ROOT) / scene / "vggt_outputs.npz")
     tensor_hw = (int(pred["depth"].shape[1]), int(pred["depth"].shape[2]))
     proj = projection_params(Path(image_paths[0]), tensor_hw)
     depths = [preprocess_tum_depth_to_vggt_grid(p, Path(ip), tensor_hw)

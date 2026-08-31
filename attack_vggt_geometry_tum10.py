@@ -13,8 +13,8 @@ This is a GT-geometry-consistent physical patch pipeline:
   texture optimization
 * optional physical EOT applies printable color clamping, lighting jitter, and
   camera noise during texture optimization
-* the objective is still label-free feature L1: maximize
-  L1(feature_adv, feature_clean)
+* the objective is selectable: label-free feature distance, gauge-aware pose
+  damage, piecewise/shared trajectory targets, or coupled four-task objectives
 
 The script writes official-style vggt_outputs.npz plus attack_summary.json so
 scripts/eval_vggt_tum_pose_for_recons_eval_tum10.py can evaluate ATE/RPE.
@@ -2771,6 +2771,34 @@ def orthogonal_mode_displacement(positions: np.ndarray, order: int, axis: int,
     return magnitude * radius * delta
 
 
+def scale_shared_deformation(delta_unit: np.ndarray, positions: np.ndarray,
+                             magnitude: float) -> np.ndarray:
+    """Scale a unit-Frobenius shared field using the orthogonal-mode convention.
+
+    ``solve_shared_deform.py`` stores one field with Frobenius norm one.  The
+    hand-built orthogonal mode has unit RMS row norm instead, so multiplying by
+    ``sqrt(N)`` makes ``magnitude`` mean the same thing in both paths.
+    """
+    delta_unit = np.asarray(delta_unit, dtype=np.float64)
+    positions = np.asarray(positions, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError(f"Expected positions with shape (N, 3), got {positions.shape}")
+    if delta_unit.shape != positions.shape:
+        raise ValueError(
+            f"Shared deformation {delta_unit.shape} does not match trajectory "
+            f"{positions.shape}"
+        )
+    if not np.isfinite(delta_unit).all():
+        raise ValueError("Shared deformation contains NaN or infinity")
+    norm = float(np.linalg.norm(delta_unit))
+    if not np.isclose(norm, 1.0, rtol=1e-5, atol=1e-8):
+        raise ValueError(
+            f"delta_unit must have unit Frobenius norm, got {norm:.8f}"
+        )
+    radius = float(np.sqrt(((positions - positions.mean(0)) ** 2).sum(1).mean()))
+    return float(magnitude) * radius * delta_unit * math.sqrt(len(delta_unit))
+
+
 def piecewise_gauge_schedule(family: str, n: int, magnitude: float,
                              positions: np.ndarray | None = None,
                              order: int = 2, axis: int = 0
@@ -3600,8 +3628,13 @@ def load_mirage_projected_gt(
     if cache is None:
         cache = {}
         args._mirage_projected_gt_cache = cache
-    if seq_name in cache:
-        return cache[seq_name]
+    # keyed on the GT directory and frames too: subsets share a scene name, and a
+    # scene-only key would serve the first subset's GT to all of them, skipping
+    # the frame-set assertion below on every cache hit
+    cache_key = (seq_name, str(args.mirage_projected_gt_dir),
+                 tuple(int(i) for i in frame_indices))
+    if cache_key in cache:
+        return cache[cache_key]
 
     path = Path(args.mirage_projected_gt_dir) / f"{seq_name}_gt.npz"
     if not path.exists():
@@ -3650,7 +3683,7 @@ def load_mirage_projected_gt(
             np.asarray(raw["track_known"], dtype=bool)
         ).to(device=device),
     }
-    cache[seq_name] = target
+    cache[cache_key] = target
     return target
 
 
@@ -3967,11 +4000,36 @@ def load_tum_sequence(
     pose_gt_rel = c2w_numpy_to_relative_tensor(gt_c2w, device)
     # Built here rather than in the loss because the per-frame gauge acts in the
     # world frame, and only the absolute GT trajectory is available at this point.
-    pose_piecewise_rel = c2w_numpy_to_relative_tensor(
-        apply_piecewise_gauge(gt_c2w, args.piecewise_gauge_family,
-                              args.piecewise_gauge_magnitude),
-        device,
-    ) if getattr(args, "piecewise_gauge_family", None) else None
+    if getattr(args, "shared_deformation", False):
+        # One field over the whole pool, sampled by global frame index. Built
+        # per subset instead, the cosine profile would run over that subset's
+        # own indices and the Sim(3) basis would come from its own positions,
+        # so every subset would pursue a different deformation.
+        pool_rows = read_tum_rows(seq_dir / gt_name)
+        pool_c2w = tum_rows_to_c2w(pool_rows, list(range(len(pool_rows))))
+        if getattr(args, "shared_deformation_file", ""):
+            _d = np.load(args.shared_deformation_file)["delta_unit"]
+            _p = pool_c2w[:, :3, 3]
+            delta = scale_shared_deformation(
+                _d,
+                _p,
+                args.piecewise_gauge_magnitude,
+            )
+        else:
+            delta = orthogonal_mode_displacement(
+                pool_c2w[:, :3, 3], args.orthogonal_mode_order,
+                args.orthogonal_mode_axis, args.piecewise_gauge_magnitude)
+        target_c2w = np.array(gt_c2w, dtype=np.float64, copy=True)
+        target_c2w[:, :3, 3] += delta[[int(i) for i in frame_indices]]
+        pose_piecewise_rel = c2w_numpy_to_relative_tensor(target_c2w, device)
+    elif getattr(args, "piecewise_gauge_family", None):
+        pose_piecewise_rel = c2w_numpy_to_relative_tensor(
+            apply_piecewise_gauge(gt_c2w, args.piecewise_gauge_family,
+                                  args.piecewise_gauge_magnitude),
+            device,
+        )
+    else:
+        pose_piecewise_rel = None
     local_intrinsics = intrinsics
     old_vggt_points = getattr(args, "_active_vggt_points", None)
     old_vggt_point_map_grid = getattr(args, "_active_vggt_point_map_grid", None)
@@ -4208,6 +4266,27 @@ def patch_regularization_terms(texture: torch.Tensor, args: argparse.Namespace) 
     }
 
 
+def draw_subset_plan_entries(
+    subset_plan: list[dict],
+    subset_queue: list[int],
+    count: int,
+    rng: np.random.Generator,
+) -> tuple[list[dict], list[int]]:
+    """Draw balanced random subsets without replacement within each round."""
+    if not subset_plan:
+        return [], []
+    queue = list(subset_queue)
+    picks: list[dict] = []
+    for _ in range(max(1, int(count))):
+        if not queue:
+            queue = rng.permutation(len(subset_plan)).tolist()
+        index = int(queue.pop())
+        if index < 0 or index >= len(subset_plan):
+            raise IndexError(f"Subset queue index {index} is out of range")
+        picks.append(subset_plan[index])
+    return picks, queue
+
+
 def train_geometry_patch(
     model: torch.nn.Module,
     scene_dirs: list[Path],
@@ -4281,9 +4360,52 @@ def train_geometry_patch(
             batch = []
             for idx in scene_indices:
                 seq_dir = scene_dirs[int(idx)]
+                step_frames = manifest[seq_dir.name]
+                subset_plan = getattr(args, "_subset_plan", None)
+                if subset_plan is None:
+                    subset_plan = []
+                    if args.subset_plan:
+                        import json as _json
+                        for entry in _json.loads(
+                                Path(args.subset_plan).read_text(encoding="utf-8")):
+                            entry["frames"] = load_frame_manifest(entry["manifest"])
+                            subset_plan.append(entry)
+                        print(f"[subset] 训练池 {len(subset_plan)} 个十帧子集，"
+                              f"每步随机抽一个")
+                    args._subset_plan = subset_plan
+                if subset_plan:
+                    # without replacement in rounds, so no subset is over- or
+                    # under-sampled within a pass over the pool
+                    queue = getattr(args, "_subset_queue", [])
+                    picks, queue = draw_subset_plan_entries(
+                        subset_plan,
+                        queue,
+                        args.subset_accum,
+                        rng,
+                    )
+                    args._subset_queue = queue
+                    for sub in picks:
+                        # images, clean outputs and GT all move together
+                        args.clean_vggt_output_root = sub["clean_root"]
+                        args.mirage_projected_gt_dir = sub["gt_dir"]
+                        args._active_subset = sub["name"]
+                        _it = load_tum_sequence(
+                            seq_dir,
+                            sub["frames"][seq_dir.name],
+                            args.gt_name,
+                            intrinsics,
+                            args.texture_size,
+                            args,
+                            device,
+                            model=model,
+                            dtype=dtype,
+                        )
+                        _it["subset_name"] = sub["name"]
+                        batch.append(_it)
+                    continue
                 item = load_tum_sequence(
                     seq_dir,
-                    manifest[seq_dir.name],
+                    step_frames,
                     args.gt_name,
                     intrinsics,
                     args.texture_size,
@@ -4411,6 +4533,7 @@ def train_geometry_patch(
                     "mask_coverage_mean": float(np.mean(coverages)),
                     "eot_strength": float(getattr(args, "_eot_strength", 0.0)),
                     "scenes": [item["seq"] for item in batch],
+                    "subsets": [item.get("subset_name") for item in batch],
                 }
                 for key, values in attack_term_values.items():
                     record[key] = float(np.mean(values))
@@ -4824,6 +4947,26 @@ def parse_args() -> argparse.Namespace:
                              "on the tracking term. Clean EPE is ~4.5 px.")
     parser.add_argument("--mirage_track_weight", type=float, default=1.0,
                         help="weight on the untargeted tracking term; 0 disables it")
+    parser.add_argument(
+        "--shared_deformation_file", default="",
+        help="npz，含 delta_unit (n,3)；由 solve_shared_deform.py 求解得到，"
+             "给定则替代手调的 orthogonal_mode 正弦模式",
+    )
+    parser.add_argument(
+        "--shared_deformation", action="store_true",
+        help="在整条池轨迹上算一次 orthogonal_mode 形变，各子集按全局帧号切出同一目标；"
+             "需配合 --attack_loss pose_piecewise_gauge_targeted",
+    )
+    parser.add_argument(
+        "--subset_accum", type=int, default=1,
+        help="每个 optimizer step 累积多少个子集；梯度取平均（batch 机制已除以 len(batch)），"
+             "因此学习率无需调整",
+    )
+    parser.add_argument(
+        "--subset_plan", default="",
+        help="JSON 列表，每项含 name/manifest/clean_root/gt_dir；给定后每步随机抽一个子集，"
+             "其图像、clean 输出与 GT 必须同源",
+    )
     parser.add_argument(
         "--mirage_projected_gt_dir",
         default=str(Path(__file__).resolve().parent / "outputs/tum_gt_point_track"),

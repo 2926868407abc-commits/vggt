@@ -65,6 +65,12 @@ MIRAGE_PROJECTED_DIRECTION_SCALE="${MIRAGE_PROJECTED_DIRECTION_SCALE:-0.0}"
 MIRAGE_FLOOR_TRACK_PX="${MIRAGE_FLOOR_TRACK_PX:-8.0}"
 MIRAGE_FLOOR_VIS="${MIRAGE_FLOOR_VIS:-0.5}"
 MIRAGE_PROJECTED_GT_DIR="${MIRAGE_PROJECTED_GT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/outputs/tum_gt_point_track}"
+SUBSET_PLAN="${SUBSET_PLAN:-}"
+SUBSET_ACCUM="${SUBSET_ACCUM:-1}"
+SHARED_DEFORMATION="${SHARED_DEFORMATION:-}"
+# ${VAR:+...} tests non-empty, so "0" would have switched the flag on
+[[ "$SHARED_DEFORMATION" == "0" ]] && SHARED_DEFORMATION=""
+SHARED_DEFORMATION_FILE="${SHARED_DEFORMATION_FILE:-}"
 BUDGET_DUAL_DECAY="${BUDGET_DUAL_DECAY:-1.0}"
 FILTER_BUDGET_JSON="${FILTER_BUDGET_JSON:-$VGGT_ROOT/configs/tum10_filter_budgets.json}"
 FILTER_BUDGET_FRACTION="${FILTER_BUDGET_FRACTION:-0.80}"
@@ -347,7 +353,10 @@ fi
   --mirage_floor_track_px "$MIRAGE_FLOOR_TRACK_PX" \
   --mirage_floor_vis "$MIRAGE_FLOOR_VIS" \
   --mirage_projected_gt_dir "$MIRAGE_PROJECTED_GT_DIR" \
-  --budget_dual_decay "$BUDGET_DUAL_DECAY" \
+  --subset_plan "$SUBSET_PLAN" \
+  --subset_accum "$SUBSET_ACCUM" \
+  --shared_deformation_file "$SHARED_DEFORMATION_FILE" \
+  ${SHARED_DEFORMATION:+--shared_deformation} \
   --filter_budget_json "$FILTER_BUDGET_JSON" \
   --filter_budget_fraction "$FILTER_BUDGET_FRACTION" \
   --budget_constraints "$BUDGET_CONSTRAINTS" \
