@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VGGT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$VGGT_ROOT"
+
+historical_warm_start="$VGGT_ROOT/outputs_attack_geometry_aware_tum10/l64_al_s0/geometry_patch/geometry_patch_texture.png"
+default_init="$historical_warm_start"
+if [[ ! -f "$default_init" ]]; then
+  default_init="$VGGT_ROOT/assets/hazard_textures/mde_attack_warnning.png"
+fi
+
+export TUM_GEOM_RUN_NAME="${PROJECTED_RUN_NAME:-mp_smoke1}"
+export SCENE_PATTERN=rgbd_dataset_freiburg3_sitting_halfsphere
+export ATTACK_LOSS="${PROJECTED_ATTACK_LOSS:-mirage_projected}"
+export ITERATIONS="${PROJECTED_ITERATIONS:-1}"
+export INNER_LOOP="${PROJECTED_INNER_LOOP:-1}"
+export SCENES_PER_ITERATION=1
+export TEXTURE_SIZE=64
+export TEXTURE_INIT=image
+export TEXTURE_INIT_IMAGE="${PROJECTED_TEXTURE_INIT_IMAGE:-$default_init}"
+export PATCH_LR=0.002
+export POSE_ROTATION_WEIGHT="${PROJECTED_POSE_ROTATION_WEIGHT:-5.0}"
+export POSE_TRANSLATION_WEIGHT="${PROJECTED_POSE_TRANSLATION_WEIGHT:-1.0}"
+export MIRAGE_PROJECTED_DIRECTION_SCALE="${PROJECTED_DIRECTION_SCALE:-0.0}"
+export JOINT_POINT_STRIDE=8
+export JOINT_TRACK_ITERS=4
+
+export PLANE_MODE=depth_manual_quad_surface
+export MANUAL_QUAD_COORDINATES=normalized
+export MANUAL_QUAD_XY=0.3603,0.2939,0.5682,0.3063,0.5644,0.4943,0.3603,0.4795
+export MANUAL_QUAD_DEPTH_SAMPLE_STRIDE=1
+export MANUAL_QUAD_FIT_SHRINK=0.75
+export MANUAL_QUAD_PLANE_INLIER_TOLERANCE=0.06
+export MANUAL_QUAD_MIN_INLIER_RATIO=0.60
+export USE_DEPTH_VISIBILITY=1
+export OPTIMIZE_GEOMETRY=1
+export SURFACE_SUPPORT_CHECK=1
+export SURFACE_SUPPORT_REL_TOLERANCE=0.01
+export SURFACE_SUPPORT_ABS_TOLERANCE=0.10
+export SURFACE_MIN_SUPPORT_RATIO=0.50
+export FUSED_MAX_PLANE_RESIDUAL=0.02
+export SURFACE_SCORE_MODE=coverage
+export SURFACE_COVERAGE_MIN=0.002
+export SURFACE_COVERAGE_MAX=0.08
+export SURFACE_MIN_VISIBLE_FRAMES=4
+export SURFACE_MIN_VISIBILITY_RATIO=0.30
+export VISIBILITY_DEPTH_MARGIN=0.08
+
+export PHYSICAL_EOT=0
+export TV_WEIGHT=0.001
+export PRINTABILITY_WEIGHT=0.001
+export PRINTABLE_COLOR_LEVELS=2
+export LOW_FREQUENCY_WEIGHT=0.0
+export NATURAL_REFERENCE_WEIGHT=0.05
+export NATURAL_REFERENCE_IMAGE="${PROJECTED_NATURAL_REFERENCE_IMAGE:-$VGGT_ROOT/assets/hazard_textures/mde_attack_warnning.png}"
+
+export FORCE_TRAIN=1
+export FORCE_APPLY=1
+export RUN_EVAL=0
+export RUN_GAUGE_DIAG=0
+export RUN_CONSISTENCY_CHECK=0
+export FREEZE_MODEL_PARAMETERS=1
+export SEED="${PROJECTED_SEED:-0}"
+
+exec bash "$VGGT_ROOT/run_geometry_aware_tum10.sh"
