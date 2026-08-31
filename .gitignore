@@ -160,3 +160,7 @@ skyseg.onnx
 /checkpoints/
 /data/
 /reports/
+
+# Local experiment artefacts retained on the server but not versioned.
+/logs/
+/assets/natural_textures/
