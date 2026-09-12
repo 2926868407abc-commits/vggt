@@ -13,9 +13,13 @@ cd "$VGGT_ROOT"
 
 PHASE="${PHASE:-planes}"
 SCENE="${SCENE:-rgbd_dataset_freiburg3_sitting_halfsphere}"
-AREA="${AREA:-0.05}"
+AREA="${AREA:-0.2}"
 ASPECT="${ASPECT:-1.5534}"
 GRID="${GRID:-8}"
+CELL="${CELL:-0.025}"
+MIN_FILL="${MIN_FILL:-0.95}"
+MIN_CANDIDATE_VISIBLE_FRAMES="${MIN_CANDIDATE_VISIBLE_FRAMES:-6}"
+MIN_CANDIDATE_SUPPORTED_FRAMES="${MIN_CANDIDATE_SUPPORTED_FRAMES:-6}"
 PLANES_DIR="${PLANES_DIR:-$VGGT_ROOT/outputs/candidate_planes}"
 GT_DIR="${GT_DIR:-$VGGT_ROOT/outputs/tum_gt_point_track}"
 CLEAN_ROOT="${CLEAN_ROOT:-$VGGT_ROOT/outputs_attack_geometry_aware_tum10/tum10_clean_uniform_l3}"
@@ -37,7 +41,13 @@ run_planes() {
     --clean_root "$CLEAN_ROOT" --planes_dir "$PLANES_DIR"
   "$VGGT_PY" -B scripts/gen_scan_candidates.py \
     --scene "$SCENE" --area "$AREA" --aspect "$ASPECT" --grid "$GRID" \
+    --cell "$CELL" --min_fill "$MIN_FILL" \
     --planes_dir "$PLANES_DIR" --gt_dir "$GT_DIR"
+  "$VGGT_PY" -B scripts/filter_scan_candidates.py \
+    --scene "$SCENE" --area "$AREA" --tum_root "$TUM_ROOT" \
+    --planes_dir "$PLANES_DIR" --clean_root "$CLEAN_ROOT" \
+    --min_visible_frames "$MIN_CANDIDATE_VISIBLE_FRAMES" \
+    --min_supported_frames "$MIN_CANDIDATE_SUPPORTED_FRAMES"
 }
 
 run_scan() {
@@ -46,6 +56,7 @@ run_scan() {
   "$VGGT_PY" -B scripts/run_position_scan.py \
     --scene "$SCENE" --area "$AREA" --tum_root "$TUM_ROOT" \
     --planes_dir "$PLANES_DIR" --clean_root "$CLEAN_ROOT" \
+    --spec "$PLANES_DIR/${SCENE}_validated_a${AREA}.json" \
     "${texture_args[@]}"
 }
 
@@ -61,7 +72,8 @@ run_score() {
 
 run_probe() {
   "$VGGT_PY" -B scripts/pick_probe_positions.py \
-    --scene "$SCENE" --area "$AREA" --planes-dir "$PLANES_DIR"
+    --scene "$SCENE" --area "$AREA" --planes-dir "$PLANES_DIR" \
+    --input "$PLANES_DIR/${SCENE}_validated_a${AREA}.json"
 }
 
 case "$PHASE" in

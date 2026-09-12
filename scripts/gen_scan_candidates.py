@@ -5,11 +5,12 @@ all planes, so a plane cannot win by hosting a bigger patch. The manual monitor
 patch (0.263 m², 74% of its own plane) stays a separate baseline row and does not
 take part in the scan.
 
-Section 6.1 also requires at least 16 valid candidates per plane for a heat map to
-mean anything, so that is checked here rather than after spending GPU time: a centre
-is only valid when the whole rectangle lies inside the plane's occupied region, not
-merely inside its bounding box -- an L-shaped desk should not accept a patch hanging
-over the notch.
+Section 6.1 also requires at least 16 valid candidates per plane before drawing a
+heat map.  That is a reporting threshold, not a reason to delete a physically valid
+surface from the search.  We therefore retain sparse planes and mark their candidates
+as heatmap_reliable=false.  A centre is valid only when almost the whole rectangle
+lies inside the plane's occupied region, not merely inside its bounding box -- an
+L-shaped desk should not accept a patch hanging over the notch.
 """
 
 from __future__ import annotations
@@ -37,11 +38,17 @@ def main() -> None:
     ap.add_argument("--aspect", type=float, default=1.5534,
                     help="w/h, kept at the existing patch's ratio")
     ap.add_argument("--grid", type=int, default=8)
-    ap.add_argument("--cell", type=float, default=0.05,
-                    help="occupancy cell size, matching the extractor")
-    ap.add_argument("--min_fill", type=float, default=0.85,
+    ap.add_argument("--cell", type=float, default=0.025,
+                    help="occupancy cell size used to reject rectangles crossing a surface boundary")
+    ap.add_argument("--min_fill", type=float, default=0.95,
                     help="fraction of the rectangle that must sit on occupied surface")
     ap.add_argument("--min_valid", type=int, default=16)
+    ap.add_argument(
+        "--require_heatmap_reliable",
+        action="store_true",
+        help="drop a plane when it has fewer than --min_valid positions; by default "
+             "such positions remain searchable but are marked heatmap_reliable=false",
+    )
     ap.add_argument("--min_visible_frames", type=int, default=6)
     ap.add_argument("--out", default=None)
     cli = ap.parse_args()
@@ -66,6 +73,7 @@ def main() -> None:
     cloud = world[np.sort(uniq)]
 
     out = []
+    plane_summaries = []
     print(f"{'平面':>4}{'面积m²':>9}{'可见帧':>7}{'有效位置':>9}{'占比':>8}  说明")
     print("-" * 62)
     for pi, c in enumerate(meta["candidates"]):
@@ -117,15 +125,26 @@ def main() -> None:
                               "fill": float(fill),
                               "quad": corners.reshape(-1).tolist()})
         frac = len(valid) / (cli.grid ** 2)
-        note = "✅" if len(valid) >= cli.min_valid else f"< {cli.min_valid}，热力图不可信"
+        heatmap_reliable = len(valid) >= cli.min_valid
+        note = "✅" if heatmap_reliable else f"< {cli.min_valid}，可搜索但热力图不可信"
         print(f"{pi:>4}{c['area_m2']:>9.3f}{c['visible_frames']:>7}"
               f"{len(valid):>9}{frac:>8.0%}  {note}")
-        if len(valid) >= cli.min_valid:
+        for candidate in valid:
+            candidate["heatmap_reliable"] = bool(heatmap_reliable)
+        plane_summaries.append({
+            "plane": pi,
+            "valid_candidates": len(valid),
+            "heatmap_reliable": bool(heatmap_reliable),
+        })
+        if heatmap_reliable or not cli.require_heatmap_reliable:
             out.extend(valid)
 
     dst = Path(cli.out or (cli.planes_dir / f"{scene}_scan_a{cli.area}.json"))
     dst.write_text(json.dumps({"scene": scene, "area_m2": cli.area,
                                "w": w, "h": h, "grid": cli.grid,
+                               "cell": cli.cell, "min_fill": cli.min_fill,
+                               "min_valid_for_heatmap": cli.min_valid,
+                               "planes": plane_summaries,
                                "candidates": out}, indent=1), encoding="utf-8")
     planes = sorted({c["plane"] for c in out})
     print(f"\n合格平面 {planes}，候选总数 {len(out)}")

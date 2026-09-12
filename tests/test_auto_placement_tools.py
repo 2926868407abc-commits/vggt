@@ -13,6 +13,7 @@ if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
 from pick_probe_positions import pick_spread_positions  # noqa: E402
+from filter_scan_candidates import candidate_rejection_reasons  # noqa: E402
 from score_probe import average_ranks, spearman  # noqa: E402
 from score_scan import trajectory_ceiling, w2c_to_c2w  # noqa: E402
 
@@ -64,6 +65,50 @@ def test_probe_picker_represents_multiple_planes() -> None:
     assert len(selected) == 8
     assert counts == {0: 4, 1: 4}
     assert len({item["tag"] for item in selected}) == 8
+
+
+def test_candidate_preflight_rejects_parent_plane_only_visibility() -> None:
+    meta = {
+        "raw_projected_coverage_per_frame": [0.01] * 10,
+        "mask_coverage_per_frame": [0.0] * 10,
+        "visibility_ratio_per_frame": [0.0] * 10,
+        "surface_support_ratio_per_frame": [0.0] * 10,
+    }
+    reasons, metrics = candidate_rejection_reasons(
+        meta,
+        min_visible_frames=6,
+        min_supported_frames=6,
+        min_frame_coverage=0.002,
+        min_raw_frame_coverage=0.002,
+        min_mean_coverage=0.005,
+        min_visibility_ratio=0.3,
+        min_support_ratio=0.6,
+    )
+    assert metrics["visible_frames"] == 0
+    assert "too_few_visible_frames" in reasons
+    assert "surface_support_too_small" in reasons
+
+
+def test_candidate_preflight_accepts_six_supported_frames() -> None:
+    meta = {
+        "raw_projected_coverage_per_frame": [0.02] * 6 + [0.0] * 4,
+        "mask_coverage_per_frame": [0.015] * 6 + [0.0] * 4,
+        "visibility_ratio_per_frame": [0.75] * 6 + [0.0] * 4,
+        "surface_support_ratio_per_frame": [0.9] * 6 + [0.0] * 4,
+    }
+    reasons, metrics = candidate_rejection_reasons(
+        meta,
+        min_visible_frames=6,
+        min_supported_frames=6,
+        min_frame_coverage=0.002,
+        min_raw_frame_coverage=0.002,
+        min_mean_coverage=0.005,
+        min_visibility_ratio=0.3,
+        min_support_ratio=0.6,
+    )
+    assert metrics["visible_frames"] == 6
+    assert metrics["supported_frames"] == 6
+    assert reasons == []
 
 
 if __name__ == "__main__":

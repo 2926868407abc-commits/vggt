@@ -72,6 +72,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene", default="rgbd_dataset_freiburg3_sitting_halfsphere")
     parser.add_argument("--area", type=float, default=0.2)
     parser.add_argument("--planes-dir", type=Path, default=DEFAULT_PLANES)
+    parser.add_argument("--input", type=Path, default=None,
+                        help="validated candidate JSON; defaults to the raw scan file")
     parser.add_argument("--max-positions", type=int, default=8)
     parser.add_argument("--max-per-plane", type=int, default=4)
     parser.add_argument("--out", type=Path, default=None)
@@ -80,7 +82,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    source = args.planes_dir / f"{args.scene}_scan_a{args.area}.json"
+    source = args.input or args.planes_dir / f"{args.scene}_scan_a{args.area}.json"
     spec = json.loads(source.read_text(encoding="utf-8"))
     selected = pick_spread_positions(
         spec["candidates"],

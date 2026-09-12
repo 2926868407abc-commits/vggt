@@ -164,3 +164,6 @@ skyseg.onnx
 # Local experiment artefacts retained on the server but not versioned.
 /logs/
 /assets/natural_textures/
+
+# in-place patch backups, not source
+*.pre_*

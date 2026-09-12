@@ -12,6 +12,7 @@ TUM10_FRAME_SCENES="${TUM10_FRAME_SCENES:-$VGGT_ROOT/data/tum_dynamics_10frame_i
 TUM10_FRAME_MANIFEST="${TUM10_FRAME_MANIFEST:-$TUM10_FRAME_SCENES/tum10_frame_manifest.json}"
 TUM_FRAME_COUNT="${TUM_FRAME_COUNT:-10}"
 SCENE_PATTERN="${SCENE_PATTERN:-rgbd_dataset_freiburg3_*}"
+GT_NAME="${GT_NAME:-groundtruth_90.txt}"
 
 OUT_BASE="${OUT_BASE:-$VGGT_ROOT/outputs_attack_geometry_aware_tum10}"
 TUM_CLEAN_OUT="${TUM_CLEAN_OUT:-$OUT_BASE/tum10_clean_uniform_l3}"
@@ -25,12 +26,51 @@ ITERATIONS="${ITERATIONS:-200}"
 INNER_LOOP="${INNER_LOOP:-10}"
 SCENES_PER_ITERATION="${SCENES_PER_ITERATION:-1}"
 PATCH_LR="${PATCH_LR:-0.001}"
+SCHEDULER="${SCHEDULER:-cosine}"
+WARMUP_ITERATIONS="${WARMUP_ITERATIONS:-20}"
 TEXTURE_SIZE="${TEXTURE_SIZE:-128}"
 TEXTURE_INIT="${TEXTURE_INIT:-random}"
 TEXTURE_INIT_IMAGE="${TEXTURE_INIT_IMAGE:-}"
+TEXTURE_INIT_PRESERVE_ASPECT="${TEXTURE_INIT_PRESERVE_ASPECT:-0}"
 FREEZE_TEXTURE="${FREEZE_TEXTURE:-0}"
 FEATURE_LAYER="${FEATURE_LAYER:-aggregator_final}"
 ATTACK_LOSS="${ATTACK_LOSS:-feature_l1}"
+BASELINE_FOCUS_SCALE="${BASELINE_FOCUS_SCALE:-2.0}"
+BASELINE_FOCUS_QUAD_WORLD="${BASELINE_FOCUS_QUAD_WORLD:-}"
+BASELINE_DEPTH_EPS="${BASELINE_DEPTH_EPS:-0.001}"
+BASELINE_SPOO_TARGET_AREA_FRACTION="${BASELINE_SPOO_TARGET_AREA_FRACTION:-0.1111111111111111}"
+BASELINE_SPOO_MASK_WEIGHT="${BASELINE_SPOO_MASK_WEIGHT:-0.001}"
+BASELINE_SPOO_MASK_SHARPNESS="${BASELINE_SPOO_MASK_SHARPNESS:-1.0}"
+BASELINE_SPOO_BORDER_LR="${BASELINE_SPOO_BORDER_LR:-1.0}"
+BASELINE_SPOO_LBFGS_HISTORY="${BASELINE_SPOO_LBFGS_HISTORY:-20}"
+BASELINE_SPOO_NATURALNESS="${BASELINE_SPOO_NATURALNESS:-0}"
+BASELINE_SPOO_VGG19_WEIGHTS="${BASELINE_SPOO_VGG19_WEIGHTS:-}"
+BASELINE_SPOO_STYLE_WEIGHT="${BASELINE_SPOO_STYLE_WEIGHT:-2.0}"
+BASELINE_SPOO_CONTENT_WEIGHT="${BASELINE_SPOO_CONTENT_WEIGHT:-0.002}"
+BASELINE_SPOO_TV_WEIGHT="${BASELINE_SPOO_TV_WEIGHT:-0.0000000002}"
+BASELINE_SPOO_REALISM_WEIGHT="${BASELINE_SPOO_REALISM_WEIGHT:-0.00002}"
+BASELINE_SPOO_LATE_START_FRACTION="${BASELINE_SPOO_LATE_START_FRACTION:-0.5}"
+BASELINE_SPOO_BEST_START_FRACTION="${BASELINE_SPOO_BEST_START_FRACTION:-0.1}"
+BASELINE_SPOO_MASK_SCHEDULE_FRACTION="${BASELINE_SPOO_MASK_SCHEDULE_FRACTION:-0.6}"
+BASELINE_SPOO_MASK_UPDATE_INTERVAL="${BASELINE_SPOO_MASK_UPDATE_INTERVAL:-20}"
+BASELINE_SPOO_MASK_UPSCALER="${BASELINE_SPOO_MASK_UPSCALER:-1.5}"
+BASELINE_SPOO_MASK_DOWNSCALER="${BASELINE_SPOO_MASK_DOWNSCALER:-0.7}"
+BASELINE_APARATE_OUTSIDE_WEIGHT="${BASELINE_APARATE_OUTSIDE_WEIGHT:-1.0}"
+BASELINE_APARATE_TV_WEIGHT="${BASELINE_APARATE_TV_WEIGHT:-0.1}"
+BASELINE_APARATE_NPS_WEIGHT="${BASELINE_APARATE_NPS_WEIGHT:-1.5}"
+BASELINE_MASK_RESOLUTION="${BASELINE_MASK_RESOLUTION:-16}"
+BASELINE_MASK_AREA_FRACTION="${BASELINE_MASK_AREA_FRACTION:-0.5}"
+BASELINE_MASK_AREA_WEIGHT="${BASELINE_MASK_AREA_WEIGHT:-10.0}"
+BASELINE_MASK_BINARY_WEIGHT="${BASELINE_MASK_BINARY_WEIGHT:-0.1}"
+BASELINE_MASK_TV_WEIGHT="${BASELINE_MASK_TV_WEIGHT:-0.1}"
+BASELINE_MASK_TEMPERATURE="${BASELINE_MASK_TEMPERATURE:-1.0}"
+BASELINE_3D2FOOL_TV_WEIGHT="${BASELINE_3D2FOOL_TV_WEIGHT:-0.1}"
+BASELINE_3D2FOOL_NPS_WEIGHT="${BASELINE_3D2FOOL_NPS_WEIGHT:-5.0}"
+BASELINE_TEXTURE_REPEATS="${BASELINE_TEXTURE_REPEATS:-6}"
+BASELINE_CONVERTED_TEXTURE_SIZE="${BASELINE_CONVERTED_TEXTURE_SIZE:-4096}"
+BASELINE_TEXTURE_UPSAMPLE_FACTOR="${BASELINE_TEXTURE_UPSAMPLE_FACTOR:-8}"
+BASELINE_WEATHER_STRENGTH="${BASELINE_WEATHER_STRENGTH:-0.15}"
+BASELINE_VO_BLUR_KERNEL="${BASELINE_VO_BLUR_KERNEL:-9}"
 ACTIVATION_CHECKPOINT="${ACTIVATION_CHECKPOINT:-0}"
 POSE_REVERSE_REFERENCE="${POSE_REVERSE_REFERENCE:-gt}"
 POSE_BAD_REFERENCE="${POSE_BAD_REFERENCE:-gt}"
@@ -65,8 +105,20 @@ MIRAGE_PROJECTED_DIRECTION_SCALE="${MIRAGE_PROJECTED_DIRECTION_SCALE:-0.0}"
 MIRAGE_FLOOR_TRACK_PX="${MIRAGE_FLOOR_TRACK_PX:-8.0}"
 MIRAGE_FLOOR_VIS="${MIRAGE_FLOOR_VIS:-0.5}"
 MIRAGE_PROJECTED_GT_DIR="${MIRAGE_PROJECTED_GT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/outputs/tum_gt_point_track}"
+MIRAGE_PROJECTED_MIN_QUERIES="${MIRAGE_PROJECTED_MIN_QUERIES:-20}"
 SUBSET_PLAN="${SUBSET_PLAN:-}"
 SUBSET_ACCUM="${SUBSET_ACCUM:-1}"
+SUBSET_AGG="${SUBSET_AGG:-mean}"
+MIRAGE_PROJECTED_TASKS="${MIRAGE_PROJECTED_TASKS:-}"
+DYNAMIC_FRAME_POOL="${DYNAMIC_FRAME_POOL:-}"
+DYNAMIC_FRAME_POOL_JSON="${DYNAMIC_FRAME_POOL_JSON:-}"
+DYNAMIC_FRAME_POOL_JSON="${DYNAMIC_FRAME_POOL_JSON:-}"
+AUDIT_PLAN="${AUDIT_PLAN:-}"
+AUDIT_EVERY="${AUDIT_EVERY:-0}"
+DYNAMIC_SETS_PER_STEP="${DYNAMIC_SETS_PER_STEP:-6}"
+DYNAMIC_FRAMES_PER_SET="${DYNAMIC_FRAMES_PER_SET:-10}"
+SOFTMIN_TAU="${SOFTMIN_TAU:-0.05}"
+SOFTMIN_NORMALIZE="${SOFTMIN_NORMALIZE:-clean}"
 SHARED_DEFORMATION="${SHARED_DEFORMATION:-}"
 # ${VAR:+...} tests non-empty, so "0" would have switched the flag on
 [[ "$SHARED_DEFORMATION" == "0" ]] && SHARED_DEFORMATION=""
@@ -154,6 +206,8 @@ PRINT_MIN="${PRINT_MIN:-0.0}"
 PRINT_MAX="${PRINT_MAX:-1.0}"
 EOT_BRIGHTNESS="${EOT_BRIGHTNESS:-0.15}"
 EOT_CONTRAST="${EOT_CONTRAST:-0.15}"
+EOT_SATURATION="${EOT_SATURATION:-0.0}"
+EOT_HUE="${EOT_HUE:-0.0}"
 EOT_GAMMA="${EOT_GAMMA:-0.10}"
 EOT_NOISE_STD="${EOT_NOISE_STD:-0.01}"
 EOT_WARMUP_FRACTION="${EOT_WARMUP_FRACTION:-0.25}"
@@ -172,6 +226,8 @@ NATURAL_REFERENCE_WEIGHT="${NATURAL_REFERENCE_WEIGHT:-0.0}"
 
 FORCE_PREPARE_TUM10="${FORCE_PREPARE_TUM10:-0}"
 FORCE_CLEAN="${FORCE_CLEAN:-0}"
+SKIP_TUM_PREPARE="${SKIP_TUM_PREPARE:-0}"
+SKIP_CLEAN_VGGT="${SKIP_CLEAN_VGGT:-0}"
 FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_APPLY="${FORCE_APPLY:-0}"
 RUN_EVAL="${RUN_EVAL:-1}"
@@ -207,6 +263,8 @@ echo "texture_size=$TEXTURE_SIZE texture_init=$TEXTURE_INIT freeze_texture=$FREE
 echo "texture_init_image=$TEXTURE_INIT_IMAGE"
 echo "activation_checkpoint=$ACTIVATION_CHECKPOINT"
 echo "attack_loss=$ATTACK_LOSS pose_reverse_reference=$POSE_REVERSE_REFERENCE pose_weights=(rot:$POSE_ROTATION_WEIGHT,trans:$POSE_TRANSLATION_WEIGHT)"
+echo "paper_baseline focus_scale=$BASELINE_FOCUS_SCALE focus_quad=$BASELINE_FOCUS_QUAD_WORLD depth_eps=$BASELINE_DEPTH_EPS mask_area=$BASELINE_MASK_AREA_FRACTION mask_resolution=$BASELINE_MASK_RESOLUTION"
+echo "paper_baseline spoo target_area=$BASELINE_SPOO_TARGET_AREA_FRACTION mask_weight=$BASELINE_SPOO_MASK_WEIGHT sharpness=$BASELINE_SPOO_MASK_SHARPNESS border_lr=$BASELINE_SPOO_BORDER_LR lbfgs_history=$BASELINE_SPOO_LBFGS_HISTORY"
 echo "filter_budget json=$FILTER_BUDGET_JSON fraction=$FILTER_BUDGET_FRACTION constraints=$BUDGET_CONSTRAINTS pose_objective=$BUDGET_POSE_OBJECTIVE"
 echo "pose_bad_reference=$POSE_BAD_REFERENCE drift=($POSE_DRIFT_X_M,$POSE_DRIFT_Y_M,$POSE_DRIFT_Z_M)m drift_yaw=$POSE_DRIFT_YAW_DEGREES scale=$POSE_TRANSLATION_SCALE yaw=$POSE_YAW_DEGREES"
 echo "plane_width=$PLANE_WIDTH plane_height=$PLANE_HEIGHT plane_distance=$PLANE_DISTANCE"
@@ -228,36 +286,44 @@ echo "regularization tv=$TV_WEIGHT printability=$PRINTABILITY_WEIGHT levels=$PRI
 echo "natural_reference image=$NATURAL_REFERENCE_IMAGE weight=$NATURAL_REFERENCE_WEIGHT"
 echo "run_eval=$RUN_EVAL run_gauge_diag=$RUN_GAUGE_DIAG run_consistency_check=$RUN_CONSISTENCY_CHECK"
 
-log "prepare TUM images links"
-for seq_dir in "$TUM_ROOT"/rgbd_dataset_freiburg3_*; do
-  if [[ -d "$seq_dir/rgb_90" ]]; then
-    ln -sfn rgb_90 "$seq_dir/images"
+if [[ "$SKIP_TUM_PREPARE" != "1" ]]; then
+  log "prepare TUM images links"
+  for seq_dir in "$TUM_ROOT"/rgbd_dataset_freiburg3_*; do
+    if [[ -d "$seq_dir/rgb_90" ]]; then
+      ln -sfn rgb_90 "$seq_dir/images"
+    fi
+  done
+
+  log "prepare uniform TUM-10 manifest"
+  prepare_args=()
+  if [[ "$FORCE_PREPARE_TUM10" == "1" ]]; then
+    prepare_args=(--overwrite)
   fi
-done
-
-log "prepare uniform TUM-10 manifest"
-prepare_args=()
-if [[ "$FORCE_PREPARE_TUM10" == "1" ]]; then
-  prepare_args=(--overwrite)
+  "$VGGT_PY" "$VGGT_ROOT/scripts/prepare_tum10_frame_scenes_for_vla.py" \
+    --tum_root "$TUM_ROOT" \
+    --out_root "$TUM10_FRAME_SCENES" \
+    --frame_count "$TUM_FRAME_COUNT" \
+    "${prepare_args[@]}"
+else
+  log "skip TUM links/manifest preparation because SKIP_TUM_PREPARE=1"
 fi
-"$VGGT_PY" "$VGGT_ROOT/scripts/prepare_tum10_frame_scenes_for_vla.py" \
-  --tum_root "$TUM_ROOT" \
-  --out_root "$TUM10_FRAME_SCENES" \
-  --frame_count "$TUM_FRAME_COUNT" \
-  "${prepare_args[@]}"
 
-log "run clean VGGT on TUM-10 uniform frames"
-clean_args=()
-if [[ "$FORCE_CLEAN" != "1" ]]; then
-  clean_args=(--skip_existing)
+if [[ "$SKIP_CLEAN_VGGT" != "1" ]]; then
+  log "run clean VGGT on TUM-10 uniform frames"
+  clean_args=()
+  if [[ "$FORCE_CLEAN" != "1" ]]; then
+    clean_args=(--skip_existing)
+  fi
+  "$VGGT_PY" "$VGGT_ROOT/scripts/run_vggt_clean_tum10_uniform.py" \
+    --tum_root "$TUM_ROOT" \
+    --output_root "$TUM_CLEAN_OUT" \
+    --frame_manifest "$TUM10_FRAME_MANIFEST" \
+    --ckpt "$CKPT" \
+    --seed "$SEED" \
+    "${clean_args[@]}"
+else
+  log "skip clean VGGT because SKIP_CLEAN_VGGT=1"
 fi
-"$VGGT_PY" "$VGGT_ROOT/scripts/run_vggt_clean_tum10_uniform.py" \
-  --tum_root "$TUM_ROOT" \
-  --output_root "$TUM_CLEAN_OUT" \
-  --frame_manifest "$TUM10_FRAME_MANIFEST" \
-  --ckpt "$CKPT" \
-  --seed "$SEED" \
-  "${clean_args[@]}"
 
 log "run GT-geometry-aware planar patch attack"
 patch_args=()
@@ -291,6 +357,12 @@ fi
 if [[ "$FREEZE_TEXTURE" == "1" ]]; then
   geometry_args+=(--freeze_texture)
 fi
+if [[ "$TEXTURE_INIT_PRESERVE_ASPECT" == "1" ]]; then
+  geometry_args+=(--texture_init_preserve_aspect)
+fi
+if [[ "$BASELINE_SPOO_NATURALNESS" == "1" ]]; then
+  geometry_args+=(--baseline_spoo_naturalness)
+fi
 if [[ "$ACTIVATION_CHECKPOINT" == "1" ]]; then
   geometry_args+=(--activation_checkpoint)
 fi
@@ -312,6 +384,7 @@ fi
   --scene_pattern "$SCENE_PATTERN" \
   --output_dir "$TUM_GEOM_OUT" \
   --frame_manifest "$TUM10_FRAME_MANIFEST" \
+  --gt_name "$GT_NAME" \
   --ckpt "$CKPT" \
   --texture_size "$TEXTURE_SIZE" \
   --texture_init "$TEXTURE_INIT" \
@@ -319,8 +392,45 @@ fi
   --inner_loop "$INNER_LOOP" \
   --scenes_per_iteration "$SCENES_PER_ITERATION" \
   --patch_lr "$PATCH_LR" \
+  --scheduler "$SCHEDULER" \
+  --warmup_iterations "$WARMUP_ITERATIONS" \
   --feature_layer "$FEATURE_LAYER" \
   --attack_loss "$ATTACK_LOSS" \
+  --baseline_focus_scale "$BASELINE_FOCUS_SCALE" \
+  "--baseline_focus_quad_world=$BASELINE_FOCUS_QUAD_WORLD" \
+  --baseline_depth_eps "$BASELINE_DEPTH_EPS" \
+  --baseline_spoo_target_area_fraction "$BASELINE_SPOO_TARGET_AREA_FRACTION" \
+  --baseline_spoo_mask_weight "$BASELINE_SPOO_MASK_WEIGHT" \
+  --baseline_spoo_mask_sharpness "$BASELINE_SPOO_MASK_SHARPNESS" \
+  --baseline_spoo_border_lr "$BASELINE_SPOO_BORDER_LR" \
+  --baseline_spoo_lbfgs_history "$BASELINE_SPOO_LBFGS_HISTORY" \
+  --baseline_spoo_vgg19_weights "$BASELINE_SPOO_VGG19_WEIGHTS" \
+  --baseline_spoo_style_weight "$BASELINE_SPOO_STYLE_WEIGHT" \
+  --baseline_spoo_content_weight "$BASELINE_SPOO_CONTENT_WEIGHT" \
+  --baseline_spoo_tv_weight "$BASELINE_SPOO_TV_WEIGHT" \
+  --baseline_spoo_realism_weight "$BASELINE_SPOO_REALISM_WEIGHT" \
+  --baseline_spoo_late_start_fraction "$BASELINE_SPOO_LATE_START_FRACTION" \
+  --baseline_spoo_best_start_fraction "$BASELINE_SPOO_BEST_START_FRACTION" \
+  --baseline_spoo_mask_schedule_fraction "$BASELINE_SPOO_MASK_SCHEDULE_FRACTION" \
+  --baseline_spoo_mask_update_interval "$BASELINE_SPOO_MASK_UPDATE_INTERVAL" \
+  --baseline_spoo_mask_upscaler "$BASELINE_SPOO_MASK_UPSCALER" \
+  --baseline_spoo_mask_downscaler "$BASELINE_SPOO_MASK_DOWNSCALER" \
+  --baseline_aparate_outside_weight "$BASELINE_APARATE_OUTSIDE_WEIGHT" \
+  --baseline_aparate_tv_weight "$BASELINE_APARATE_TV_WEIGHT" \
+  --baseline_aparate_nps_weight "$BASELINE_APARATE_NPS_WEIGHT" \
+  --baseline_mask_resolution "$BASELINE_MASK_RESOLUTION" \
+  --baseline_mask_area_fraction "$BASELINE_MASK_AREA_FRACTION" \
+  --baseline_mask_area_weight "$BASELINE_MASK_AREA_WEIGHT" \
+  --baseline_mask_binary_weight "$BASELINE_MASK_BINARY_WEIGHT" \
+  --baseline_mask_tv_weight "$BASELINE_MASK_TV_WEIGHT" \
+  --baseline_mask_temperature "$BASELINE_MASK_TEMPERATURE" \
+  --baseline_3d2fool_tv_weight "$BASELINE_3D2FOOL_TV_WEIGHT" \
+  --baseline_3d2fool_nps_weight "$BASELINE_3D2FOOL_NPS_WEIGHT" \
+  --baseline_texture_repeats "$BASELINE_TEXTURE_REPEATS" \
+  --baseline_converted_texture_size "$BASELINE_CONVERTED_TEXTURE_SIZE" \
+  --baseline_texture_upsample_factor "$BASELINE_TEXTURE_UPSAMPLE_FACTOR" \
+  --baseline_weather_strength "$BASELINE_WEATHER_STRENGTH" \
+  --baseline_vo_blur_kernel "$BASELINE_VO_BLUR_KERNEL" \
   --pose_reverse_reference "$POSE_REVERSE_REFERENCE" \
   --pose_bad_reference "$POSE_BAD_REFERENCE" \
   --pose_drift_x_m "$POSE_DRIFT_X_M" \
@@ -353,8 +463,19 @@ fi
   --mirage_floor_track_px "$MIRAGE_FLOOR_TRACK_PX" \
   --mirage_floor_vis "$MIRAGE_FLOOR_VIS" \
   --mirage_projected_gt_dir "$MIRAGE_PROJECTED_GT_DIR" \
+  --mirage_projected_min_queries "$MIRAGE_PROJECTED_MIN_QUERIES" \
   --subset_plan "$SUBSET_PLAN" \
   --subset_accum "$SUBSET_ACCUM" \
+  --subset_agg "$SUBSET_AGG" \
+  --mirage_projected_tasks "$MIRAGE_PROJECTED_TASKS" \
+  --dynamic_frame_pool "$DYNAMIC_FRAME_POOL" \
+  --dynamic_frame_pool_json "$DYNAMIC_FRAME_POOL_JSON" \
+  --audit_plan "$AUDIT_PLAN" \
+  --audit_every "$AUDIT_EVERY" \
+  --dynamic_sets_per_step "$DYNAMIC_SETS_PER_STEP" \
+  --dynamic_frames_per_set "$DYNAMIC_FRAMES_PER_SET" \
+  --softmin_tau "$SOFTMIN_TAU" \
+  --softmin_normalize "$SOFTMIN_NORMALIZE" \
   --shared_deformation_file "$SHARED_DEFORMATION_FILE" \
   ${SHARED_DEFORMATION:+--shared_deformation} \
   --filter_budget_json "$FILTER_BUDGET_JSON" \
@@ -430,6 +551,8 @@ fi
   --print_max "$PRINT_MAX" \
   --eot_brightness "$EOT_BRIGHTNESS" \
   --eot_contrast "$EOT_CONTRAST" \
+  --eot_saturation "$EOT_SATURATION" \
+  --eot_hue "$EOT_HUE" \
   --eot_gamma "$EOT_GAMMA" \
   --eot_noise_std "$EOT_NOISE_STD" \
   --eot_warmup_fraction "$EOT_WARMUP_FRACTION" \

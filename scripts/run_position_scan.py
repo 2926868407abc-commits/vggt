@@ -42,6 +42,9 @@ def build_args(
     checkpoint: Path,
     frame_manifest: Path,
     output_dir: Path,
+    surface_support_check: bool = True,
+    support_abs_tolerance: float = 0.06,
+    support_rel_tolerance: float = 0.02,
 ) -> argparse.Namespace:
     argv = [
         "attack.py", "--tum_root", str(tum_root), "--scene_pattern", scene,
@@ -56,6 +59,12 @@ def build_args(
         "--use_depth_visibility", "--visibility_depth_margin", "0.08",
         "--seed", "0",
     ]
+    if surface_support_check:
+        argv.extend([
+            "--surface_support_check",
+            "--surface_support_abs_tolerance", str(support_abs_tolerance),
+            "--surface_support_rel_tolerance", str(support_rel_tolerance),
+        ])
     saved, sys.argv = sys.argv, argv
     try:
         return A.parse_args()
@@ -79,6 +88,8 @@ def main() -> None:
     ap.add_argument("--texture_size", type=int, default=64)
     ap.add_argument("--tum_root", type=Path, default=TUM)
     ap.add_argument("--planes_dir", type=Path, default=PL)
+    ap.add_argument("--spec", type=Path, default=None,
+                    help="candidate JSON; defaults to the unvalidated scan file")
     ap.add_argument("--clean_root", type=Path, default=CLEAN_ROOT)
     ap.add_argument("--checkpoint", type=Path, default=VG / "checkpoints/VGGT-1B")
     ap.add_argument(
@@ -89,11 +100,14 @@ def main() -> None:
     )
     ap.add_argument("--scratch_dir", type=Path, default=Path("/tmp/pos_scan"))
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--surface_support_check", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--support_abs_tolerance", type=float, default=0.06)
+    ap.add_argument("--support_rel_tolerance", type=float, default=0.02)
     ap.add_argument("--out", default=None)
     cli = ap.parse_args()
 
     scene = cli.scene
-    spec_path = cli.planes_dir / f"{scene}_scan_a{cli.area}.json"
+    spec_path = cli.spec or cli.planes_dir / f"{scene}_scan_a{cli.area}.json"
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     cands = spec["candidates"][:cli.limit] if cli.limit else spec["candidates"]
     print(f"{scene}  面积 {cli.area} m²  候选 {len(cands)}")
@@ -107,6 +121,9 @@ def main() -> None:
         checkpoint=cli.checkpoint,
         frame_manifest=cli.frame_manifest,
         output_dir=cli.scratch_dir,
+        surface_support_check=bool(cli.surface_support_check),
+        support_abs_tolerance=cli.support_abs_tolerance,
+        support_rel_tolerance=cli.support_rel_tolerance,
     )
     device = torch.device("cuda")
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16

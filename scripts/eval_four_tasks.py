@@ -101,6 +101,11 @@ def main() -> None:
                     help="帧子集需指向该子集自己的 GT")
     ap.add_argument("--clean", default=CLEAN,
                     help="帧子集需指向该子集自己的 clean run 名")
+    ap.add_argument(
+        "--require_render_ok",
+        action="store_true",
+        help="任一重渲染未复现存档输出时返回非零；正式实验应启用",
+    )
     cli = ap.parse_args()
 
     scene = cli.scene
@@ -176,6 +181,8 @@ def main() -> None:
             print(f"⚠️ 重渲染未复现存档位姿的 run: {bad}  —— 这些行的 track 指标不可信")
         used = {r["track_frames_used"] for r in rows}
         print(f"track 使用帧数（共 9 个非查询帧，阈值 {cli.min_track_points} 点）: {used}")
+        if bad and cli.require_render_ok:
+            raise SystemExit(3)
 
 
 if __name__ == "__main__":

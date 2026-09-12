@@ -51,7 +51,12 @@ def perspective_coefficients(dst: np.ndarray, src: np.ndarray) -> list[float]:
     return coeffs.astype(float).tolist()
 
 
-def warp_texture_to_quad(texture: Image.Image, quad: np.ndarray, image_size: tuple[int, int]) -> tuple[Image.Image, Image.Image]:
+def warp_texture_to_quad(
+    texture: Image.Image,
+    quad: np.ndarray,
+    image_size: tuple[int, int],
+    texture_alpha: Image.Image | None = None,
+) -> tuple[Image.Image, Image.Image]:
     tex_w, tex_h = texture.size
     src = np.asarray(
         [
@@ -70,8 +75,11 @@ def warp_texture_to_quad(texture: Image.Image, quad: np.ndarray, image_size: tup
         resample=Image.Resampling.BICUBIC,
         fillcolor=(0, 0, 0),
     )
-    white = Image.new("L", texture.size, 255)
-    mask = white.transform(
+    source_mask = (
+        texture_alpha.convert("L").resize(texture.size, Image.Resampling.BILINEAR)
+        if texture_alpha is not None else Image.new("L", texture.size, 255)
+    )
+    mask = source_mask.transform(
         image_size,
         Image.Transform.PERSPECTIVE,
         coeffs,
@@ -138,9 +146,12 @@ def composite_patch(
     visibility_mask: np.ndarray | None = None,
     draw_outline: bool = True,
     draw_text_label: bool = True,
+    texture_alpha: Image.Image | None = None,
 ) -> Image.Image:
     out = base.convert("RGBA")
-    warped, quad_mask = warp_texture_to_quad(texture, quad, out.size)
+    warped, quad_mask = warp_texture_to_quad(
+        texture, quad, out.size, texture_alpha=texture_alpha
+    )
     mask = quad_mask
     if visibility_mask is not None:
         visible = mask_array_to_image(visibility_mask, out.size)
@@ -232,6 +243,7 @@ def visualize_sequence(
     draw_outline: bool,
     draw_text_label: bool,
     save_outline_frames: bool,
+    texture_alpha: Image.Image | None,
 ) -> int:
     summary_path = seq_dir / "attack_summary.json"
     with summary_path.open("r", encoding="utf-8") as f:
@@ -273,6 +285,7 @@ def visualize_sequence(
             visibility_mask,
             draw_outline=draw_outline,
             draw_text_label=draw_text_label,
+            texture_alpha=texture_alpha,
         )
         if not contact_sheet_only:
             stem = f"{i:02d}_frame_{int(frame_indices[i]):06d}"
@@ -317,11 +330,32 @@ def main() -> None:
 
     root = Path(args.geometry_output_root)
     out_dir = Path(args.out_dir)
-    texture_path = Path(args.texture_path) if args.texture_path else root / "geometry_patch" / "geometry_patch_texture.png"
+    patch_dir = root / "geometry_patch"
+    metadata_path = patch_dir / "geometry_patch_meta.json"
+    metadata = (
+        json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata_path.exists() else {}
+    )
+    default_texture = patch_dir / "geometry_patch_texture.png"
+    # 3D2Fool optimises a 128x128 seed but deploys a repeated, centre-cropped
+    # 512x512 texture.  The saved optimized_patch is that deterministic deployed
+    # appearance, so use it in the contact sheet instead of the raw seed.
+    if metadata.get("attack_target") == "baseline_3d2fool_depth":
+        default_texture = patch_dir / "optimized_patch.png"
+    texture_path = Path(args.texture_path) if args.texture_path else default_texture
     if not texture_path.exists():
         raise FileNotFoundError(f"Missing texture image: {texture_path}")
 
     texture = Image.open(texture_path).convert("RGB")
+    texture_alpha = None
+    texture_npz = patch_dir / "geometry_patch_texture.npz"
+    if texture_npz.exists():
+        with np.load(texture_npz) as data:
+            if "adaptive_mask" in data:
+                mask = np.asarray(data["adaptive_mask"], dtype=np.float32).squeeze()
+                texture_alpha = Image.fromarray(
+                    (np.clip(mask, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L"
+                )
     out_dir.mkdir(parents=True, exist_ok=True)
     texture.save(out_dir / texture_path.name)
 
@@ -345,6 +379,7 @@ def main() -> None:
             not args.no_outline,
             not args.no_label,
             not args.no_outline_frames,
+            texture_alpha,
         )
         total += count
         print(f"[visualized] {seq_dir.name}: {count} frame(s)")

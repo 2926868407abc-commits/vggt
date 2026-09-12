@@ -70,6 +70,17 @@ def test_track_score_caps_single_outlier():
     assert 0.0 < float(score) < 3.0
 
 
+def test_track_score_returns_none_when_dynamic_batch_has_no_visible_gt():
+    target = torch.zeros(3, 4, 2)
+    visible = torch.zeros(3, 4, dtype=torch.bool)
+    known = torch.ones(3, 4, dtype=torch.bool)
+    pred = target.clone()
+    score = mirage_projected_track_score(
+        pred.unsqueeze(0), target, visible, known, cap_px=20.0
+    )
+    assert score is None
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

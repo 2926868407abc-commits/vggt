@@ -34,7 +34,9 @@ CLEAN = "tum10_clean_uniform_l3"
 
 def build_args(scene: str, texture_size: int, quad: str,
                manifest: str, clean: str,
-               explicit_quad: str = "") -> argparse.Namespace:
+               explicit_quad: str = "",
+               attack_loss: str = "feature_l1",
+               focus_quad: str = "") -> argparse.Namespace:
     argv = [
         "attack.py", "--tum_root", str(TUM), "--scene_pattern", scene,
         "--output_dir", "/tmp/four_task", "--ckpt", str(VG / "checkpoints/VGGT-1B"),
@@ -57,6 +59,8 @@ def build_args(scene: str, texture_size: int, quad: str,
         "--fused_max_plane_residual", "0.02", "--visibility_depth_margin", "0.08",
         "--seed", "0", "--use_depth_visibility", "--optimize_geometry",
         "--surface_support_check",
+        "--attack_loss", attack_loss,
+        f"--baseline_focus_quad_world={focus_quad}",
     ]
     if explicit_quad:
         argv.append(f"--explicit_quad_world={explicit_quad}")
@@ -97,9 +101,11 @@ def main() -> None:
     model = None
 
     for run in [r.strip() for r in cli.runs.split(",") if r.strip()]:
-        if not (R / run / scene / "attack_summary.json").exists():
+        summary_path = R / run / scene / "attack_summary.json"
+        if not summary_path.exists():
             print(f"{run}: 缺 attack_summary，跳过")
             continue
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
         tex_npz = R / run / "geometry_patch/geometry_patch_texture.npz"
         has_patch = tex_npz.exists()
         if has_patch:
@@ -108,9 +114,24 @@ def main() -> None:
         else:
             tex_arr, tsize = None, 64
 
-        args = build_args(scene, int(tsize), cli.quad,
-                          cli.manifest, cli.clean,
-                          cli.explicit_quad_world)
+        run_meta = summary.get("geometry_patch_metadata", {})
+        paper_meta = run_meta.get("paper_baseline", {}) or {}
+        attack_loss = str(run_meta.get("attack_target", "feature_l1"))
+        run_quad_values = summary.get("geometry", {}).get("plane_corners_world")
+        run_quad = (
+            ",".join(str(value) for row in run_quad_values for value in row)
+            if run_quad_values else cli.explicit_quad_world
+        )
+        args = build_args(
+            scene,
+            int(tsize),
+            cli.quad,
+            cli.manifest,
+            cli.clean,
+            run_quad,
+            attack_loss,
+            str(paper_meta.get("focus_quad_world") or ""),
+        )
         if model is None:
             model = A.load_model(args, device)
             for p in model.parameters():
@@ -124,13 +145,8 @@ def main() -> None:
                                        intr, args.texture_size, args, device,
                                        model=model, dtype=dtype)
             if has_patch:
-                tex = torch.as_tensor(
-                    tex_arr if tex_arr.ndim == 3 and tex_arr.shape[0] in (3, 4)
-                    else tex_arr.transpose(2, 0, 1),
-                    device=device, dtype=torch.float32)
-                if float(tex.max()) > 1.5:
-                    tex = tex / 255.0
-                adv = A.apply_geometry_patch(item["images"], tex[None, :3],
+                tex = A.load_texture(str(tex_npz), device, args)
+                adv = A.apply_geometry_patch(item["images"], tex[:, :3],
                                              item["grids"], item["masks"],
                                              args, training=False)
             else:

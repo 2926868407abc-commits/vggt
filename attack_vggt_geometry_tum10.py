@@ -37,6 +37,13 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from torchvision.transforms.functional import to_pil_image
 
+from scripts.tum_gt_pool import (
+    gather_pool as gather_mirage_gt_pool,
+    open_pool as open_mirage_gt_pool,
+    pool_exists as mirage_gt_pool_exists,
+    query_count as mirage_gt_pool_query_count,
+)
+
 from attack_vggt_new1 import (
     autocast_context,
     detach_predictions,
@@ -51,6 +58,45 @@ from attack_vggt_new1 import (
 from attack_vggt_vla_style import load_frame_manifest, scheduled_lr
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+from baselines.paper_losses import (
+    APARATE_SHAPE_EXTENSION,
+    DEPTH_BASELINE_LOSSES,
+    PAPER_BASELINE_LOSSES,
+    VO_BASELINE_LOSSES,
+    adaptive_alpha,
+    adaptive_mask_regularization,
+    aparate_depth_loss,
+    fool3d_non_printability_score,
+    fool3d_depth_loss,
+    fool3d_smoothness_loss,
+    isotropic_total_variation,
+    non_printability_score,
+    paper_color_transform,
+    paper_patch_noise_like,
+    paper_random_texture,
+    pgd_sign_step,
+    passive_vo_box_blur,
+    project_spoo_borders_,
+    rectangular_focus_mask,
+    spoo_depth_loss,
+    spoo_edge_based_adam_step_,
+    spoo_initial_borders,
+    spoo_matting_laplacian,
+    spoo_mask_size_loss,
+    spoo_polynomial_lr,
+    spoo_realism_loss,
+    spoo_rectangle_area_fraction,
+    spoo_soft_rectangle,
+    spoo_source_tv_loss,
+    spoo_target_area_schedule,
+    spoo_updated_mask_weight,
+    SpooVgg19Naturalness,
+    sample_texture_conversion,
+    texture_conversion,
+    vo_mprms_loss,
+    vo_rms_loss,
+)
 
 
 def list_scene_dirs(root: Path, pattern: str) -> list[Path]:
@@ -1469,6 +1515,17 @@ def build_geometry_arrays_for_plane(
         dst, corner_valid = camera_to_tensor_xy(corners_cam, frame_intrinsics, proj)
         projected_corners.append(dst.astype(float).tolist())
 
+        # A corner outside the image is not a reason to drop the patch: the
+        # homography is fine as long as every corner is in front of the camera,
+        # and the per-pixel `inside` test below clips the rest. Culling on the
+        # in-image test threw away frames with up to 88% of the quad visible.
+        in_front = corners_cam[:, 2] > 1e-6
+        # A near-grazing corner projects astronomically far and makes the
+        # homography ill-conditioned, so keep a magnitude guard.
+        span = max(tensor_h, tensor_w)
+        finite = np.isfinite(dst).all(axis=1) & (np.abs(dst).max(axis=1) < 100.0 * span)
+        corner_valid = in_front & finite
+
         if not bool(corner_valid.all()):
             grid = np.zeros((tensor_h, tensor_w, 2), dtype=np.float32)
             mask = np.zeros((1, tensor_h, tensor_w), dtype=np.float32)
@@ -2178,6 +2235,53 @@ def select_candidate_by_feature_probe(
     return best[1], best[2]
 
 
+def texture_hw(args: argparse.Namespace, texture: torch.Tensor | None = None) -> tuple[int, int]:
+    if texture is not None:
+        return int(texture.shape[-2]), int(texture.shape[-1])
+    stored = getattr(args, "_texture_hw", None)
+    if stored is not None:
+        return int(stored[0]), int(stored[1])
+    return int(args.texture_size), int(args.texture_size)
+
+
+def apply_paper_photometric_eot(
+    rendered: torch.Tensor,
+    args: argparse.Namespace,
+    training: bool,
+) -> torch.Tensor:
+    """Apply the source baseline's sampled colour transform after rendering."""
+    if not training or not args.physical_eot:
+        return rendered.clamp(args.print_min, args.print_max)
+    n_frames = rendered.shape[0]
+    strength = float(np.clip(getattr(args, "_eot_strength", 1.0), 0.0, 1.0))
+
+    def per_frame(spread: float) -> torch.Tensor:
+        spread *= strength
+        return torch.empty((n_frames,), device=rendered.device).uniform_(
+            1.0 - spread, 1.0 + spread)
+
+    brightness = per_frame(args.eot_brightness) if args.eot_brightness > 0 else None
+    contrast = per_frame(args.eot_contrast) if args.eot_contrast > 0 else None
+    saturation = per_frame(args.eot_saturation) if args.eot_saturation > 0 else None
+    hue = None
+    if args.eot_hue > 0:
+        hue_spread = min(0.5, float(args.eot_hue) * strength)
+        hue = torch.empty((n_frames,), device=rendered.device).uniform_(
+            -hue_spread, hue_spread
+        )
+    rendered = paper_color_transform(
+        rendered,
+        brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
+        hue=hue,
+    )
+    if args.eot_gamma > 0:
+        gamma = per_frame(args.eot_gamma).view(n_frames, 1, 1, 1)
+        rendered = rendered.clamp(1e-5, 1.0).pow(gamma)
+    return rendered.clamp(args.print_min, args.print_max)
+
+
 def prepare_texture_for_render(texture: torch.Tensor, args: argparse.Namespace | None,
                                training: bool, n_frames: int = 1) -> torch.Tensor:
     """Photometric EOT, sampled independently per frame.
@@ -2193,26 +2297,111 @@ def prepare_texture_for_render(texture: torch.Tensor, args: argparse.Namespace |
     if args is None:
         return texture.clamp(0.0, 1.0).expand(n_frames, -1, -1, -1)
 
-    rendered = texture.clamp(args.print_min, args.print_max)
+    source = texture
+    if args.attack_loss == "baseline_3d2fool_depth":
+        source = texture_conversion(
+            texture,
+            training=training,
+            repeats=args.baseline_texture_repeats,
+            output_size=args.baseline_converted_texture_size,
+            upsample_factor=args.baseline_texture_upsample_factor,
+        )
+    elif args.attack_loss in VO_BASELINE_LOSSES:
+        # Public Passive-VO code box-blurs the perturbation before every
+        # perspective warp. Our 3-D renderer replaces that homography, but the
+        # same pre-warp blur is retained.
+        source = passive_vo_box_blur(texture, args.baseline_vo_blur_kernel)
+    rendered = source.clamp(args.print_min, args.print_max)
     rendered = rendered.expand(n_frames, -1, -1, -1)
-    if not training or not args.physical_eot:
-        return rendered
+    return apply_paper_photometric_eot(rendered, args, training)
 
-    strength = float(np.clip(getattr(args, "_eot_strength", 1.0), 0.0, 1.0))
 
-    def per_frame(spread: float) -> torch.Tensor:
-        spread *= strength
-        return torch.empty((n_frames, 1, 1, 1), device=texture.device).uniform_(
-            1.0 - spread, 1.0 + spread)
+def paper_base_texture_preview(
+    texture: torch.Tensor,
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    """Return the source method's optimised base variable for human inspection.
 
-    if args.eot_brightness > 0:
-        rendered = rendered * per_frame(args.eot_brightness)
-    if args.eot_contrast > 0:
-        mean = rendered.mean(dim=(-2, -1), keepdim=True)
-        rendered = (rendered - mean) * per_frame(args.eot_contrast) + mean
-    if args.eot_gamma > 0:
-        rendered = rendered.clamp(1e-5, 1.0).pow(per_frame(args.eot_gamma))
-    return rendered.clamp(args.print_min, args.print_max)
+    This deliberately excludes training/deployment transforms.  In particular,
+    3D2Fool optimises a 128x128 coarse RGB map and writes its nearest-neighbour
+    8x expansion; random 6x6 tiling/cropping belongs to ``tex_trans`` and is
+    therefore shown separately as a deployed preview.
+    """
+    preview = texture.detach().float().clamp(0.0, 1.0)
+    if args.attack_loss == "baseline_3d2fool_depth":
+        preview = F.interpolate(preview, scale_factor=8, mode="nearest")
+    return preview.squeeze(0).cpu()
+
+
+def projected_adaptive_mask(
+    grids: torch.Tensor,
+    masks: torch.Tensor,
+    args: argparse.Namespace | None,
+) -> torch.Tensor:
+    """Project APARATE's learnable UV alpha mask through the physical renderer."""
+    if args is None or args.attack_loss not in (
+        APARATE_SHAPE_EXTENSION, "baseline_spoo_depth"
+    ):
+        return masks
+    if args.attack_loss == "baseline_spoo_depth":
+        borders = getattr(args, "_spoo_borders", None)
+        if borders is None:
+            return masks
+        alpha = spoo_soft_rectangle(
+            borders,
+            texture_hw(args),
+            args.baseline_spoo_mask_sharpness,
+        )
+    else:
+        logits = getattr(args, "_adaptive_mask_logits", None)
+        if logits is None:
+            return masks
+        alpha = adaptive_alpha(
+            logits,
+            temperature=args.baseline_mask_temperature,
+            output_size=texture_hw(args),
+        )
+    alpha = alpha.expand(grids.shape[0], -1, -1, -1)
+    sampled_alpha = F.grid_sample(
+        alpha,
+        grids,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return masks * sampled_alpha.clamp(0.0, 1.0)
+
+
+def baseline_weather_augmentation(
+    sampled: torch.Tensor,
+    args: argparse.Namespace | None,
+    training: bool,
+) -> torch.Tensor:
+    """Legacy TUM weather proxy (disabled by all formal baseline profiles).
+
+    The released 3D2Fool code keys weather, fog and rain to CARLA map/weather
+    labels. TUM has no equivalent labels, so this approximation is retained only
+    for old experiment reproducibility and must not be called official logic.
+    """
+    if (args is None or not training or not args.physical_eot
+            or args.attack_loss != "baseline_3d2fool_depth"):
+        return sampled
+    strength = float(args.baseline_weather_strength) * float(
+        np.clip(getattr(args, "_eot_strength", 1.0), 0.0, 1.0)
+    )
+    if strength <= 0:
+        return sampled
+    n = sampled.shape[0]
+    exposure = torch.empty((n, 1, 1, 1), device=sampled.device).uniform_(
+        1.0 - strength, 1.0 + strength
+    )
+    fog = torch.empty((n, 1, 1, 1), device=sampled.device).uniform_(0.0, strength)
+    rain = torch.randn_like(sampled[:, :1])
+    rain = F.avg_pool2d(rain, kernel_size=(7, 1), stride=1, padding=(3, 0))
+    rain = rain.expand(-1, sampled.shape[1], -1, -1) * (0.25 * strength)
+    return (sampled * exposure * (1.0 - fog) + fog + rain).clamp(
+        args.print_min, args.print_max
+    )
 
 
 def jitter_sampling_grids(grids: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
@@ -2264,17 +2453,36 @@ def apply_geometry_patch(
     training: bool = False,
 ) -> torch.Tensor:
     n_frames = images.shape[0]
-    rendered_texture = prepare_texture_for_render(texture, args, training, n_frames)
+    # Shape is part of the printed patch and therefore stays fixed when EOT jitters
+    # the sampled *content* inside it.
+    effective_masks = projected_adaptive_mask(grids, masks, args)
     if args is not None and training and args.physical_eot:
         grids = jitter_sampling_grids(grids, args)
-    sampled = F.grid_sample(
-        rendered_texture,
-        grids,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )
-    patched = (images * (1.0 - masks) + sampled * masks).clamp(0.0, 1.0)
+    if args is not None and args.attack_loss == "baseline_3d2fool_depth":
+        # Fuse the official 4096-from-6144 texture conversion with image-space
+        # sampling.  This is pixel-equivalent to constructing the 4096 texture
+        # and calling grid_sample, but avoids a multi-gigabyte backward buffer.
+        sampled = sample_texture_conversion(
+            texture,
+            grids,
+            training=training,
+            repeats=args.baseline_texture_repeats,
+            output_size=args.baseline_converted_texture_size,
+            upsample_factor=args.baseline_texture_upsample_factor,
+        ).clamp(args.print_min, args.print_max)
+        # 3D2Fool jitters the rendered vehicle, not its latent UV seed.
+        sampled = apply_paper_photometric_eot(sampled, args, training)
+    else:
+        rendered_texture = prepare_texture_for_render(texture, args, training, n_frames)
+        sampled = F.grid_sample(
+            rendered_texture,
+            grids,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+    sampled = baseline_weather_augmentation(sampled, args, training)
+    patched = (images * (1.0 - effective_masks) + sampled * effective_masks).clamp(0.0, 1.0)
     if args is not None and training and args.physical_eot and args.eot_noise_std > 0:
         # Whole-image white noise changes millions of pixels that the patch cannot
         # control.  On VGGT-1B its stochastic backbone gradient overwhelmed the
@@ -2283,8 +2491,12 @@ def apply_geometry_patch(
         # belongs: on the rendered patch.  Camera-wide noise remains an evaluation
         # stress test, not an optimisation variable.
         strength = float(np.clip(getattr(args, "_eot_strength", 1.0), 0.0, 1.0))
-        noise = torch.randn_like(sampled) * (args.eot_noise_std * strength)
-        patched = (patched + noise * masks).clamp(0.0, 1.0)
+        noise = paper_patch_noise_like(
+            sampled,
+            args.attack_loss,
+            args.eot_noise_std * strength,
+        )
+        patched = (patched + noise * effective_masks).clamp(0.0, 1.0)
     return patched
 
 
@@ -2298,6 +2510,19 @@ def scheduled_eot_strength(update_idx: int, total_updates: int,
     if progress <= start:
         return 0.0
     return float(np.clip((progress - start) / max(1.0 - start, 1e-12), 0.0, 1.0))
+
+
+def current_eot_strength(args: argparse.Namespace, update_idx: int,
+                         total_updates: int) -> float:
+    if not args.physical_eot:
+        return 0.0
+    # APARATE and 3D2Fool apply their random transformations from the first
+    # update. The repository's progressive EOT schedule belongs to our method,
+    # not to those paper baselines.
+    if args.attack_loss in ("baseline_aparate_depth", APARATE_SHAPE_EXTENSION,
+                            "baseline_3d2fool_depth"):
+        return 1.0
+    return scheduled_eot_strength(update_idx, total_updates, args.eot_warmup_fraction)
 
 
 def c2w_numpy_to_relative_tensor(c2w: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -3229,6 +3454,35 @@ def forward_all_geometry_heads(
     return out
 
 
+def forward_depth_only(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Run the shared aggregator and only VGGT's depth head for MDE baselines."""
+    images_b = images if images.ndim == 5 else images[None]
+    patch_start_idx = model.aggregator.patch_start_idx
+
+    def run_aggregator(imgs):
+        with autocast_context(imgs.device, dtype):
+            tokens_list, _ = model.aggregator(imgs)
+        return tuple(tokens_list)
+
+    tokens = list(torch.utils.checkpoint.checkpoint(
+        run_aggregator, images_b, use_reentrant=False))
+
+    def run_depth(*tensors):
+        depth, _ = model.depth_head(
+            list(tensors), images=images_b, patch_start_idx=patch_start_idx
+        )
+        return depth
+
+    with torch.cuda.amp.autocast(enabled=False):
+        return torch.utils.checkpoint.checkpoint(
+            run_depth, *tokens, use_reentrant=False
+        )
+
+
 def track_consistency_loss(pred_track: torch.Tensor, target_track: torch.Tensor,
                            pred_vis: torch.Tensor, target_vis: torch.Tensor,
                            pred_conf: torch.Tensor | None, target_conf: torch.Tensor | None,
@@ -3616,14 +3870,62 @@ def mirage_floor_loss(
     }
 
 
+def get_mirage_projected_gt_pool(
+    seq_name: str,
+    args: argparse.Namespace,
+) -> dict | None:
+    """Open a scene pool once; cache only disk-backed memmap handles."""
+    root = str(getattr(args, "mirage_projected_gt_dir", ""))
+    if not root or not mirage_gt_pool_exists(root, seq_name):
+        return None
+    cache = getattr(args, "_mirage_projected_pool_cache", None)
+    if cache is None:
+        cache = {}
+        args._mirage_projected_pool_cache = cache
+    key = (seq_name, root)
+    if key not in cache:
+        cache[key] = open_mirage_gt_pool(root, seq_name)
+        print(f"[projected-gt] opened disk-backed pool {root}/{seq_name}")
+    return cache[key]
+
+
 def load_mirage_projected_gt(
     seq_name: str,
     frame_indices: list[int],
     tensor_hw: tuple[int, int],
     args: argparse.Namespace,
     device: torch.device,
+    image_paths: list[str] | None = None,
+    gt_c2w: np.ndarray | None = None,
 ) -> dict[str, torch.Tensor]:
     """Load the four TUM GT tasks once for projected multi-objective training."""
+    pool = get_mirage_projected_gt_pool(seq_name, args)
+    if pool is not None:
+        # Never cache exact dynamic subsets: almost every tuple is unique and
+        # caching gathered GPU tensors would grow memory throughout training.
+        raw = gather_mirage_gt_pool(
+            pool,
+            frame_indices,
+            tensor_hw,
+            image_names=[Path(path).name for path in image_paths]
+            if image_paths is not None else None,
+            gt_c2w=gt_c2w,
+            min_queries=args.mirage_projected_min_queries,
+        )
+        points = torch.from_numpy(raw["point_map"]).to(device=device)
+        valid = torch.from_numpy(raw["point_valid"]).to(device=device)
+        points = points.clone()
+        points[~valid] = float("nan")
+        return {
+            "depth": torch.from_numpy(raw["depth"]).to(device=device),
+            "point_map": points,
+            "point_valid": valid,
+            "query_points": torch.from_numpy(raw["query_points"]).to(device=device),
+            "tracks": torch.from_numpy(raw["tracks"]).to(device=device),
+            "track_visible": torch.from_numpy(raw["track_visible"]).to(device=device),
+            "track_known": torch.from_numpy(raw["track_known"]).to(device=device),
+        }
+
     cache = getattr(args, "_mirage_projected_gt_cache", None)
     if cache is None:
         cache = {}
@@ -3709,7 +4011,7 @@ def mirage_projected_track_score(
     visible: torch.Tensor,
     known: torch.Tensor,
     cap_px: float,
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     """Capped reprojection-GT EPE so a few outliers cannot carry the objective."""
     if pred.ndim == 4:
         pred = pred[0]
@@ -3717,7 +4019,11 @@ def mirage_projected_track_score(
     distance = (pred[1:] - target[1:]).float().pow(2).sum(-1).clamp_min(1e-12).sqrt()
     values = distance[keep]
     if values.numel() == 0:
-        raise RuntimeError("No visible reprojection-GT tracks for mirage_projected")
+        # Dynamic frame sampling can occasionally draw a valid pose/depth/point
+        # batch with no visible reprojection-GT track.  That batch carries no
+        # information about the tracking objective, so omit only this task from
+        # the max-min solve instead of aborting the whole training run.
+        return None
     cap = max(float(cap_px), 1e-6)
     return cap * torch.tanh(values / cap).mean()
 
@@ -3773,14 +4079,32 @@ def mirage_projected_task_scores(
         args.mirage_projected_track_cap_px,
     )
     if split_pose:
-        return {
+        scores = {
             "pose_trans": pose_trans,
             "pose_rot": pose_rot,
             "depth": depth,
             "point": point,
-            "track": track,
         }
-    return {"pose": pose, "depth": depth, "point": point, "track": track}
+        if track is not None:
+            scores["track"] = track
+    else:
+        scores = {"pose": pose, "depth": depth, "point": point}
+        if track is not None:
+            scores["track"] = track
+    wanted = [t.strip() for t in
+              getattr(args, "mirage_projected_tasks", "").split(",") if t.strip()]
+    if wanted:
+        supported = ({"pose_trans", "pose_rot", "depth", "point", "track"}
+                     if split_pose else {"pose", "depth", "point", "track"})
+        unknown = [t for t in wanted if t not in supported]
+        if unknown:
+            raise ValueError(f"未知任务 {unknown}，可选 {sorted(supported)}")
+        scores = {k: scores[k] for k in wanted if k in scores}
+        if not scores:
+            raise RuntimeError(
+                "None of the requested mirage_projected tasks has valid GT in this batch"
+            )
+    return scores
 
 
 def maximin_gradient_weights(unit_gradients: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
@@ -3852,6 +4176,7 @@ def mirage_projected_texture_gradient(
 
     terms = {f"projected_{name}_score": float(scores[name].detach().cpu())
              for name in names}
+    terms["projected_track_available"] = float("track" in scores)
     for index, name in enumerate(names):
         terms[f"projected_{name}_grad_norm"] = float(norms[index].cpu())
         terms[f"projected_{name}_weight"] = float(weights_np[index])
@@ -3860,12 +4185,16 @@ def mirage_projected_texture_gradient(
     terms["projected_direction_scale"] = float(direction_scale.detach().cpu())
     if "pose" in scores:
         terms["pose_loss"] = terms["projected_pose_score"]
-    else:
+    elif "pose_trans" in scores and "pose_rot" in scores:
         # Logging only; the split-pose search direction never differentiates this
         # sum and therefore has no hidden rotation-vs-translation coefficient.
         terms["pose_loss"] = (
             terms["projected_pose_trans_score"] + terms["projected_pose_rot_score"]
         )
+    else:
+        # a task subset without any pose term still needs a headline number
+        terms["pose_loss"] = float(np.mean(
+            [terms[f"projected_{k}_score"] for k in scores]))
     return direction, terms
 
 
@@ -3910,6 +4239,34 @@ def attack_objective_loss(
         terms["piecewise_gauge_magnitude"] = args.piecewise_gauge_magnitude
         return loss, terms, False
 
+    if args.attack_loss in DEPTH_BASELINE_LOSSES:
+        depth = dense_scalar_head(forward_depth_only(model, adv_images, dtype)).float()
+        patch_mask = projected_adaptive_mask(item["grids"], item["masks"], args)
+        focus_mask = item.get("baseline_focus_masks")
+        if focus_mask is None:
+            focus_mask = rectangular_focus_mask(
+                patch_mask.detach(), scale=args.baseline_focus_scale
+            )
+        if args.attack_loss == "baseline_spoo_depth":
+            loss, terms = spoo_depth_loss(depth, focus_mask, args.baseline_depth_eps)
+        elif args.attack_loss in ("baseline_aparate_depth", APARATE_SHAPE_EXTENSION):
+            loss, terms = aparate_depth_loss(
+                depth,
+                patch_mask,
+                focus_mask,
+                args.baseline_depth_eps,
+                args.baseline_aparate_outside_weight,
+            )
+        else:
+            # The original method textures the whole 3-D vehicle.  Under the common
+            # planar threat model, the physically occupied patch is the textured
+            # surface; the metadata labels this explicitly as an adaptation.
+            loss, terms = fool3d_depth_loss(
+                depth, patch_mask, args.baseline_depth_eps
+            )
+        terms["baseline_adaptation"] = args.attack_loss
+        return loss, terms, False
+
     preds = forward_camera_pose_only(
         model,
         adv_images,
@@ -3917,6 +4274,16 @@ def attack_objective_loss(
         args.activation_checkpoint,
     )
     pred_rel = pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
+
+    if args.attack_loss == "baseline_vo_rms":
+        loss, terms = vo_rms_loss(pred_rel, item["pose_gt_rel"])
+        terms["pose_reference"] = "gt"
+        return loss, terms, True
+
+    if args.attack_loss == "baseline_vo_mprms":
+        loss, terms = vo_mprms_loss(pred_rel, item["pose_gt_rel"])
+        terms["pose_reference"] = "gt"
+        return loss, terms, True
 
     if args.attack_loss == "pose_gt_untargeted":
         target_rel = item["pose_gt_rel"]
@@ -4089,6 +4456,28 @@ def load_tum_sequence(
         args._active_vggt_point_valid_grid = old_vggt_point_valid_grid
         args._active_vggt_geometry_source = old_vggt_source
         args._intrinsics_in_tensor_space = old_tensor_intrinsics
+    baseline_focus_masks = None
+    baseline_focus_geometry = None
+    if getattr(args, "baseline_focus_quad_world", None):
+        values = [float(value) for value in str(args.baseline_focus_quad_world).split(",")]
+        if len(values) != 12:
+            raise ValueError("--baseline_focus_quad_world needs 12 numbers (4 corners x xyz)")
+        focus_quad = np.asarray(values, dtype=np.float64).reshape(4, 3)
+        old_depth_maps = getattr(args, "_active_depth_maps", None)
+        args._active_depth_maps = depth_maps
+        try:
+            _, focus_masks_np, baseline_focus_geometry = build_geometry_arrays_for_plane(
+                focus_quad,
+                c2w,
+                image_paths,
+                tensor_hw,
+                texture_size,
+                local_intrinsics,
+                args,
+            )
+        finally:
+            args._active_depth_maps = old_depth_maps
+        baseline_focus_masks = torch.from_numpy(focus_masks_np).to(device)
     joint_track_targets = None
     needs_strict_track = (args.attack_loss in ("geometry_joint_gauge_targeted",
                                               "mirage_coupled", "mirage_floor")
@@ -4101,7 +4490,15 @@ def load_tum_sequence(
         joint_track_targets = clean_track_targets(
             seq_dir.name, images, tensor_hw, model, dtype, args)
     mirage_projected_gt = (
-        load_mirage_projected_gt(seq_dir.name, frame_indices, tensor_hw, args, device)
+        load_mirage_projected_gt(
+            seq_dir.name,
+            frame_indices,
+            tensor_hw,
+            args,
+            device,
+            image_paths=image_paths,
+            gt_c2w=gt_c2w,
+        )
         if args.attack_loss in ("mirage_projected", "mirage_projected_split_pose") else None
     )
     return {
@@ -4130,6 +4527,8 @@ def load_tum_sequence(
         "grids": grids,
         "masks": masks,
         "geometry": geom_meta,
+        "baseline_focus_masks": baseline_focus_masks,
+        "baseline_focus_geometry": baseline_focus_geometry,
         "tensor_hw": tensor_hw,
         "clean_features": clean_features,
     }
@@ -4144,14 +4543,181 @@ def assert_texture_only_optimizer(optimizer: torch.optim.Optimizer | None,
                                   texture: torch.Tensor,
                                   model: torch.nn.Module) -> None:
     """Make the threat model executable: victim weights must never be optimised."""
+    assert_patch_only_optimizer(optimizer, [texture], model)
+
+
+def assert_patch_only_optimizer(
+    optimizer: torch.optim.Optimizer | None,
+    patch_parameters: list[torch.Tensor],
+    model: torch.nn.Module,
+) -> None:
+    """Allow texture/mask variables while excluding every victim-model weight."""
     if optimizer is None:
         return
     optimised = {id(param) for group in optimizer.param_groups for param in group["params"]}
     model_params = {id(param) for param in model.parameters()}
-    if optimised != {id(texture)}:
-        raise RuntimeError("Adversarial-patch optimiser must contain only the texture tensor")
+    expected = {id(parameter) for parameter in patch_parameters}
+    if optimised != expected:
+        raise RuntimeError("Adversarial-patch optimiser contains an undeclared parameter")
     if optimised & model_params:
         raise RuntimeError("Victim-model parameter leaked into the patch optimiser")
+
+
+def assert_patch_only_optimizers(
+    optimizers: list[torch.optim.Optimizer | None],
+    patch_parameters: list[torch.Tensor],
+    model: torch.nn.Module,
+) -> None:
+    active = [optimizer for optimizer in optimizers if optimizer is not None]
+    if not active:
+        return
+    optimised = {
+        id(parameter)
+        for optimizer in active
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    expected = {id(parameter) for parameter in patch_parameters}
+    model_params = {id(parameter) for parameter in model.parameters()}
+    if optimised != expected:
+        raise RuntimeError("Paper-baseline optimisers do not own exactly the declared patch variables")
+    if optimised & model_params:
+        raise RuntimeError("Victim-model parameter leaked into a paper-baseline optimiser")
+
+
+def build_patch_optimizer(
+    args: argparse.Namespace,
+    patch_parameters: list[torch.Tensor],
+) -> torch.optim.Optimizer:
+    """Select the source method's optimiser instead of silently using AdamW."""
+    if args.attack_loss == "baseline_spoo_depth":
+        # With max_iter=1, one expensive VGGT forward/backward is one L-BFGS
+        # update. The caller supplies its already accumulated gradient through
+        # the closure, while Adam updates the four region borders separately.
+        return torch.optim.LBFGS(
+            [patch_parameters[0]],
+            lr=args.patch_lr,
+            max_iter=1,
+            history_size=args.baseline_spoo_lbfgs_history,
+            line_search_fn=None,
+        )
+    if args.attack_loss in VO_BASELINE_LOSSES:
+        # Used for parameter ownership and zero_grad; the actual paper-faithful
+        # sign update is performed by pgd_sign_step below.
+        return torch.optim.SGD(patch_parameters, lr=args.patch_lr)
+    if args.attack_loss in DEPTH_BASELINE_LOSSES:
+        return torch.optim.Adam(patch_parameters, lr=args.patch_lr)
+    return torch.optim.AdamW(patch_parameters, lr=args.patch_lr)
+
+
+def patch_optimizer_name(args: argparse.Namespace) -> str:
+    if args.attack_loss in VO_BASELINE_LOSSES:
+        return "PGD-sign"
+    if args.attack_loss == "baseline_spoo_depth":
+        return "L-BFGS texture + Adam borders (largest-gradient edge only)"
+    if args.attack_loss in DEPTH_BASELINE_LOSSES:
+        return "Adam"
+    return "AdamW"
+
+
+def paper_baseline_fidelity(args: argparse.Namespace) -> dict | None:
+    """Machine-readable boundary between source logic and VGGT adaptation."""
+    shared_adaptations = [
+        "source victim replaced by frozen VGGT",
+        "source image/object compositor replaced by the shared TUM 3-D planar renderer",
+        "source output is evaluated with the shared four-task VGGT protocol",
+    ]
+    if args.attack_loss == "baseline_spoo_depth":
+        return {
+            "paper": "Physical Attack on Monocular Depth Estimation with Optimal Adversarial Patches",
+            "official_code": "https://github.com/Bob-cheng/MDE_Attack",
+            "official_logic": [
+                "Warnning.png content/style initializer and source seed 17",
+                "ImageNet VGG19 conv4_2 content and conv1_1..conv5_1 style losses",
+                "source TV and closed-form-matting realism losses",
+                "L-BFGS texture, late-start Adam border, largest-gradient edge only",
+                "quadratic target-area schedule and adaptive mask weight",
+                "polynomial LR decay to half LR over the first half",
+            ],
+            "vgtt_adaptations": shared_adaptations + [
+                "monocular disparity replaced by reciprocal VGGT metric depth",
+                "10000 source closures represented by a locked 1000-update comparison budget",
+                "source one-pixel/20-closure mask controller compressed to 10 pixels/2 updates",
+                "L-BFGS max_iter=1 so one costly VGGT backward equals one reported update",
+                "first-stage best-search threshold scaled from 1000/10000 to 10% of the common budget",
+            ],
+            "source_native_budget": "10000 closure calls",
+        }
+    if args.attack_loss in ("baseline_aparate_depth", APARATE_SHAPE_EXTENSION):
+        return {
+            "paper": "APARATE: Adaptive Adversarial Patch for CNN-based Monocular Depth Estimation",
+            "official_code": None,
+            "official_logic": [
+                "paper Eq. 7-10 inside-L2 plus outside-L1 depth loss using sums",
+                "paper Eq. 12-13 TV and NPS using sums",
+                "random RGB initializer, Adam 0.01 and reported colour/projective transformations",
+            ],
+            "vgtt_adaptations": shared_adaptations + [
+                "zero reciprocal depth defines the paper's far/disappearance target for metric depth",
+                "TUM object mask replaced by the frozen carrier/focus quad",
+                "paper does not publish a numeric target depth; zero reciprocal depth is an explicit VGGT choice",
+                "paper states random scaling but no range; the formal profile records a chosen +/-3% range",
+                "printer gamut uses the documented fixed RGB palette because no measured printer palette was released",
+            ],
+            "source_native_budget": "4000 epochs",
+        }
+    if args.attack_loss == "baseline_3d2fool_depth":
+        return {
+            "paper": "Physical 3D Adversarial Attacks against Monocular Depth Estimation in Autonomous Driving",
+            "official_code": "https://github.com/Gandolfczjh/3D2Fool",
+            "official_logic": [
+                "official factor-10 vanishing objective, squared-sum smoothness and ten-colour NPS",
+                "random 128x128 coarse texture and Adam 0.01",
+                "independent per-tile horizontal/vertical flips and optional 90-degree rotation",
+                "nearest 8x expansion, tau=6 tiling and a random 4096-from-6144 crop",
+            ],
+            "vgtt_adaptations": shared_adaptations + [
+                "monocular disparity replaced by reciprocal VGGT metric depth",
+                "whole 3-D vehicle texture replaced by the selected complete planar surface",
+                "CARLA map/weather labels are unavailable in TUM, so their label-conditioned weather branch is disabled",
+            ],
+            "source_native_budget": "15 epochs over the released CARLA loader",
+        }
+    if args.attack_loss in VO_BASELINE_LOSSES:
+        return {
+            "paper": "Physical Passive Patch Adversarial Attacks on Visual Odometry Systems",
+            "official_code": "https://github.com/patchadversarialattacks/patchadversarialattacks",
+            "official_logic": [
+                "paper Algorithms 1-2 Uniform(0,1) initializer, 9x9 pre-warp box blur and Linf PGD sign update",
+                "RMS/MPRMS trajectory criterion and best-scoring patch retention",
+            ],
+            "vgtt_adaptations": shared_adaptations + [
+                "pairwise VO output replaced by VGGT camera-to-world trajectory",
+                "source albedo modulation replaced by a directly printable RGB planar patch",
+                "the paper's coefficient P is mapped directly to RGB because TUM has no rendered black/white albedo bracket images I0/I1",
+                "MPRMS is divided by its positive gap count; PGD sign direction is unchanged",
+            ],
+            "source_native_budget": "configuration-dependent PGD iterations",
+        }
+    return None
+
+
+def initialize_adaptive_mask_logits(
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    requires_grad: bool,
+) -> torch.Tensor:
+    """Deployable low-resolution mask, initialised as one centred solid region."""
+    resolution = max(4, int(args.baseline_mask_resolution))
+    fraction = float(np.clip(args.baseline_mask_area_fraction, 1e-3, 1.0))
+    side = max(1, min(resolution, int(round(resolution * math.sqrt(fraction)))))
+    y0 = (resolution - side) // 2
+    x0 = (resolution - side) // 2
+    logits = torch.full((1, 1, resolution, resolution), -4.0, device=device)
+    logits[..., y0:y0 + side, x0:x0 + side] = 4.0
+    logits.requires_grad_(requires_grad)
+    return logits
 
 
 def initialize_texture(
@@ -4164,7 +4730,12 @@ def initialize_texture(
     init = init or args.texture_init
     shape = (1, 3, args.texture_size, args.texture_size)
     if init == "random":
-        texture = torch.rand(shape, device=device, dtype=torch.float32)
+        texture = paper_random_texture(
+            args.attack_loss,
+            args.texture_size,
+            args.texture_size,
+            device=device,
+        )
     elif init == "gray":
         texture = torch.full(shape, 0.5, device=device, dtype=torch.float32)
     elif init == "white":
@@ -4182,17 +4753,38 @@ def initialize_texture(
     elif init == "image":
         if not args.texture_init_image:
             raise ValueError("--texture_init image requires --texture_init_image")
-        texture = load_texture_image(args.texture_init_image, args.texture_size, device)
+        texture = load_texture_image(
+            args.texture_init_image,
+            args.texture_size,
+            device,
+            preserve_aspect=args.texture_init_preserve_aspect,
+        )
     else:
         raise ValueError(f"Unknown texture_init: {init}")
     texture = texture.clamp(args.print_min, args.print_max)
+    args._texture_hw = (int(texture.shape[-2]), int(texture.shape[-1]))
     texture.requires_grad_(requires_grad)
     return texture
 
 
-def load_texture_image(image_path: str | Path, texture_size: int, device: torch.device) -> torch.Tensor:
+def load_texture_image(
+    image_path: str | Path,
+    texture_size: int | tuple[int, int],
+    device: torch.device,
+    *,
+    preserve_aspect: bool = False,
+) -> torch.Tensor:
     with Image.open(image_path) as image:
-        image = image.convert("RGB").resize((texture_size, texture_size), Image.Resampling.BICUBIC)
+        image = image.convert("RGB")
+        if isinstance(texture_size, tuple):
+            target_height, target_width = (int(value) for value in texture_size)
+        elif preserve_aspect:
+            scale = float(texture_size) / max(image.width, image.height)
+            target_width = max(1, int(round(image.width * scale)))
+            target_height = max(1, int(round(image.height * scale)))
+        else:
+            target_height = target_width = int(texture_size)
+        image = image.resize((target_width, target_height), Image.Resampling.BICUBIC)
     array = np.asarray(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
     return tensor.clamp(0.0, 1.0)
@@ -4208,7 +4800,7 @@ def natural_reference_texture(args: argparse.Namespace, device: torch.device) ->
     cached_path = getattr(args, "_natural_reference_texture_path", None)
     if cached is not None and cached_path == str(path):
         return cached
-    reference = load_texture_image(path, args.texture_size, device).detach()
+    reference = load_texture_image(path, texture_hw(args), device).detach()
     args._natural_reference_texture = reference
     args._natural_reference_texture_path = str(path)
     return reference
@@ -4257,13 +4849,286 @@ def patch_regularization_terms(texture: torch.Tensor, args: argparse.Namespace) 
         + args.printability_weight * printable
         + args.natural_reference_weight * natural_reference
     )
-    return {
+    paper_tv = texture.new_zeros(())
+    paper_nps = texture.new_zeros(())
+    paper_style = texture.new_zeros(())
+    paper_content = texture.new_zeros(())
+    paper_realism = texture.new_zeros(())
+    spoo_mask_loss = texture.new_zeros(())
+    spoo_area_fraction = texture.new_ones(())
+    adaptive_total = texture.new_zeros(())
+    adaptive_terms: dict[str, torch.Tensor] = {}
+    if args.attack_loss == "baseline_spoo_depth":
+        paper_tv = spoo_source_tv_loss(texture)
+        naturalness = getattr(args, "_spoo_naturalness", None)
+        if naturalness is not None:
+            paper_style, paper_content = naturalness(texture)
+        if getattr(args, "_spoo_second_stage", False):
+            laplacian = getattr(args, "_spoo_laplacian", None)
+            if laplacian is not None:
+                paper_realism = spoo_realism_loss(texture, laplacian)
+        total = total + args.baseline_spoo_style_weight * paper_style
+        total = total + args.baseline_spoo_content_weight * paper_content
+        total = total + args.baseline_spoo_tv_weight * paper_tv
+        total = total + args.baseline_spoo_realism_weight * paper_realism
+        borders = getattr(args, "_spoo_borders", None)
+        if borders is not None:
+            spoo_mask_loss = spoo_mask_size_loss(
+                borders, texture_hw(args, texture)
+            )
+            spoo_area_fraction = spoo_soft_rectangle(
+                borders, texture_hw(args, texture), args.baseline_spoo_mask_sharpness
+            ).mean()
+            if getattr(args, "_spoo_mask_active", False) and not getattr(
+                    args, "_spoo_region_frozen", False):
+                total = total + getattr(
+                    args, "_spoo_mask_weight", args.baseline_spoo_mask_weight
+                ) * spoo_mask_loss
+    elif args.attack_loss in ("baseline_aparate_depth", APARATE_SHAPE_EXTENSION):
+        paper_tv = isotropic_total_variation(texture, reduction="sum")
+        paper_nps = non_printability_score(texture, reduction="sum")
+        total = total + args.baseline_aparate_tv_weight * paper_tv
+        total = total + args.baseline_aparate_nps_weight * paper_nps
+        mask_logits = getattr(args, "_adaptive_mask_logits", None)
+        if mask_logits is not None:
+            adaptive_total, adaptive_terms = adaptive_mask_regularization(
+                mask_logits,
+                args.baseline_mask_area_fraction,
+                args.baseline_mask_area_weight,
+                args.baseline_mask_binary_weight,
+                args.baseline_mask_tv_weight,
+                args.baseline_mask_temperature,
+            )
+            total = total + adaptive_total
+    elif args.attack_loss == "baseline_3d2fool_depth":
+        paper_tv = fool3d_smoothness_loss(texture)
+        paper_nps = fool3d_non_printability_score(texture)
+        total = total + args.baseline_3d2fool_tv_weight * paper_tv
+        total = total + args.baseline_3d2fool_nps_weight * paper_nps
+    terms = {
         "regularization_total": total,
         "tv": tv,
         "low_frequency": low_freq,
         "printability": printable,
         "natural_reference": natural_reference,
+        "paper_tv": paper_tv,
+        "paper_nps": paper_nps,
+        "paper_style": paper_style,
+        "paper_content": paper_content,
+        "paper_realism": paper_realism,
+        "spoo_mask_size_loss": spoo_mask_loss,
+        "spoo_area_fraction": spoo_area_fraction,
+        "adaptive_mask_regularization": adaptive_total,
     }
+    terms.update(adaptive_terms)
+    return terms
+
+
+def _softmin_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    k = int(2 * round(3 * sigma) + 1)
+    g = torch.arange(k, device=x.device, dtype=x.dtype) - k // 2
+    g = torch.exp(-(g ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    c = x.shape[1]
+    x = torch.nn.functional.conv2d(
+        torch.nn.functional.pad(x, (k // 2,) * 4, mode="reflect"),
+        g.view(1, 1, 1, k).expand(c, 1, 1, k), groups=c)
+    return torch.nn.functional.conv2d(
+        x, g.view(1, 1, k, 1).expand(c, 1, k, 1), groups=c)
+
+
+def apply_softmin_transform(x: torch.Tensor, kind: str,
+                            rng: np.random.Generator) -> torch.Tensor:
+    """Pixel-level transforms the attack has to survive.
+
+    Differentiable throughout, so gradients still reach the texture. Drawn from a
+    range rather than fixed, so the patch cannot latch onto one exact resampling.
+    """
+    if kind == "identity":
+        return x
+    if kind == "blur":
+        return _softmin_blur(x, float(rng.uniform(0.5, 1.5)))
+    if kind == "shift":
+        # sub-pixel translation via grid_sample; +-1 px in each axis
+        h, w = x.shape[-2:]
+        dx, dy = (float(rng.uniform(-1.0, 1.0)) for _ in range(2))
+        theta = torch.tensor([[[1.0, 0.0, 2.0 * dx / w],
+                               [0.0, 1.0, 2.0 * dy / h]]],
+                             device=x.device, dtype=x.dtype).expand(x.shape[0], -1, -1)
+        grid = torch.nn.functional.affine_grid(theta, x.shape, align_corners=False)
+        return torch.nn.functional.grid_sample(
+            x, grid, mode="bilinear", padding_mode="reflection", align_corners=False)
+    if kind == "scale":
+        h, w = x.shape[-2:]
+        f = float(rng.uniform(0.97, 1.03))
+        y = torch.nn.functional.interpolate(
+            x, scale_factor=f, mode="bilinear", align_corners=False)
+        nh, nw = y.shape[-2:]
+        if f >= 1.0:
+            t0, t1 = (nh - h) // 2, (nw - w) // 2
+            return y[..., t0:t0 + h, t1:t1 + w]
+        p0, p1 = (h - nh) // 2, (w - nw) // 2
+        return torch.nn.functional.pad(
+            y, (p1, w - nw - p1, p0, h - nh - p0), mode="replicate")
+    raise ValueError(f"未知变换 {kind}")
+
+
+def _audit_umeyama(src: np.ndarray, dst: np.ndarray):
+    ms, md = src.mean(0), dst.mean(0)
+    s0, d0 = src - ms, dst - md
+    U, D, Vt = np.linalg.svd(d0.T @ s0 / len(src))
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1
+    R = U @ S @ Vt
+    var = (s0 ** 2).sum() / len(src)
+    sc = float(np.trace(np.diag(D) @ S) / var) if var > 0 else 1.0
+    return sc, R, md - sc * R @ ms
+
+
+def run_fixed_audit(model, texture, args, device, dtype, intrinsics, update_idx):
+    """ATE/ceiling on a fixed set of frame sets, so progress is comparable step to step."""
+    import json as _json
+
+    entries = getattr(args, "_audit_entries", None)
+    if entries is None:
+        entries = _json.loads(Path(args.audit_plan).read_text(encoding="utf-8"))
+        for e in entries:
+            e["_frames"] = load_frame_manifest(e["manifest"])
+        args._audit_entries = entries
+        args._audit_clean = {}
+
+    saved = (args.clean_vggt_output_root, args.mirage_projected_gt_dir,
+             args.attack_loss)
+    # the audit measures pose only; a pose loss keeps load_tum_sequence from
+    # pulling in projected GT / gauge targets / clean tracks it will not use
+    args.attack_loss = "pose_aligned_residual_mse"
+    out = []
+    for e in entries:
+        scene = Path(e["scene"]) if e.get("scene") else Path(args.tum_root) / e["base_scene"]
+        frames = e["_frames"][scene.name]
+        args.clean_vggt_output_root = e.get("clean_root", saved[0])
+        args.mirage_projected_gt_dir = ""
+        item = load_tum_sequence(scene, frames, args.gt_name, intrinsics,
+                                 args.texture_size, args, device, model=model,
+                                 dtype=dtype)
+        q = tum_rows_to_c2w(read_tum_rows(scene / args.gt_name), frames)[:, :3, 3]
+        ceiling = float(np.sqrt(((q - q.mean(0)) ** 2).sum(1).mean()))
+
+        def _ate(images):
+            with torch.no_grad():
+                preds = forward_camera_pose_only(model, images, dtype, False)
+                extr, _ = pose_encoding_to_extri_intri(preds["pose_enc"],
+                                                       item["tensor_hw"])
+            p = extrinsics_to_c2w(extr[0].float().cpu().numpy())[:, :3, 3]
+            sc, R, tr = _audit_umeyama(p, q)
+            rms = float(np.sqrt((((sc * (R @ p.T).T) + tr - q) ** 2).sum(1).mean()))
+            return rms / ceiling
+
+        # clean does not depend on the texture, so it is measured once per entry
+        if e["name"] not in args._audit_clean:
+            args._audit_clean[e["name"]] = _ate(item["images"])
+        clean = args._audit_clean[e["name"]]
+        with torch.no_grad():
+            adv = apply_geometry_patch(item["images"], texture, item["grids"],
+                                       item["masks"], args, training=False)
+        out.append((e["name"], clean, _ate(adv)))
+        del item
+    (args.clean_vggt_output_root, args.mirage_projected_gt_dir,
+     args.attack_loss) = saved
+    torch.cuda.empty_cache()
+    print("[audit] update {:06d}  ".format(update_idx)
+          + "  ".join(f"{n}: clean {c * 100:.2f}% -> {a * 100:.2f}% "
+                      f"(净增益 {(a - c) * 100:+.2f}%)" for n, c, a in out),
+          flush=True)
+    return out
+
+
+def dynamic_pool_for_scene(args: argparse.Namespace, scene_name: str) -> list[int]:
+    """Resolve either the legacy shared pool or a per-scene pool JSON."""
+    pool_json = str(getattr(args, "dynamic_frame_pool_json", "")).strip()
+    if pool_json:
+        pools = getattr(args, "_dynamic_pools_by_scene", None)
+        if pools is None:
+            raw = json.loads(Path(pool_json).read_text(encoding="utf-8"))
+            pools = {}
+            for scene, value in raw.items():
+                indices = value.get("frame_indices") if isinstance(value, dict) else value
+                if indices is None:
+                    raise ValueError(f"No frame_indices found for {scene} in {pool_json}")
+                pool = [int(index) for index in indices]
+                if len(pool) != len(set(pool)):
+                    raise ValueError(f"Dynamic pool for {scene} contains duplicates")
+                pools[str(scene)] = pool
+            args._dynamic_pools_by_scene = pools
+        if scene_name not in pools:
+            raise KeyError(f"No dynamic frame pool for {scene_name} in {pool_json}")
+        return pools[scene_name]
+
+    pool = getattr(args, "_dynamic_pool", None)
+    if pool is None:
+        pool = [int(v) for v in args.dynamic_frame_pool.split(",") if v.strip()]
+        args._dynamic_pool = pool
+    return pool
+
+
+def draw_dynamic_subsets(args: argparse.Namespace, rng: np.random.Generator,
+                         scene_name: str) -> list[dict]:
+    """Fresh frame sets for one update, drawn without replacement from the pool.
+
+    Named by their frame tuple rather than by an index, so the soft-min clean baseline
+    cache keys on the frames themselves and a set that does recur is not measured twice.
+    """
+    pool = dynamic_pool_for_scene(args, scene_name)
+    if len(pool) < args.dynamic_frames_per_set:
+        raise ValueError(f"{scene_name} 帧池只有 {len(pool)} 帧，不够抽 "
+                         f"{args.dynamic_frames_per_set} 帧")
+    reported = getattr(args, "_dynamic_pool_reported_scenes", set())
+    if scene_name not in reported:
+        print(f"[dynamic] {scene_name}: 帧池 {len(pool)} 帧，每步抽 "
+              f"{args.dynamic_sets_per_step} 组 x "
+              f"{args.dynamic_frames_per_set} 帧")
+        reported.add(scene_name)
+        args._dynamic_pool_reported_scenes = reported
+    gt_pool = None
+    if args.attack_loss in ("mirage_projected", "mirage_projected_split_pose"):
+        gt_pool = get_mirage_projected_gt_pool(scene_name, args)
+        query_reported = getattr(args, "_dynamic_query_reported_scenes", set())
+        if gt_pool is not None and scene_name not in query_reported:
+            minimum = int(args.mirage_projected_min_queries)
+            counts = [mirage_gt_pool_query_count(gt_pool, frame) for frame in pool]
+            eligible = sum(count >= minimum for count in counts)
+            print(
+                f"[dynamic] GT query >= {minimum}: {eligible}/{len(pool)} frames "
+                f"(min={min(counts)}, max={max(counts)})"
+            )
+            query_reported.add(scene_name)
+            args._dynamic_query_reported_scenes = query_reported
+    picks = []
+    for _ in range(max(1, args.dynamic_sets_per_step)):
+        for attempt in range(1000):
+            frames = sorted(int(v) for v in rng.choice(
+                pool, size=args.dynamic_frames_per_set, replace=False))
+            if gt_pool is None or mirage_gt_pool_query_count(gt_pool, frames[0]) >= int(
+                args.mirage_projected_min_queries
+            ):
+                break
+        else:
+            raise RuntimeError(
+                "Unable to draw a dynamic frame set whose first frame has enough "
+                "valid reprojection-GT queries"
+            )
+        if attempt:
+            args._dynamic_query_rejections = (
+                int(getattr(args, "_dynamic_query_rejections", 0)) + attempt
+            )
+        picks.append({
+            "name": "dyn_" + "_".join(str(f) for f in frames),
+            "frames": {scene_name: frames},
+            "clean_root": args.clean_vggt_output_root,
+            "gt_dir": args.mirage_projected_gt_dir,
+        })
+    return picks
 
 
 def draw_subset_plan_entries(
@@ -4308,25 +5173,101 @@ def train_geometry_patch(
 
     rng = np.random.default_rng(args.seed)
     texture = initialize_texture(args, device, requires_grad=not args.freeze_texture)
-    optimizer = None if args.freeze_texture else torch.optim.AdamW([texture], lr=args.patch_lr)
-    assert_texture_only_optimizer(optimizer, texture, model)
+    patch_parameters = [texture]
+    auxiliary_optimizer = None
+    if args.attack_loss == "baseline_spoo_depth":
+        args._spoo_naturalness = None
+        args._spoo_laplacian = None
+        if args.baseline_spoo_naturalness:
+            args._spoo_naturalness = SpooVgg19Naturalness(
+                texture.detach(), weights_path=args.baseline_spoo_vgg19_weights
+            ).to(device).eval()
+            args._spoo_laplacian = spoo_matting_laplacian(texture.detach())
+        args._spoo_borders = spoo_initial_borders(
+            texture_hw(args, texture)
+        ).to(device=device, dtype=torch.float32)
+        args._spoo_borders.requires_grad_(not args.freeze_texture)
+        args._spoo_region_frozen = False
+        args._spoo_mask_active = False
+        args._spoo_second_stage = False
+        args._spoo_mask_weight = float(args.baseline_spoo_mask_weight)
+        args._spoo_mask_update = 0
+        args._spoo_initial_area = float(spoo_soft_rectangle(
+            args._spoo_borders.detach(), texture_hw(args, texture),
+            args.baseline_spoo_mask_sharpness,
+        ).mean().cpu())
+        args._spoo_best_first_stage = None
+        args._spoo_best_first_stage_objective = float("inf")
+        patch_parameters.append(args._spoo_borders)
+        if not args.freeze_texture:
+            auxiliary_optimizer = torch.optim.Adam(
+                [args._spoo_borders], lr=args.baseline_spoo_border_lr,
+                betas=(0.5, 0.9),
+            )
+    elif args.attack_loss == APARATE_SHAPE_EXTENSION:
+        args._adaptive_mask_logits = initialize_adaptive_mask_logits(
+            args, device, requires_grad=not args.freeze_texture
+        )
+        patch_parameters.append(args._adaptive_mask_logits)
+    optimizer = None if args.freeze_texture else build_patch_optimizer(args, patch_parameters)
+    assert_patch_only_optimizers(
+        [optimizer, auxiliary_optimizer], patch_parameters, model
+    )
 
     patch_dir = output_dir / "geometry_patch"
     patch_dir.mkdir(parents=True, exist_ok=True)
     initial_texture_npz = patch_dir / "initial_texture.npz"
     np.savez_compressed(initial_texture_npz, texture=texture.detach().float().cpu().numpy())
-    to_pil_image(texture.squeeze(0).detach().float().cpu().clamp(0, 1)).save(
-        patch_dir / "initial_texture.png"
-    )
+    initial_base = paper_base_texture_preview(texture, args)
+    initial_base_image = to_pil_image(initial_base)
+    initial_base_image.save(patch_dir / "initial_texture.png")
+    initial_base_image.save(patch_dir / "initial_patch.png")
+    initial_deployed = prepare_texture_for_render(
+        texture.detach(), args, training=False, n_frames=1
+    )[0].float().cpu().clamp(0, 1)
+    initial_deployed_image = to_pil_image(initial_deployed)
+    initial_deployed_image.save(patch_dir / "initial_deployed_patch.png")
     history_path = patch_dir / "training_history.jsonl"
     if history_path.exists():
         history_path.unlink()
+    if args.attack_loss == "baseline_spoo_depth":
+        initial_alpha = spoo_soft_rectangle(
+            args._spoo_borders.detach(),
+            texture_hw(args, texture),
+            args.baseline_spoo_mask_sharpness,
+        )
+        np.savez_compressed(
+            patch_dir / "initial_adaptive_mask.npz",
+            adaptive_mask=initial_alpha.float().cpu().numpy(),
+        )
+    elif args.attack_loss == APARATE_SHAPE_EXTENSION:
+        initial_alpha = adaptive_alpha(
+            args._adaptive_mask_logits.detach(), args.baseline_mask_temperature,
+            texture_hw(args, texture),
+        )
+        np.savez_compressed(
+            patch_dir / "initial_adaptive_mask.npz",
+            adaptive_mask=initial_alpha.float().cpu().numpy(),
+        )
+        to_pil_image(initial_alpha.squeeze(0).float().cpu()).save(
+            patch_dir / "initial_adaptive_mask.png"
+        )
 
     total_updates = args.iterations * args.inner_loop
     warmup_updates = args.warmup_iterations * args.inner_loop
+    spoo_stage_two_start = max(
+        1, int(round(total_updates * args.baseline_spoo_late_start_fraction))
+    )
+    spoo_best_start = max(
+        0, int(round(total_updates * args.baseline_spoo_best_start_fraction))
+    )
     update_idx = 0
     started = time.time()
     last_loss = None
+    vo_best_texture = texture.detach().clone() if args.attack_loss in VO_BASELINE_LOSSES else None
+    vo_best_score = -float("inf")
+    vo_best_update = 0
+    last_training_batch = None
 
     if args.freeze_texture:
         last_loss = 0.0
@@ -4348,10 +5289,7 @@ def train_geometry_patch(
         for iteration in range(args.iterations):
             if args.freeze_texture:
                 break
-            args._eot_strength = (
-                scheduled_eot_strength(update_idx, total_updates, args.eot_warmup_fraction)
-                if args.physical_eot else 0.0
-            )
+            args._eot_strength = current_eot_strength(args, update_idx, total_updates)
             scene_indices = rng.choice(
                 len(scene_dirs),
                 size=min(args.scenes_per_iteration, len(scene_dirs)),
@@ -4373,25 +5311,31 @@ def train_geometry_patch(
                         print(f"[subset] 训练池 {len(subset_plan)} 个十帧子集，"
                               f"每步随机抽一个")
                     args._subset_plan = subset_plan
-                if subset_plan:
-                    # without replacement in rounds, so no subset is over- or
-                    # under-sampled within a pass over the pool
-                    queue = getattr(args, "_subset_queue", [])
-                    picks, queue = draw_subset_plan_entries(
-                        subset_plan,
-                        queue,
-                        args.subset_accum,
-                        rng,
-                    )
-                    args._subset_queue = queue
+                if subset_plan or args.dynamic_frame_pool or args.dynamic_frame_pool_json:
+                    if args.dynamic_frame_pool or args.dynamic_frame_pool_json:
+                        picks = draw_dynamic_subsets(args, rng, seq_dir.name)
+                    else:
+                        # without replacement in rounds, so no subset is over-
+                        # or under-sampled within a pass over the pool
+                        queue = getattr(args, "_subset_queue", [])
+                        picks, queue = draw_subset_plan_entries(
+                            subset_plan,
+                            queue,
+                            args.subset_accum,
+                            rng,
+                        )
+                        args._subset_queue = queue
                     for sub in picks:
                         # images, clean outputs and GT all move together
                         args.clean_vggt_output_root = sub["clean_root"]
                         args.mirage_projected_gt_dir = sub["gt_dir"]
                         args._active_subset = sub["name"]
+                        # subsets drawn from a different time window live in
+                        # their own prepared scene dir
+                        _seq = Path(sub["scene"]) if sub.get("scene") else seq_dir
                         _it = load_tum_sequence(
-                            seq_dir,
-                            sub["frames"][seq_dir.name],
+                            _seq,
+                            sub["frames"][_seq.name],
                             args.gt_name,
                             intrinsics,
                             args.texture_size,
@@ -4424,18 +5368,58 @@ def train_geometry_patch(
 
             for inner_step in range(args.inner_loop):
                 assert optimizer is not None
+                if (args.attack_loss == "baseline_spoo_depth"
+                        and not args._spoo_second_stage
+                        and update_idx >= spoo_stage_two_start):
+                    if args._spoo_best_first_stage is not None:
+                        with torch.no_grad():
+                            texture.copy_(args._spoo_best_first_stage)
+                    args._spoo_second_stage = True
+                    args._spoo_mask_active = not args._spoo_region_frozen
+                if (args.attack_loss == "baseline_spoo_depth"
+                        and args._spoo_mask_active
+                        and not args._spoo_region_frozen):
+                    args._spoo_mask_update += 1
+                    soft_area = float(spoo_soft_rectangle(
+                        args._spoo_borders.detach(), texture_hw(args, texture),
+                        args.baseline_spoo_mask_sharpness,
+                    ).mean().cpu())
+                    mask_total = max(total_updates - spoo_stage_two_start, 1)
+                    args._spoo_target_area = spoo_target_area_schedule(
+                        args._spoo_mask_update,
+                        mask_total,
+                        args._spoo_initial_area,
+                        args.baseline_spoo_target_area_fraction,
+                        args.baseline_spoo_mask_schedule_fraction,
+                    )
+                    args._spoo_mask_weight = spoo_updated_mask_weight(
+                        args._spoo_mask_weight,
+                        soft_area,
+                        args._spoo_target_area,
+                        args._spoo_mask_update,
+                        interval=args.baseline_spoo_mask_update_interval,
+                        upscaler=args.baseline_spoo_mask_upscaler,
+                        downscaler=args.baseline_spoo_mask_downscaler,
+                    )
                 optimizer.zero_grad(set_to_none=True)
-                current_lr = scheduled_lr(
-                    args.patch_lr,
-                    update_idx,
-                    total_updates,
-                    warmup_updates,
-                    args.scheduler,
+                if auxiliary_optimizer is not None:
+                    auxiliary_optimizer.zero_grad(set_to_none=True)
+                current_lr = (
+                    spoo_polynomial_lr(args.patch_lr, update_idx, total_updates)
+                    if args.attack_loss == "baseline_spoo_depth"
+                    else (
+                        args.patch_lr
+                        if args.attack_loss in VO_BASELINE_LOSSES
+                        else scheduled_lr(
+                        args.patch_lr,
+                        update_idx,
+                        total_updates,
+                        warmup_updates,
+                        args.scheduler,
+                    )
+                    )
                 )
-                args._eot_strength = (
-                    scheduled_eot_strength(update_idx, total_updates, args.eot_warmup_fraction)
-                    if args.physical_eot else 0.0
-                )
+                args._eot_strength = current_eot_strength(args, update_idx, total_updates)
                 set_optimizer_lr(optimizer, current_lr)
                 losses = []
                 reg_totals = []
@@ -4443,8 +5427,14 @@ def train_geometry_patch(
                 low_freq_terms = []
                 printable_terms = []
                 natural_reference_terms = []
+                paper_tv_terms = []
+                paper_nps_terms = []
+                paper_style_terms = []
+                paper_content_terms = []
+                paper_realism_terms = []
                 coverages = []
                 attack_term_values: dict[str, list[float]] = {}
+                objective_values = []
                 # With EOT on, one draw per step gives a gradient whose per-draw
                 # scatter is roughly twice its own mean (measured SNR 0.52), so the
                 # optimiser is following noise. Averaging n independent draws inside
@@ -4453,7 +5443,76 @@ def train_geometry_patch(
                 # Off is n=1, which is byte-for-byte the previous behaviour.
                 eot_draws = (max(1, int(args.eot_samples)) if args.physical_eot else 1)
                 grad_divisor = len(batch) * eot_draws
-                for item in batch:
+                softmin_w = None
+                if args.subset_agg == "softmin" and len(batch) > 1:
+                    # Weights need all damages before any backward, and three
+                    # VGGT graphs do not fit at once, so measure first without
+                    # gradients and replay with weights below.
+                    _tf = [t.strip() for t in
+                           args.softmin_transforms.split(",") if t.strip()]
+                    combos = [(bi, tk) for bi in range(len(batch)) for tk in _tf]
+                    with torch.no_grad():
+                        ds, raw = [], []
+                        base = getattr(args, "_softmin_clean", {})
+                        for _bi, _tk in combos:
+                            _it = batch[_bi]
+                            _adv = apply_geometry_patch(
+                                _it["images"], texture, _it["grids"],
+                                _it["masks"], args, training=True)
+                            _adv = apply_softmin_transform(_adv, _tk, rng)
+                            _l, _t, _m = attack_objective_loss(
+                                model, _adv, _it, args, dtype)
+                            _d = float(_l) if _m else -float(_l)
+                            raw.append(_d)
+                            if args.softmin_normalize == "clean":
+                                # the baseline must carry the same transform,
+                                # or blur alone would read as attack damage
+                                _nm = f"{_it.get('subset_name', '_')}|{_tk}"
+                                if _nm not in base:
+                                    # identity is deterministic; averaging it
+                                    # over draws would just repeat one forward
+                                    _n = 1 if _tk == "identity" else 4
+                                    _cd = 0.0
+                                    for _r in range(_n):
+                                        _ci = apply_softmin_transform(
+                                            _it["images"], _tk, rng)
+                                        _cl, _, _cm = attack_objective_loss(
+                                            model, _ci, _it, args, dtype)
+                                        _cd += (float(_cl) if _cm
+                                                else -float(_cl)) / _n
+                                    base[_nm] = _cd
+                                    print(f"[softmin] {_nm} clean 基线 "
+                                          f"D={_cd:.6f}")
+                                _d = _d / max(abs(base[_nm]), 1e-8)
+                            ds.append(_d)
+                        args._softmin_clean = base
+                    d = torch.tensor(ds, dtype=torch.float64)
+                    softmin_w = torch.softmax(-d / max(args.softmin_tau, 1e-6), dim=0)
+                    if args.softmin_topk and args.softmin_topk < len(combos):
+                        keep = torch.topk(softmin_w, args.softmin_topk).indices
+                        m = torch.zeros_like(softmin_w)
+                        m[keep] = softmin_w[keep]
+                        softmin_w = m / m.sum()
+                    args._softmin_combos = combos
+                    tau = max(args.softmin_tau, 1e-6)
+                    j_val = -tau * float(torch.logsumexp(-d / tau, dim=0)
+                                         - np.log(len(d)))
+                    extra_terms = {
+                        "softmin_J": j_val,
+                        "softmin_weakest": int(torch.argmin(d)),
+                        "softmin_combos": [f"{batch[b].get('subset_name', b)}|{t}"
+                                          for b, t in combos],
+                        "softmin_damages": [float(x) for x in d],
+                        "softmin_damages_raw": raw,
+                        "softmin_weights": [float(x) for x in softmin_w],
+                    }
+                _work = (list(enumerate(getattr(args, "_softmin_combos", [])))
+                         if softmin_w is not None
+                         else [(i, (i, "identity")) for i in range(len(batch))])
+                for _wi, (_bi, _tk) in _work:
+                    if softmin_w is not None and float(softmin_w[_wi]) <= 0.0:
+                        continue
+                    item = batch[_bi]
                     for _ in range(eot_draws):
                         adv_images = apply_geometry_patch(
                             item["images"],
@@ -4463,6 +5522,8 @@ def train_geometry_patch(
                             args,
                             training=True,
                         )
+                        if softmin_w is not None and _tk != "identity":
+                            adv_images = apply_softmin_transform(adv_images, _tk, rng)
                         reg_terms = patch_regularization_terms(texture, args)
                         if args.attack_loss in ("mirage_projected", "mirage_projected_split_pose"):
                             task_gradient, terms = mirage_projected_texture_gradient(
@@ -4477,7 +5538,11 @@ def train_geometry_patch(
                             # AdamW performs descent. Task scores are larger-is-worse,
                             # hence their max-min direction enters with a minus sign;
                             # physical regularizers retain the ordinary descent sign.
-                            contribution = (-task_gradient + reg_gradient) / grad_divisor
+                            if softmin_w is not None:
+                                _w = float(softmin_w[_wi]) / eot_draws
+                                contribution = (-task_gradient + reg_gradient) * _w
+                            else:
+                                contribution = (-task_gradient + reg_gradient) / grad_divisor
                             if texture.grad is None:
                                 texture.grad = contribution.detach().clone()
                             else:
@@ -4492,7 +5557,12 @@ def train_geometry_patch(
                             )
                             objective = ((-loss if maximize_loss else loss)
                                          + reg_terms["regularization_total"])
-                            (objective / grad_divisor).backward()
+                            if softmin_w is not None:
+                                w = float(softmin_w[_wi]) / eot_draws
+                                (objective * w).backward()
+                            else:
+                                (objective / grad_divisor).backward()
+                            objective_values.append(float(objective.detach().cpu()))
                         metric_value = terms.get("feature_l1")
                         if metric_value is None:
                             metric_value = terms.get("pose_loss")
@@ -4507,11 +5577,60 @@ def train_geometry_patch(
                         low_freq_terms.append(float(reg_terms["low_frequency"].detach().cpu()))
                         printable_terms.append(float(reg_terms["printability"].detach().cpu()))
                         natural_reference_terms.append(float(reg_terms["natural_reference"].detach().cpu()))
+                        paper_tv_terms.append(float(reg_terms["paper_tv"].detach().cpu()))
+                        paper_nps_terms.append(float(reg_terms["paper_nps"].detach().cpu()))
+                        paper_style_terms.append(float(reg_terms["paper_style"].detach().cpu()))
+                        paper_content_terms.append(float(reg_terms["paper_content"].detach().cpu()))
+                        paper_realism_terms.append(float(reg_terms["paper_realism"].detach().cpu()))
                         coverages.append(item["geometry"]["mask_coverage_mean"])
 
                 if texture.grad is None:
                     raise RuntimeError("Geometry patch gradient is None.")
-                optimizer.step()
+                if args.attack_loss in VO_BASELINE_LOSSES:
+                    # In the formal profile there is one fixed sequence and no
+                    # EOT, so this is the same criterion the current texture
+                    # would receive in a separate source-style attack_eval call.
+                    candidate_score = float(np.mean(losses))
+                    if candidate_score > vo_best_score:
+                        vo_best_score = candidate_score
+                        vo_best_update = update_idx
+                        vo_best_texture = texture.detach().clone()
+                if args.attack_loss == "baseline_spoo_depth":
+                    objective_value = float(np.mean(objective_values))
+                    if (not args._spoo_second_stage and update_idx >= spoo_best_start
+                            and objective_value < args._spoo_best_first_stage_objective):
+                        args._spoo_best_first_stage_objective = objective_value
+                        args._spoo_best_first_stage = texture.detach().clone()
+                    # grid_sample can leave a non-contiguous leaf gradient;
+                    # PyTorch 2.1's L-BFGS gathers it with view(-1).
+                    texture.grad = texture.grad.contiguous()
+                    optimizer.step(
+                        lambda: texture.sum() * 0.0 + texture.new_tensor(objective_value)
+                    )
+                    if (auxiliary_optimizer is not None and args._spoo_mask_active
+                            and not args._spoo_region_frozen):
+                        spoo_edge_based_adam_step_(
+                            args._spoo_borders,
+                            auxiliary_optimizer,
+                            texture_hw(args, texture),
+                        )
+                        project_spoo_borders_(
+                            args._spoo_borders,
+                            args.baseline_spoo_target_area_fraction,
+                        )
+                        soft_area = float(spoo_soft_rectangle(
+                            args._spoo_borders.detach(), texture_hw(args, texture),
+                            args.baseline_spoo_mask_sharpness,
+                        ).mean().cpu())
+                        args._spoo_region_frozen = (
+                            soft_area <= args.baseline_spoo_target_area_fraction
+                        )
+                        if args._spoo_region_frozen:
+                            args._spoo_mask_active = False
+                elif args.attack_loss in VO_BASELINE_LOSSES:
+                    pgd_sign_step(patch_parameters, current_lr)
+                else:
+                    optimizer.step()
                 with torch.no_grad():
                     texture.clamp_(args.print_min, args.print_max)
                 update_budget_duals(args, attack_term_values)
@@ -4530,13 +5649,34 @@ def train_geometry_patch(
                     "low_frequency": float(np.mean(low_freq_terms)) if low_freq_terms else 0.0,
                     "printability": float(np.mean(printable_terms)) if printable_terms else 0.0,
                     "natural_reference": float(np.mean(natural_reference_terms)) if natural_reference_terms else 0.0,
+                    "paper_tv": float(np.mean(paper_tv_terms)) if paper_tv_terms else 0.0,
+                    "paper_nps": float(np.mean(paper_nps_terms)) if paper_nps_terms else 0.0,
+                    "paper_style": float(np.mean(paper_style_terms)) if paper_style_terms else 0.0,
+                    "paper_content": float(np.mean(paper_content_terms)) if paper_content_terms else 0.0,
+                    "paper_realism": float(np.mean(paper_realism_terms)) if paper_realism_terms else 0.0,
                     "mask_coverage_mean": float(np.mean(coverages)),
                     "eot_strength": float(getattr(args, "_eot_strength", 0.0)),
                     "scenes": [item["seq"] for item in batch],
                     "subsets": [item.get("subset_name") for item in batch],
+                    **(extra_terms if args.subset_agg == "softmin"
+                       and len(batch) > 1 else {}),
                 }
                 for key, values in attack_term_values.items():
                     record[key] = float(np.mean(values))
+                if args.attack_loss == "baseline_spoo_depth":
+                    record["spoo_borders_lrtb"] = [
+                        float(value) for value in args._spoo_borders.detach().cpu()
+                    ]
+                    record["spoo_area_fraction"] = float(
+                        spoo_rectangle_area_fraction(args._spoo_borders).detach().cpu()
+                    )
+                    record["spoo_region_frozen"] = bool(args._spoo_region_frozen)
+                    record["spoo_second_stage"] = bool(args._spoo_second_stage)
+                    record["spoo_mask_active"] = bool(args._spoo_mask_active)
+                    record["spoo_mask_weight"] = float(args._spoo_mask_weight)
+                    record["spoo_mask_target_area"] = float(getattr(
+                        args, "_spoo_target_area", 1.0
+                    ))
                 if args.attack_loss == "mirage_floor":
                     update_floor_duals(args, attack_term_values)
                 if args.attack_loss == "geometry_joint_gauge_budgeted":
@@ -4550,14 +5690,84 @@ def train_geometry_patch(
                         f"reg={record['regularization_total']:.6f} "
                         f"coverage={record['mask_coverage_mean']:.6f}"
                     )
+                if (args.audit_plan and args.audit_every > 0
+                        and (update_idx % args.audit_every == 0
+                             or update_idx == total_updates)):
+                    run_fixed_audit(model, texture, args, device, dtype,
+                                    intrinsics, update_idx)
 
+            last_training_batch = batch
             del batch
 
+    if args.attack_loss in VO_BASELINE_LOSSES and last_training_batch:
+        final_scores = []
+        with torch.no_grad():
+            for item in last_training_batch:
+                adv_images = apply_geometry_patch(
+                    item["images"], texture, item["grids"], item["masks"], args,
+                    training=False,
+                )
+                loss, _, _ = attack_objective_loss(model, adv_images, item, args, dtype)
+                final_scores.append(float(loss.detach().cpu()))
+        final_score = float(np.mean(final_scores))
+        if final_score > vo_best_score:
+            vo_best_score = final_score
+            vo_best_update = total_updates
+            vo_best_texture = texture.detach().clone()
+        if vo_best_texture is not None:
+            with torch.no_grad():
+                texture.copy_(vo_best_texture)
+        args._vo_best_score = vo_best_score
+        args._vo_best_update = vo_best_update
+
     texture_npz = patch_dir / "geometry_patch_texture.npz"
-    np.savez_compressed(texture_npz, texture=texture.detach().float().cpu().numpy())
-    to_pil_image(texture.squeeze(0).detach().float().cpu().clamp(0, 1)).save(
-        patch_dir / "geometry_patch_texture.png"
-    )
+    save_values = {"texture": texture.detach().float().cpu().numpy()}
+    if args.attack_loss == "baseline_spoo_depth":
+        final_alpha = spoo_soft_rectangle(
+            args._spoo_borders.detach(),
+            texture_hw(args, texture),
+            args.baseline_spoo_mask_sharpness,
+        )
+        save_values["adaptive_mask"] = final_alpha.float().cpu().numpy()
+        save_values["spoo_borders_lrtb"] = args._spoo_borders.detach().float().cpu().numpy()
+        np.savez_compressed(
+            patch_dir / "adaptive_mask.npz",
+            adaptive_mask=save_values["adaptive_mask"],
+            spoo_borders_lrtb=save_values["spoo_borders_lrtb"],
+        )
+        to_pil_image(final_alpha.squeeze(0).float().cpu()).save(
+            patch_dir / "adaptive_mask.png"
+        )
+    elif args.attack_loss == APARATE_SHAPE_EXTENSION:
+        final_alpha = adaptive_alpha(
+            args._adaptive_mask_logits.detach(), args.baseline_mask_temperature,
+            texture_hw(args, texture),
+        )
+        save_values["adaptive_mask"] = final_alpha.float().cpu().numpy()
+        np.savez_compressed(
+            patch_dir / "adaptive_mask.npz", adaptive_mask=save_values["adaptive_mask"]
+        )
+        to_pil_image(final_alpha.squeeze(0).float().cpu()).save(
+            patch_dir / "adaptive_mask.png"
+        )
+    np.savez_compressed(texture_npz, **save_values)
+    final_base = paper_base_texture_preview(texture, args)
+    final_base_image = to_pil_image(final_base)
+    final_base_image.save(patch_dir / "geometry_patch_texture.png")
+    final_preview = prepare_texture_for_render(
+        texture.detach(), args, training=False, n_frames=1
+    )[0].float().cpu().clamp(0, 1)
+    if args.attack_loss == "baseline_spoo_depth":
+        l, r, t, b = [float(value) for value in args._spoo_borders.detach().cpu()]
+        height, width = texture_hw(args, texture)
+        x0, x1 = int(np.floor(l * width)), int(np.ceil(r * width))
+        y0, y1 = int(np.floor(t * height)), int(np.ceil(b * height))
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(width, max(x0 + 1, x1)), min(height, max(y0 + 1, y1))
+        final_base = final_base[:, y0:y1, x0:x1]
+        final_preview = final_preview[:, y0:y1, x0:x1]
+    to_pil_image(final_base).save(patch_dir / "optimized_patch.png")
+    to_pil_image(final_preview).save(patch_dir / "optimized_deployed_patch.png")
     metadata = {
         "mode": "gt_geometry_aware_planar_patch",
         "attack_target": args.attack_loss,
@@ -4612,10 +5822,104 @@ def train_geometry_patch(
         "texture_shape": list(texture.shape),
         "texture_init": args.texture_init,
         "texture_init_image": args.texture_init_image,
+        "texture_init_preserve_aspect": bool(args.texture_init_preserve_aspect),
+        "raw_texture_hw": list(texture_hw(args, texture)),
+        "deployed_preview_files": {
+            "initial_base": "geometry_patch/initial_patch.png",
+            "initial_deployed": "geometry_patch/initial_deployed_patch.png",
+            "optimized_base": "geometry_patch/optimized_patch.png",
+            "optimized_deployed": "geometry_patch/optimized_deployed_patch.png",
+            "learnable_initial": "geometry_patch/initial_texture.png",
+            "learnable_optimized": "geometry_patch/geometry_patch_texture.png",
+        },
         "freeze_texture": bool(args.freeze_texture),
-        "optimizer_target": "texture_only",
+        "optimizer_target": (
+            "texture_and_spoo_rectangle_borders"
+            if args.attack_loss == "baseline_spoo_depth"
+            else (
+                "texture_and_adaptive_mask"
+                if args.attack_loss == APARATE_SHAPE_EXTENSION
+                else "texture_only"
+            )
+        ),
         "victim_model_weights_updated": False,
         "patch_lr": args.patch_lr,
+        "optimizer": patch_optimizer_name(args),
+        "paper_baseline": {
+            "name": args.attack_loss if args.attack_loss in PAPER_BASELINE_LOSSES else None,
+            "extension": (
+                "APARATE loss plus a learnable low-resolution shape mask"
+                if args.attack_loss == APARATE_SHAPE_EXTENSION else None
+            ),
+            "adapted_to": "VGGT ten-frame planar physical patch",
+            "focus_scale": args.baseline_focus_scale,
+            "depth_eps": args.baseline_depth_eps,
+            "focus_quad_world": args.baseline_focus_quad_world,
+            "spoo_target_area_fraction": args.baseline_spoo_target_area_fraction,
+            "spoo_mask_weight": args.baseline_spoo_mask_weight,
+            "spoo_mask_sharpness": args.baseline_spoo_mask_sharpness,
+            "spoo_border_lr": args.baseline_spoo_border_lr,
+            "spoo_lbfgs_history": args.baseline_spoo_lbfgs_history,
+            "spoo_naturalness": bool(args.baseline_spoo_naturalness),
+            "spoo_vgg19_weights": args.baseline_spoo_vgg19_weights,
+            "spoo_style_weight": args.baseline_spoo_style_weight,
+            "spoo_content_weight": args.baseline_spoo_content_weight,
+            "spoo_tv_weight": args.baseline_spoo_tv_weight,
+            "spoo_realism_weight": args.baseline_spoo_realism_weight,
+            "spoo_late_start_fraction": args.baseline_spoo_late_start_fraction,
+            "spoo_best_start_fraction": args.baseline_spoo_best_start_fraction,
+            "spoo_mask_schedule_fraction": args.baseline_spoo_mask_schedule_fraction,
+            "spoo_mask_update_interval": args.baseline_spoo_mask_update_interval,
+            "spoo_final_mask_weight": float(getattr(
+                args, "_spoo_mask_weight", args.baseline_spoo_mask_weight
+            )),
+            "spoo_best_first_stage_objective": (
+                float(args._spoo_best_first_stage_objective)
+                if args.attack_loss == "baseline_spoo_depth"
+                and np.isfinite(args._spoo_best_first_stage_objective) else None
+            ),
+            "spoo_final_borders_lrtb": (
+                [float(value) for value in args._spoo_borders.detach().cpu()]
+                if args.attack_loss == "baseline_spoo_depth" else None
+            ),
+            "spoo_initial_area_fraction": (
+                float(args._spoo_initial_area)
+                if args.attack_loss == "baseline_spoo_depth" else None
+            ),
+            "spoo_final_area_fraction": (
+                float(spoo_soft_rectangle(
+                    args._spoo_borders.detach(), texture_hw(args, texture),
+                    args.baseline_spoo_mask_sharpness,
+                ).mean().cpu())
+                if args.attack_loss == "baseline_spoo_depth" else None
+            ),
+            "spoo_region_frozen": bool(
+                getattr(args, "_spoo_region_frozen", False)
+            ),
+            "aparate_outside_weight": args.baseline_aparate_outside_weight,
+            "aparate_tv_weight": args.baseline_aparate_tv_weight,
+            "aparate_nps_weight": args.baseline_aparate_nps_weight,
+            "adaptive_mask_area_fraction": args.baseline_mask_area_fraction,
+            "adaptive_mask_resolution": args.baseline_mask_resolution,
+            "adaptive_mask_area_weight": args.baseline_mask_area_weight,
+            "adaptive_mask_binary_weight": args.baseline_mask_binary_weight,
+            "adaptive_mask_tv_weight": args.baseline_mask_tv_weight,
+            "adaptive_mask_temperature": args.baseline_mask_temperature,
+            "3d2fool_tv_weight": args.baseline_3d2fool_tv_weight,
+            "3d2fool_nps_weight": args.baseline_3d2fool_nps_weight,
+            "texture_repeats": args.baseline_texture_repeats,
+            "converted_texture_size": args.baseline_converted_texture_size,
+            "texture_upsample_factor": args.baseline_texture_upsample_factor,
+            "weather_strength": args.baseline_weather_strength,
+            "weather_semantics": (
+                "legacy_tum_proxy_disabled_in_formal_profile"
+                if args.attack_loss == "baseline_3d2fool_depth" else None
+            ),
+            "vo_blur_kernel": args.baseline_vo_blur_kernel,
+            "vo_best_score": getattr(args, "_vo_best_score", None),
+            "vo_best_update": getattr(args, "_vo_best_update", None),
+            "source_fidelity": paper_baseline_fidelity(args),
+        },
         "scheduler": args.scheduler,
         "warmup_iterations": args.warmup_iterations,
         "iterations": args.iterations,
@@ -4632,12 +5936,20 @@ def train_geometry_patch(
         },
         "physical_eot": {
             "enabled": bool(args.physical_eot),
+            "samples": int(args.eot_samples),
             "print_min": args.print_min,
             "print_max": args.print_max,
             "brightness": args.eot_brightness,
             "contrast": args.eot_contrast,
+            "saturation": args.eot_saturation,
+            "hue": args.eot_hue,
             "gamma": args.eot_gamma,
             "noise_std": args.eot_noise_std,
+            "noise_distribution": (
+                "uniform_bounded"
+                if args.attack_loss in ("baseline_aparate_depth", APARATE_SHAPE_EXTENSION)
+                else "gaussian"
+            ),
             "noise_scope": "patch_only",
             "warmup_fraction": args.eot_warmup_fraction,
             "geo_translate": args.eot_geo_translate,
@@ -4730,9 +6042,28 @@ def train_geometry_patch(
     return texture.detach(), metadata
 
 
-def load_texture(path: str, device: torch.device) -> torch.Tensor:
+def load_texture(path: str, device: torch.device,
+                 args: argparse.Namespace | None = None) -> torch.Tensor:
     with np.load(path) as data:
         texture = torch.from_numpy(np.asarray(data["texture"]).astype(np.float32))
+        # Some paper baselines use a non-square source texture (SPOO is
+        # 450x600).  ``initialize_texture`` records that shape during training,
+        # but a later evaluation process reconstructs ``args`` from the CLI.
+        # Restore the saved tensor shape here as well; otherwise an adaptive UV
+        # mask is silently rebuilt as texture_size x texture_size and the
+        # re-render no longer matches the stored attack output.
+        if args is not None:
+            args._texture_hw = (int(texture.shape[-2]), int(texture.shape[-1]))
+        if args is not None and "spoo_borders_lrtb" in data:
+            args._spoo_borders = torch.from_numpy(
+                np.asarray(data["spoo_borders_lrtb"]).astype(np.float32)
+            ).to(device)
+            args._spoo_region_frozen = True
+        elif args is not None and "adaptive_mask" in data:
+            alpha = torch.from_numpy(
+                np.asarray(data["adaptive_mask"]).astype(np.float32)
+            ).to(device).clamp(1e-5, 1.0 - 1e-5)
+            args._adaptive_mask_logits = torch.logit(alpha) * args.baseline_mask_temperature
     return texture.to(device)
 
 
@@ -4791,6 +6122,7 @@ def evaluate_geometry_patch(
             "feature_layer": args.feature_layer,
             "final_feature_l1": float(final_loss.detach().cpu()),
             "geometry": item["geometry"],
+            "baseline_focus_geometry": item.get("baseline_focus_geometry"),
             "depth_available": item["depth_available"],
             "geometry_patch_metadata": patch_metadata,
             "outputs": {
@@ -4829,6 +6161,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="RGB image used when --texture_init=image, e.g. a natural/style-transferred sticker texture.",
     )
+    parser.add_argument(
+        "--texture_init_preserve_aspect",
+        action="store_true",
+        help="Resize an image initializer by its longest side without forcing it square.",
+    )
     parser.add_argument("--freeze_texture", action="store_true")
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--inner_loop", type=int, default=10)
@@ -4851,6 +6188,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--attack_loss",
         choices=(
+            *PAPER_BASELINE_LOSSES,
+            APARATE_SHAPE_EXTENSION,
             "feature_l1",
             "pose_gt_untargeted",
             "pose_scale_invariant_mse",
@@ -4882,6 +6221,50 @@ def parse_args() -> argparse.Namespace:
             "ATE normalized by its ceiling."
         ),
     )
+    parser.add_argument(
+        "--baseline_focus_scale", type=float, default=2.0,
+        help="SPOO/APARATE rectangular focus-region scale relative to the projected patch bbox.",
+    )
+    parser.add_argument(
+        "--baseline_focus_quad_world", default="",
+        help="Frozen 12-number carrier/object quad used as the SPOO/APARATE focus mask.",
+    )
+    parser.add_argument("--baseline_depth_eps", type=float, default=1e-3)
+    parser.add_argument("--baseline_spoo_target_area_fraction", type=float, default=1.0 / 9.0)
+    parser.add_argument("--baseline_spoo_mask_weight", type=float, default=1e-3)
+    parser.add_argument("--baseline_spoo_mask_sharpness", type=float, default=1.0)
+    parser.add_argument("--baseline_spoo_border_lr", type=float, default=1.0)
+    parser.add_argument("--baseline_spoo_lbfgs_history", type=int, default=20)
+    parser.add_argument("--baseline_spoo_naturalness", action="store_true")
+    parser.add_argument("--baseline_spoo_vgg19_weights", default=None)
+    # Source weights divided by its 1e6 adversarial coefficient. This keeps
+    # every relative coefficient while avoiding unnecessarily huge gradients.
+    parser.add_argument("--baseline_spoo_style_weight", type=float, default=2.0)
+    parser.add_argument("--baseline_spoo_content_weight", type=float, default=2e-3)
+    parser.add_argument("--baseline_spoo_tv_weight", type=float, default=2e-10)
+    parser.add_argument("--baseline_spoo_realism_weight", type=float, default=2e-5)
+    parser.add_argument("--baseline_spoo_late_start_fraction", type=float, default=0.5)
+    parser.add_argument("--baseline_spoo_best_start_fraction", type=float, default=0.1)
+    parser.add_argument("--baseline_spoo_mask_schedule_fraction", type=float, default=0.6)
+    parser.add_argument("--baseline_spoo_mask_update_interval", type=int, default=20)
+    parser.add_argument("--baseline_spoo_mask_upscaler", type=float, default=1.5)
+    parser.add_argument("--baseline_spoo_mask_downscaler", type=float, default=0.7)
+    parser.add_argument("--baseline_aparate_outside_weight", type=float, default=1.0)
+    parser.add_argument("--baseline_aparate_tv_weight", type=float, default=0.1)
+    parser.add_argument("--baseline_aparate_nps_weight", type=float, default=1.5)
+    parser.add_argument("--baseline_mask_resolution", type=int, default=16)
+    parser.add_argument("--baseline_mask_area_fraction", type=float, default=0.5)
+    parser.add_argument("--baseline_mask_area_weight", type=float, default=10.0)
+    parser.add_argument("--baseline_mask_binary_weight", type=float, default=0.1)
+    parser.add_argument("--baseline_mask_tv_weight", type=float, default=0.1)
+    parser.add_argument("--baseline_mask_temperature", type=float, default=1.0)
+    parser.add_argument("--baseline_3d2fool_tv_weight", type=float, default=0.1)
+    parser.add_argument("--baseline_3d2fool_nps_weight", type=float, default=5.0)
+    parser.add_argument("--baseline_texture_repeats", type=int, default=6)
+    parser.add_argument("--baseline_converted_texture_size", type=int, default=4096)
+    parser.add_argument("--baseline_texture_upsample_factor", type=int, default=8)
+    parser.add_argument("--baseline_weather_strength", type=float, default=0.15)
+    parser.add_argument("--baseline_vo_blur_kernel", type=int, default=9)
     parser.add_argument("--pose_reverse_reference", choices=("gt", "clean"), default="gt")
     parser.add_argument("--pose_bad_reference", choices=("gt", "clean"), default="gt")
     parser.add_argument("--pose_drift_x_m", type=float, default=0.5)
@@ -4901,7 +6284,7 @@ def parse_args() -> argparse.Namespace:
         "A constant gauge is removed exactly by the evaluator, so only frame-varying "
         "ones leave measurable error; see scripts/diag_piecewise_gauge.py for what each "
         "family is worth. scale_sine is the most consistent across sequences "
-        "(68-87% of the ATE ceiling) at a frame-to-frame jump of 0.35 versus 1.0 for a "
+        "(68-87%% of the ATE ceiling) at a frame-to-frame jump of 0.35 versus 1.0 for a "
         "hard split.",
     )
     parser.add_argument("--piecewise_gauge_magnitude", type=float, default=1.0)
@@ -4953,6 +6336,54 @@ def parse_args() -> argparse.Namespace:
              "给定则替代手调的 orthogonal_mode 正弦模式",
     )
     parser.add_argument(
+        "--subset_agg", choices=("mean", "softmin"), default="mean",
+        help="跨子集聚合方式；softmin 把更新集中到当前最弱的子集",
+    )
+    parser.add_argument(
+        "--softmin_tau", type=float, default=0.05,
+        help="soft-min 温度；越小越接近硬 min",
+    )
+    parser.add_argument(
+        "--softmin_normalize", choices=("none", "clean"), default="clean",
+        help="clean=按各子集自身 clean 基线归一，消除场景尺度差异",
+    )
+    parser.add_argument(
+        "--audit_plan", default="",
+        help="固定审计集合的 plan json；每隔 --audit_every 步评估一次",
+    )
+    parser.add_argument(
+        "--audit_every", type=int, default=0,
+        help="审计间隔步数；0=关闭",
+    )
+    parser.add_argument(
+        "--dynamic_frame_pool", default="",
+        help="逗号分隔的帧下标池；设置后每步从中重新随机抽帧，不复用固定组合",
+    )
+    parser.add_argument(
+        "--dynamic_frame_pool_json", default="",
+        help="按场景保存帧下标池的 JSON；用于各序列长度不同的全帧 universal 训练",
+    )
+    parser.add_argument(
+        "--dynamic_sets_per_step", type=int, default=6,
+        help="每步抽多少组",
+    )
+    parser.add_argument(
+        "--dynamic_frames_per_set", type=int, default=10,
+        help="每组多少帧",
+    )
+    parser.add_argument(
+        "--mirage_projected_tasks", default="",
+        help="逗号分隔的任务子集（pose/depth/point/track）；空=全部四个",
+    )
+    parser.add_argument(
+        "--softmin_transforms", default="identity",
+        help="逗号分隔的像素级变换，与帧集合做叉乘后一起取 soft-min",
+    )
+    parser.add_argument(
+        "--softmin_topk", type=int, default=0,
+        help="只对权重最大的 k 个组合回传梯度；0=全部",
+    )
+    parser.add_argument(
         "--shared_deformation", action="store_true",
         help="在整条池轨迹上算一次 orthogonal_mode 形变，各子集按全局帧号切出同一目标；"
              "需配合 --attack_loss pose_piecewise_gauge_targeted",
@@ -4977,6 +6408,10 @@ def parse_args() -> argparse.Namespace:
         "--mirage_projected_track_cap_px", type=float, default=20.0,
         help="smooth EPE cap for mirage_projected; prevents a few track outliers "
              "from carrying the whole objective",
+    )
+    parser.add_argument(
+        "--mirage_projected_min_queries", type=int, default=20,
+        help="minimum valid GT query points required for a dynamic subset's first frame",
     )
     parser.add_argument(
         "--mirage_projected_direction_scale", type=float, default=0.0,
@@ -5170,6 +6605,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print_max", type=float, default=1.0)
     parser.add_argument("--eot_brightness", type=float, default=0.15)
     parser.add_argument("--eot_contrast", type=float, default=0.15)
+    parser.add_argument("--eot_saturation", type=float, default=0.0)
+    parser.add_argument("--eot_hue", type=float, default=0.0)
     parser.add_argument("--eot_gamma", type=float, default=0.10)
     parser.add_argument("--eot_noise_std", type=float, default=0.01)
     parser.add_argument("--eot_warmup_fraction", type=float, default=0.25,
@@ -5195,6 +6632,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if (args.subset_agg == "softmin"
+            and args.attack_loss in ("mirage_projected",
+                                     "mirage_projected_split_pose")):
+        raise SystemExit("softmin 目前只支持 attack_objective_loss 分支，"
+                         "mirage_projected 走的是自定义梯度路径")
     set_random_seeds(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -5228,7 +6670,7 @@ def main() -> None:
         param.requires_grad_(False)
 
     if args.texture_path:
-        texture = load_texture(args.texture_path, device)
+        texture = load_texture(args.texture_path, device, args)
         patch_metadata = {
             "mode": "gt_geometry_aware_planar_patch",
             "loaded_texture_path": str(Path(args.texture_path)),
