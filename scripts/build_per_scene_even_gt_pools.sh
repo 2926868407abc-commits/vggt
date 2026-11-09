@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 V=/mnt/data/wangqq/vggt
-PY=/mnt/data/wangqq/conda_envs/recons_eval/bin/python3
+PY="${PY:-/mnt/data/wangqq/conda_envs/recons_eval/bin/python3}"
 TUM=/mnt/data/wangqq/recons_eval/data/tum_all_sync
 POOLS="$V/data/tum_per_scene_splits/evenodd_train_pools.json"
 OUT="$V/outputs/tum_gt_pool_per_scene_even"
@@ -29,10 +29,15 @@ build_one() {
 }
 
 running=0
+jobs="${GT_POOL_JOBS:-4}"
+if (( jobs < 1 )); then
+  echo "GT_POOL_JOBS must be at least 1" >&2
+  exit 2
+fi
 for scene in "${scenes[@]}"; do
   build_one "$scene" &
   running=$((running + 1))
-  if (( running == 4 )); then
+  if (( running == jobs )); then
     wait
     running=0
   fi

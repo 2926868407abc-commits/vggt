@@ -27,6 +27,7 @@ import csv
 import copy
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -1560,12 +1561,17 @@ def build_geometry_arrays_for_plane(
             patch_depth, depth_valid = plane_depth_map(corners_cam, frame_intrinsics, proj, tensor_hw)
             scene_depth = depth_maps[frame_idx]
             scene_valid = (scene_depth > args.depth_min_m) & (scene_depth < args.depth_max_m)
-            visible = depth_valid & scene_valid & (patch_depth <= scene_depth + args.visibility_depth_margin)
+            # Missing RGB-D measurements are not evidence that a physical sticker
+            # is hidden.  Cull a patch pixel only when a valid scene measurement is
+            # clearly in front of the carrier plane.  The old conjunction with
+            # ``scene_valid`` punched holes through dark/reflective monitors, where
+            # structured-light depth is commonly absent.
+            occluded_by_foreground = scene_valid & (
+                scene_depth < patch_depth - args.visibility_depth_margin
+            )
+            visible = depth_valid & ~occluded_by_foreground
             mask_bool = raw_inside & visible
             if args.surface_support_check:
-                occluded_by_foreground = scene_valid & (
-                    scene_depth < patch_depth - args.visibility_depth_margin
-                )
                 evaluable = raw_inside & depth_valid & scene_valid & ~occluded_by_foreground
                 support_tolerance = np.maximum(
                     args.surface_support_abs_tolerance,
@@ -3395,16 +3401,27 @@ def forward_all_geometry_heads(
     dtype: torch.dtype,
     query_points: torch.Tensor | None = None,
     track_iters: int = 4,
+    activation_checkpoint: bool = False,
+    activation_checkpoint_mode: str = "global",
+    requested_tasks: tuple[str, ...] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Geometry heads in one pass, with memory-heavy heads checkpointed.
+    """Requested geometry heads in one pass, with heavy heads checkpointed.
 
-    Running the whole model the way forward_vggt does needs more memory than the
-    camera-only path and overflows a 46 GiB card at 10 frames: the DPT decoders keep
-    full-resolution activations for both depth and point maps on top of the
-    aggregator's. Checkpointing recomputes those two heads during the backward pass
-    instead of storing them, which is numerically identical and brings the peak back
-    under the card. The aggregator itself is shared and runs once either way.
+    ``requested_tasks=None`` preserves the historical all-head behavior.  An
+    explicit task subset avoids executing heads whose outputs will be discarded;
+    this is essential for long-context Track-only training, where the two DPT
+    decoders otherwise consume memory without contributing to the objective.
     """
+    task_set = set(requested_tasks or (
+        "pose", "pose_trans", "pose_rot", "depth", "point", "track"
+    ))
+    need_pose = bool(task_set & {"pose", "pose_trans", "pose_rot"})
+    need_depth = "depth" in task_set
+    need_point = "point" in task_set
+    need_track = "track" in task_set
+    if need_track and query_points is None:
+        raise ValueError("Track head requested without query_points")
+
     images_b = images if images.ndim == 5 else images[None]
     # The aggregator's own activations are the bulk of the cost -- the camera-only
     # path already sits near 32 GiB with them -- so checkpointing only the two DPT
@@ -3416,8 +3433,24 @@ def forward_all_geometry_heads(
     patch_start_idx = model.aggregator.patch_start_idx
 
     def run_aggregator(imgs):
-        with autocast_context(imgs.device, dtype):
-            tokens_list, _ = model.aggregator(imgs)
+        # Global attention dominates memory as the number of frames grows.
+        # Keep the frozen victim in eval mode and checkpoint only those blocks;
+        # checkpointing frame-local blocks too is mathematically valid but much
+        # slower and saves little sequence-length-dependent memory.
+        previous_checkpointing = getattr(
+            model.aggregator, "gradient_checkpointing", False
+        )
+        if activation_checkpoint:
+            if activation_checkpoint_mode not in {"global", "all"}:
+                raise ValueError(
+                    f"Unknown activation checkpoint mode: {activation_checkpoint_mode}"
+                )
+            model.aggregator.gradient_checkpointing = activation_checkpoint_mode
+        try:
+            with autocast_context(imgs.device, dtype):
+                tokens_list, _ = model.aggregator(imgs)
+        finally:
+            model.aggregator.gradient_checkpointing = previous_checkpointing
         return tuple(tokens_list)
 
     tokens = list(torch.utils.checkpoint.checkpoint(
@@ -3425,19 +3458,22 @@ def forward_all_geometry_heads(
 
     out: dict[str, torch.Tensor] = {}
     with torch.cuda.amp.autocast(enabled=False):
-        out["pose_enc"] = model.camera_head(tokens)[-1]
+        if need_pose:
+            out["pose_enc"] = model.camera_head(tokens)[-1]
 
         def run_head(head):
             def fn(*tensors):
                 return head(list(tensors), images=images_b, patch_start_idx=patch_start_idx)
             return torch.utils.checkpoint.checkpoint(fn, *tokens, use_reentrant=False)
 
-        depth, depth_conf = run_head(model.depth_head)
-        out["depth"], out["depth_conf"] = depth, depth_conf
-        points, points_conf = run_head(model.point_head)
-        out["world_points"], out["world_points_conf"] = points, points_conf
+        if need_depth:
+            depth, depth_conf = run_head(model.depth_head)
+            out["depth"], out["depth_conf"] = depth, depth_conf
+        if need_point:
+            points, points_conf = run_head(model.point_head)
+            out["world_points"], out["world_points_conf"] = points, points_conf
 
-        if query_points is not None:
+        if need_track:
             if model.track_head is None:
                 raise RuntimeError("joint track loss requested but model has no track_head")
             query_b = query_points if query_points.ndim == 3 else query_points[None]
@@ -3889,6 +3925,36 @@ def get_mirage_projected_gt_pool(
     return cache[key]
 
 
+def cap_mirage_projected_track_queries(
+    raw: dict[str, np.ndarray], max_queries: int
+) -> dict[str, np.ndarray]:
+    """Uniformly thin Track queries for training without changing EPE itself.
+
+    The query dimension is shared by query_points and axis 1 of the three track
+    arrays.  A deterministic, evenly spaced subset avoids the early-grid bias
+    that taking the first N points would introduce.  ``max_queries <= 0`` keeps
+    the historical uncapped behavior.  Formal evaluation does not call this
+    training loader and therefore still uses every valid query.
+    """
+    limit = int(max_queries)
+    query_count = int(np.asarray(raw["query_points"]).shape[0])
+    if limit <= 0 or query_count <= limit:
+        return raw
+
+    indices = np.rint(np.linspace(0, query_count - 1, limit)).astype(np.int64)
+    if len(np.unique(indices)) != limit:
+        raise RuntimeError(
+            f"Unable to select {limit} unique Track queries from {query_count}"
+        )
+    capped = dict(raw)
+    capped["query_points"] = np.asarray(raw["query_points"])[indices]
+    for name in ("tracks", "track_known", "track_visible"):
+        capped[name] = np.asarray(raw[name])[:, indices]
+    capped["query_count_uncapped"] = np.asarray(query_count, dtype=np.int64)
+    capped["query_count"] = np.asarray(limit, dtype=np.int64)
+    return capped
+
+
 def load_mirage_projected_gt(
     seq_name: str,
     frame_indices: list[int],
@@ -3911,6 +3977,9 @@ def load_mirage_projected_gt(
             if image_paths is not None else None,
             gt_c2w=gt_c2w,
             min_queries=args.mirage_projected_min_queries,
+        )
+        raw = cap_mirage_projected_track_queries(
+            raw, args.mirage_projected_max_queries
         )
         points = torch.from_numpy(raw["point_map"]).to(device=device)
         valid = torch.from_numpy(raw["point_valid"]).to(device=device)
@@ -3943,6 +4012,9 @@ def load_mirage_projected_gt(
         raise RuntimeError(f"mirage_projected GT not found: {path}")
     with np.load(path, allow_pickle=True) as data:
         raw = {key: data[key] for key in data.files}
+    raw = cap_mirage_projected_track_queries(
+        raw, args.mirage_projected_max_queries
+    )
     saved_frames = np.asarray(raw["frame_indices"], dtype=np.int64).tolist()
     if saved_frames != [int(index) for index in frame_indices]:
         raise RuntimeError(
@@ -4011,12 +4083,41 @@ def mirage_projected_track_score(
     visible: torch.Tensor,
     known: torch.Tensor,
     cap_px: float,
+    mode: str = "capped_all",
+    min_points_per_frame: int = 20,
+    target_softmin_tau_px: float = 0.25,
 ) -> torch.Tensor | None:
-    """Capped reprojection-GT EPE so a few outliers cannot carry the objective."""
+    """Reprojection-GT tracking damage under a selectable aggregation rule.
+
+    ``capped_all`` is the historical training objective: pool every known and
+    visible point after the query frame and apply a smooth per-point cap.
+
+    ``eval_epe`` deliberately mirrors ``eval_universal_four_tasks.track_stats``:
+    discard target frames with fewer than ``min_points_per_frame`` known-visible
+    points, then average the uncapped endpoint error over the remaining points.
+    ``eval_epe_softmin`` uses the same eligible frames but takes a smooth
+    minimum over per-frame EPE. Maximising it prioritises the least damaged
+    target frame instead of allowing easy target frames to dominate the mean.
+
+    Keeping all modes makes the proxy-vs-metric ablation explicit instead of
+    silently changing already reported experiments.
+    """
     if pred.ndim == 4:
         pred = pred[0]
+    if mode not in {"capped_all", "eval_epe", "eval_epe_softmin"}:
+        raise ValueError(f"unknown projected track mode: {mode}")
+
     keep = visible[1:] & known[1:]
     distance = (pred[1:] - target[1:]).float().pow(2).sum(-1).clamp_min(1e-12).sqrt()
+
+    if mode in {"eval_epe", "eval_epe_softmin"}:
+        minimum = max(int(min_points_per_frame), 1)
+        usable = keep.sum(dim=-1) >= minimum
+        if not bool(usable.any()):
+            return None
+        keep = keep[usable]
+        distance = distance[usable]
+
     values = distance[keep]
     if values.numel() == 0:
         # Dynamic frame sampling can occasionally draw a valid pose/depth/point
@@ -4024,8 +4125,44 @@ def mirage_projected_track_score(
         # information about the tracking objective, so omit only this task from
         # the max-min solve instead of aborting the whole training run.
         return None
+    if mode == "eval_epe":
+        return values.mean()
+    if mode == "eval_epe_softmin":
+        frame_scores = []
+        for frame_keep, frame_distance in zip(keep, distance):
+            frame_values = frame_distance[frame_keep]
+            if frame_values.numel():
+                frame_scores.append(frame_values.mean())
+        if not frame_scores:
+            return None
+        scores = torch.stack(frame_scores)
+        tau = max(float(target_softmin_tau_px), 1e-6)
+        return -tau * (
+            torch.logsumexp(-scores / tau, dim=0) - math.log(scores.numel())
+        )
+
     cap = max(float(cap_px), 1e-6)
     return cap * torch.tanh(values / cap).mean()
+
+
+def requested_mirage_projected_tasks(
+    args: argparse.Namespace,
+) -> tuple[str, ...]:
+    """Return the configured task set, preserving the user's order."""
+    split_pose = args.attack_loss == "mirage_projected_split_pose"
+    supported = (
+        ("pose_trans", "pose_rot", "depth", "point", "track")
+        if split_pose else ("pose", "depth", "point", "track")
+    )
+    wanted = tuple(
+        task.strip()
+        for task in getattr(args, "mirage_projected_tasks", "").split(",")
+        if task.strip()
+    )
+    unknown = [task for task in wanted if task not in supported]
+    if unknown:
+        raise ValueError(f"未知任务 {unknown}，可选 {sorted(supported)}")
+    return wanted or supported
 
 
 def mirage_projected_task_scores(
@@ -4044,66 +4181,64 @@ def mirage_projected_task_scores(
     if gt is None:
         raise RuntimeError("mirage_projected needs the synthesized TUM four-task GT")
 
-    pred_rel = pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
+    requested = requested_mirage_projected_tasks(args)
+    requested_set = set(requested)
     split_pose = args.attack_loss == "mirage_projected_split_pose"
-    if split_pose:
-        trans_args = copy.copy(args)
-        trans_args.pose_rotation_weight = 0.0
-        trans_args.pose_translation_weight = 1.0
-        pose_trans, _ = pose_aligned_residual_mse(
-            pred_rel, item["pose_gt_rel"], trans_args
-        )
-        rot_args = copy.copy(args)
-        rot_args.pose_rotation_weight = 1.0
-        rot_args.pose_translation_weight = 0.0
-        pose_rot, _ = pose_aligned_residual_mse(
-            pred_rel, item["pose_gt_rel"], rot_args
-        )
-    else:
-        pose, _ = pose_aligned_residual_mse(pred_rel, item["pose_gt_rel"], args)
+    scores: dict[str, torch.Tensor] = {}
 
-    depth_pred = dense_scalar_head(preds["depth"]).float()
-    depth = mirage_projected_depth_score(
-        depth_pred, gt["depth"], gt["point_valid"]
-    )
-
-    point_pred = preds["world_points"]
-    if point_pred.ndim == 5:
-        point_pred = point_pred[0]
-    point = aligned_point_residual(
-        point_pred.float(), gt["point_map"], stride=args.joint_point_stride
-    )
-
-    track = mirage_projected_track_score(
-        preds["track"], gt["tracks"], gt["track_visible"], gt["track_known"],
-        args.mirage_projected_track_cap_px,
-    )
-    if split_pose:
-        scores = {
-            "pose_trans": pose_trans,
-            "pose_rot": pose_rot,
-            "depth": depth,
-            "point": point,
-        }
-        if track is not None:
-            scores["track"] = track
-    else:
-        scores = {"pose": pose, "depth": depth, "point": point}
-        if track is not None:
-            scores["track"] = track
-    wanted = [t.strip() for t in
-              getattr(args, "mirage_projected_tasks", "").split(",") if t.strip()]
-    if wanted:
-        supported = ({"pose_trans", "pose_rot", "depth", "point", "track"}
-                     if split_pose else {"pose", "depth", "point", "track"})
-        unknown = [t for t in wanted if t not in supported]
-        if unknown:
-            raise ValueError(f"未知任务 {unknown}，可选 {sorted(supported)}")
-        scores = {k: scores[k] for k in wanted if k in scores}
-        if not scores:
-            raise RuntimeError(
-                "None of the requested mirage_projected tasks has valid GT in this batch"
+    pose_tasks = requested_set & {"pose", "pose_trans", "pose_rot"}
+    if pose_tasks:
+        pred_rel = pose_predictions_to_relative_c2w(preds, item["tensor_hw"])
+        if split_pose:
+            if "pose_trans" in pose_tasks:
+                trans_args = copy.copy(args)
+                trans_args.pose_rotation_weight = 0.0
+                trans_args.pose_translation_weight = 1.0
+                scores["pose_trans"], _ = pose_aligned_residual_mse(
+                    pred_rel, item["pose_gt_rel"], trans_args
+                )
+            if "pose_rot" in pose_tasks:
+                rot_args = copy.copy(args)
+                rot_args.pose_rotation_weight = 1.0
+                rot_args.pose_translation_weight = 0.0
+                scores["pose_rot"], _ = pose_aligned_residual_mse(
+                    pred_rel, item["pose_gt_rel"], rot_args
+                )
+        else:
+            scores["pose"], _ = pose_aligned_residual_mse(
+                pred_rel, item["pose_gt_rel"], args
             )
+
+    if "depth" in requested_set:
+        depth_pred = dense_scalar_head(preds["depth"]).float()
+        scores["depth"] = mirage_projected_depth_score(
+            depth_pred, gt["depth"], gt["point_valid"]
+        )
+
+    if "point" in requested_set:
+        point_pred = preds["world_points"]
+        if point_pred.ndim == 5:
+            point_pred = point_pred[0]
+        scores["point"] = aligned_point_residual(
+            point_pred.float(), gt["point_map"], stride=args.joint_point_stride
+        )
+
+    if "track" in requested_set:
+        track = mirage_projected_track_score(
+            preds["track"], gt["tracks"], gt["track_visible"],
+            gt["track_known"], args.mirage_projected_track_cap_px,
+            mode=args.mirage_projected_track_mode,
+            min_points_per_frame=args.mirage_projected_track_min_points_per_frame,
+            target_softmin_tau_px=args.mirage_projected_track_target_softmin_tau_px,
+        )
+        if track is not None:
+            scores["track"] = track
+
+    scores = {key: scores[key] for key in requested if key in scores}
+    if not scores:
+        raise RuntimeError(
+            "None of the requested mirage_projected tasks has valid GT in this batch"
+        )
     return scores
 
 
@@ -4143,12 +4278,18 @@ def mirage_projected_texture_gradient(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Return a pose-scaled direction with positive first-order gain for all tasks."""
     gt = item["mirage_projected_gt"]
+    requested = requested_mirage_projected_tasks(args)
     preds = forward_all_geometry_heads(
         model,
         adv_images,
         dtype,
-        query_points=gt["query_points"].unsqueeze(0),
+        query_points=(
+            gt["query_points"].unsqueeze(0) if "track" in requested else None
+        ),
         track_iters=args.joint_track_iters,
+        activation_checkpoint=args.activation_checkpoint,
+        activation_checkpoint_mode=args.activation_checkpoint_mode,
+        requested_tasks=requested,
     )
     scores = mirage_projected_task_scores(preds, item, args)
     names = tuple(scores)
@@ -4225,7 +4366,8 @@ def attack_objective_loss(
         query = track_target["query_points"] if track_target is not None else None
         preds = forward_all_geometry_heads(
             model, adv_images, dtype, query_points=query,
-            track_iters=args.joint_track_iters)
+            track_iters=args.joint_track_iters,
+            activation_checkpoint=args.activation_checkpoint)
         if args.attack_loss == "geometry_joint_gauge_budgeted":
             loss, terms = geometry_joint_gauge_budgeted_loss(preds, item, args)
         elif args.attack_loss == "mirage_floor":
@@ -4986,7 +5128,7 @@ def _audit_umeyama(src: np.ndarray, dst: np.ndarray):
     return sc, R, md - sc * R @ ms
 
 
-def run_fixed_audit(model, texture, args, device, dtype, intrinsics, update_idx):
+def run_fixed_pose_audit(model, texture, args, device, dtype, intrinsics, update_idx):
     """ATE/ceiling on a fixed set of frame sets, so progress is comparable step to step."""
     import json as _json
 
@@ -5044,6 +5186,303 @@ def run_fixed_audit(model, texture, args, device, dtype, intrinsics, update_idx)
     return out
 
 
+def normalized_worst_task_score(
+    clean_scores: dict[str, float],
+    attack_scores: dict[str, float],
+    eps: float = 1e-8,
+) -> tuple[float, dict[str, float]]:
+    """Return the weakest log damage ratio across shared audit tasks."""
+    common = sorted(set(clean_scores) & set(attack_scores))
+    if not common:
+        raise ValueError("Fixed audit has no task shared by clean and attack")
+    ratios = {
+        name: (float(attack_scores[name]) + eps)
+        / (float(clean_scores[name]) + eps)
+        for name in common
+    }
+    if any(not np.isfinite(value) or value <= 0.0 for value in ratios.values()):
+        raise ValueError(f"Invalid fixed-audit task ratios: {ratios}")
+    return min(float(np.log(value)) for value in ratios.values()), ratios
+
+
+def normalized_objective_gain(
+    clean_damage: float,
+    attack_damage: float,
+    eps: float = 1e-8,
+) -> float:
+    """Fractional improvement of a method's own larger-is-worse objective.
+
+    ``attack_objective_loss`` exposes whether a loss is maximized.  Callers
+    first convert it to a larger-is-worse damage (``loss`` when maximized,
+    ``-loss`` when minimized).  Dividing the attack-minus-clean change by the
+    clean magnitude gives depth and pose baselines one comparable, dimensionless
+    convergence score without changing their paper-specific training losses.
+    """
+    clean_damage = float(clean_damage)
+    attack_damage = float(attack_damage)
+    if not np.isfinite(clean_damage) or not np.isfinite(attack_damage):
+        raise ValueError(
+            f"Non-finite objective damage: clean={clean_damage}, "
+            f"attack={attack_damage}"
+        )
+    return (attack_damage - clean_damage) / max(abs(clean_damage), float(eps))
+
+
+def run_fixed_baseline_objective_audit(
+    model, texture, args, device, dtype, intrinsics, update_idx,
+):
+    """Convergence audit using each baseline's own published objective.
+
+    The previous adaptive fallback measured CameraHead ATE for every non-MIRAGE
+    loss.  That is invalid for SPOO/APARATE/3D2Fool, whose optimized quantity is
+    depth.  This audit replays the exact configured objective on fixed held-in
+    frame sets, converts minimization losses to a larger-is-worse damage, and
+    stops on the weakest normalized gain across those sets.
+    """
+    entries = getattr(args, "_baseline_audit_entries", None)
+    if entries is None:
+        entries = json.loads(Path(args.audit_plan).read_text(encoding="utf-8"))
+        for entry in entries:
+            entry["_frames"] = load_frame_manifest(entry["manifest"])
+        args._baseline_audit_entries = entries
+        args._baseline_audit_clean = {}
+
+    output = []
+    for entry in entries:
+        scene = (Path(entry["scene"]) if entry.get("scene")
+                 else Path(args.tum_root) / entry["base_scene"])
+        frames = entry["_frames"][scene.name]
+        item = load_tum_sequence(
+            scene, frames, args.gt_name, intrinsics, args.texture_size,
+            args, device, model=model, dtype=dtype,
+        )
+
+        def objective_damage(images):
+            with torch.no_grad():
+                loss, terms, maximize = attack_objective_loss(
+                    model, images, item, args, dtype,
+                )
+            value = float(loss.detach().cpu())
+            damage = value if maximize else -value
+            return damage, {
+                key: float(term)
+                for key, term in terms.items()
+                if isinstance(term, (int, float))
+            }
+
+        if entry["name"] not in args._baseline_audit_clean:
+            args._baseline_audit_clean[entry["name"]] = objective_damage(
+                item["images"]
+            )[0]
+        clean_damage = float(args._baseline_audit_clean[entry["name"]])
+        with torch.no_grad():
+            adversarial = apply_geometry_patch(
+                item["images"], texture, item["grids"], item["masks"],
+                args, training=False,
+            )
+        attack_damage, terms = objective_damage(adversarial)
+        gain = normalized_objective_gain(clean_damage, attack_damage)
+        output.append({
+            "name": entry["name"],
+            "clean_damage": clean_damage,
+            "attack_damage": attack_damage,
+            "normalized_gain": gain,
+            "terms": terms,
+        })
+        del item
+
+    torch.cuda.empty_cache()
+    gains = [float(entry["normalized_gain"]) for entry in output]
+    score = min(gains)
+    print(
+        f"[audit] update {update_idx:06d} baseline={args.attack_loss} "
+        f"worst_normalized_gain={score:+.6f} "
+        + " ".join(
+            f"{entry['name']}={entry['normalized_gain']:+.3f}"
+            for entry in output
+        ),
+        flush=True,
+    )
+    return {
+        "update": int(update_idx),
+        "score": float(score),
+        "baseline_objective": args.attack_loss,
+        "entries": output,
+    }
+
+
+def update_adaptive_plateau_state(
+    state: dict,
+    score: float,
+    *,
+    factor: float,
+    lr_patience: int,
+    stop_patience: int,
+    min_lr: float,
+    improvement_threshold: float,
+) -> tuple[dict, str]:
+    """Pure state transition for audit-driven LR reduction and early stopping."""
+    state = dict(state)
+    score = float(score)
+    best = float(state.get("best_score", -float("inf")))
+    reference = float(state.get("plateau_reference", best))
+    event = "none"
+    if score > best:
+        state["best_score"] = score
+        state["best_update"] = int(state.get("current_update", 0))
+    # Plateau patience is measured from the last *material* improvement, not
+    # from the immediately preceding numerical best.  Consequently several
+    # small but cumulative gains can still reset patience once together they
+    # exceed the threshold.
+    if score > reference + float(improvement_threshold):
+        state["plateau_reference"] = score
+        state["bad_audits"] = 0
+        return state, "improved"
+
+    state["bad_audits"] = int(state.get("bad_audits", 0)) + 1
+    lr = float(state["lr"])
+    min_lr = float(min_lr)
+    if lr > min_lr * (1.0 + 1e-12):
+        if state["bad_audits"] >= max(1, int(lr_patience)):
+            state["lr"] = max(min_lr, lr * float(factor))
+            state["bad_audits"] = 0
+            event = "reduce_lr"
+    elif state["bad_audits"] >= max(1, int(stop_patience)):
+        state["stopped"] = True
+        event = "early_stop"
+    return state, event
+
+
+def run_fixed_audit(model, texture, args, device, dtype, intrinsics, update_idx):
+    """Evaluate a fixed five-task training audit for comparable progress checks."""
+    if (args.attack_loss in DEPTH_BASELINE_LOSSES
+            or args.attack_loss in VO_BASELINE_LOSSES):
+        return run_fixed_baseline_objective_audit(
+            model, texture, args, device, dtype, intrinsics, update_idx
+        )
+    if args.attack_loss not in ("mirage_projected", "mirage_projected_split_pose"):
+        legacy = run_fixed_pose_audit(
+            model, texture, args, device, dtype, intrinsics, update_idx
+        )
+        clean = {entry[0]: float(entry[1]) for entry in legacy}
+        attack = {entry[0]: float(entry[2]) for entry in legacy}
+        score, ratios = normalized_worst_task_score(clean, attack)
+        return {
+            "update": int(update_idx),
+            "score": score,
+            "task_ratios": ratios,
+            "entries": legacy,
+        }
+
+    entries = getattr(args, "_audit_entries", None)
+    if entries is None:
+        entries = json.loads(Path(args.audit_plan).read_text(encoding="utf-8"))
+        for entry in entries:
+            entry["_frames"] = load_frame_manifest(entry["manifest"])
+        args._audit_entries = entries
+        args._audit_clean = {}
+
+    saved = (args.clean_vggt_output_root, args.mirage_projected_gt_dir,
+             args.attack_loss)
+    output = []
+    try:
+        for entry in entries:
+            scene = (Path(entry["scene"]) if entry.get("scene")
+                     else Path(args.tum_root) / entry["base_scene"])
+            frames = entry["_frames"][scene.name]
+            args.clean_vggt_output_root = entry.get("clean_root", saved[0])
+            args.mirage_projected_gt_dir = entry.get("gt_dir", saved[1])
+            args.attack_loss = saved[2]
+            item = load_tum_sequence(
+                scene, frames, args.gt_name, intrinsics, args.texture_size,
+                args, device, model=model, dtype=dtype,
+            )
+
+            def task_scores(images):
+                gt = item["mirage_projected_gt"]
+                requested = requested_mirage_projected_tasks(args)
+                with torch.no_grad():
+                    preds = forward_all_geometry_heads(
+                        model,
+                        images,
+                        dtype,
+                        query_points=(
+                            gt["query_points"].unsqueeze(0)
+                            if "track" in requested else None
+                        ),
+                        track_iters=args.joint_track_iters,
+                        activation_checkpoint=False,
+                        requested_tasks=requested,
+                    )
+                    scores = mirage_projected_task_scores(preds, item, args)
+                return {
+                    name: float(value.detach().cpu())
+                    for name, value in scores.items()
+                }
+
+            if entry["name"] not in args._audit_clean:
+                args._audit_clean[entry["name"]] = task_scores(item["images"])
+            clean = args._audit_clean[entry["name"]]
+            with torch.no_grad():
+                adversarial = apply_geometry_patch(
+                    item["images"], texture, item["grids"], item["masks"],
+                    args, training=False,
+                )
+            attack = task_scores(adversarial)
+            output.append({
+                "name": entry["name"],
+                "clean": clean,
+                "attack": attack,
+            })
+            del item
+    finally:
+        (args.clean_vggt_output_root, args.mirage_projected_gt_dir,
+         args.attack_loss) = saved
+        torch.cuda.empty_cache()
+
+    tasks = sorted({task for entry in output for task in entry["clean"]
+                    if task in entry["attack"]})
+    expected_tasks = set(requested_mirage_projected_tasks(args))
+    missing_tasks = sorted(expected_tasks - set(tasks))
+    if missing_tasks:
+        raise RuntimeError(
+            "Fixed adaptive audit is incomplete; missing task scores: "
+            f"{missing_tasks}. Choose audit manifests with valid tracking GT."
+        )
+    clean_mean = {
+        task: float(np.mean([
+            entry["clean"][task] for entry in output
+            if task in entry["clean"] and task in entry["attack"]
+        ]))
+        for task in tasks
+    }
+    attack_mean = {
+        task: float(np.mean([
+            entry["attack"][task] for entry in output
+            if task in entry["clean"] and task in entry["attack"]
+        ]))
+        for task in tasks
+    }
+    score, ratios = normalized_worst_task_score(clean_mean, attack_mean)
+    result = {
+        "update": int(update_idx),
+        "score": float(score),
+        "task_ratios": ratios,
+        "clean_mean": clean_mean,
+        "attack_mean": attack_mean,
+        "entries": output,
+    }
+    ratio_text = " ".join(
+        f"{task}={ratio:.3f}x" for task, ratio in ratios.items()
+    )
+    print(
+        f"[audit] update {update_idx:06d} worst_log_ratio={score:+.6f} "
+        f"{ratio_text}",
+        flush=True,
+    )
+    return result
+
+
 def dynamic_pool_for_scene(args: argparse.Namespace, scene_name: str) -> list[int]:
     """Resolve either the legacy shared pool or a per-scene pool JSON."""
     pool_json = str(getattr(args, "dynamic_frame_pool_json", "")).strip()
@@ -5070,6 +5509,47 @@ def dynamic_pool_for_scene(args: argparse.Namespace, scene_name: str) -> list[in
         pool = [int(v) for v in args.dynamic_frame_pool.split(",") if v.strip()]
         args._dynamic_pool = pool
     return pool
+
+
+def draw_dynamic_frame_indices(
+    pool: list[int],
+    frame_count: int,
+    rng: np.random.Generator,
+    query_sampling: str = "earliest",
+) -> list[int]:
+    """Draw one input set while keeping frame 0's Track-query meaning explicit.
+
+    ``earliest`` preserves the historical behavior: draw the whole set, sort it,
+    and therefore use the earliest sampled frame as the Track query.
+    ``uniform_query`` first samples the query uniformly from the complete pool,
+    then independently draws the remaining target/context frames and puts the
+    query at input position zero. Sorting only the targets keeps their order
+    deterministic without reintroducing an earliest-frame query bias.
+    """
+    if frame_count < 1:
+        raise ValueError("frame_count must be at least one")
+    if len(pool) < frame_count:
+        raise ValueError(
+            f"frame pool contains {len(pool)} frames, fewer than {frame_count}"
+        )
+    if query_sampling == "earliest":
+        return sorted(
+            int(value)
+            for value in rng.choice(pool, size=frame_count, replace=False)
+        )
+    if query_sampling == "uniform_query":
+        query = int(rng.choice(pool))
+        if frame_count == 1:
+            return [query]
+        remaining = [int(value) for value in pool if int(value) != query]
+        targets = sorted(
+            int(value)
+            for value in rng.choice(
+                remaining, size=frame_count - 1, replace=False
+            )
+        )
+        return [query, *targets]
+    raise ValueError(f"Unknown dynamic query sampling mode: {query_sampling}")
 
 
 def draw_dynamic_subsets(args: argparse.Namespace, rng: np.random.Generator,
@@ -5107,8 +5587,12 @@ def draw_dynamic_subsets(args: argparse.Namespace, rng: np.random.Generator,
     picks = []
     for _ in range(max(1, args.dynamic_sets_per_step)):
         for attempt in range(1000):
-            frames = sorted(int(v) for v in rng.choice(
-                pool, size=args.dynamic_frames_per_set, replace=False))
+            frames = draw_dynamic_frame_indices(
+                pool,
+                args.dynamic_frames_per_set,
+                rng,
+                getattr(args, "dynamic_query_sampling", "earliest"),
+            )
             if gt_pool is None or mirage_gt_pool_query_count(gt_pool, frames[0]) >= int(
                 args.mirage_projected_min_queries
             ):
@@ -5152,6 +5636,80 @@ def draw_subset_plan_entries(
     return picks, queue
 
 
+def _training_checkpoint_signature(
+    args: argparse.Namespace,
+    scene_dirs: list[Path],
+    texture: torch.Tensor,
+) -> dict:
+    """Fields that must stay fixed when continuing an interrupted patch run."""
+    signature = {
+        "attack_loss": str(args.attack_loss),
+        "inner_loop": int(args.inner_loop),
+        "scene_names": [path.name for path in scene_dirs],
+        "texture_shape": list(texture.shape),
+        "dynamic_frame_pool": str(args.dynamic_frame_pool),
+        "dynamic_frame_pool_json": str(args.dynamic_frame_pool_json),
+        "dynamic_sets_per_step": int(args.dynamic_sets_per_step),
+        "dynamic_frames_per_set": int(args.dynamic_frames_per_set),
+        "dynamic_query_sampling": str(args.dynamic_query_sampling),
+        "explicit_quad_world": str(args.explicit_quad_world),
+        "seed": int(args.seed),
+    }
+    # Preserve byte-for-byte compatibility with checkpoints made before the
+    # adaptive scheduler existed.  Only adaptive runs need the extra fields in
+    # their resume signature.
+    if str(args.scheduler) == "adaptive_plateau":
+        signature.update({
+            "scheduler": str(args.scheduler),
+            "audit_plan": str(args.audit_plan),
+            "audit_every": int(args.audit_every),
+            "adaptive_lr_factor": float(args.adaptive_lr_factor),
+            "adaptive_lr_patience": int(args.adaptive_lr_patience),
+            "adaptive_stop_patience": int(args.adaptive_stop_patience),
+            "adaptive_min_lr": float(args.adaptive_min_lr),
+            "adaptive_improvement_threshold": float(
+                args.adaptive_improvement_threshold
+            ),
+        })
+    if (str(getattr(args, "projected_subset_agg", "mean")) != "mean"
+            or str(getattr(args, "mirage_projected_track_mode", "capped_all"))
+            == "eval_epe_softmin"):
+        signature.update({
+            "projected_subset_agg": str(args.projected_subset_agg),
+            "projected_subset_softmin_tau_px": float(
+                args.projected_subset_softmin_tau_px
+            ),
+            "mirage_projected_track_mode": str(args.mirage_projected_track_mode),
+            "mirage_projected_track_target_softmin_tau_px": float(
+                args.mirage_projected_track_target_softmin_tau_px
+            ),
+        })
+    return signature
+
+
+def _atomic_save_training_checkpoint(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    torch.save(state, temporary)
+    os.replace(temporary, path)
+
+
+def _truncate_history_after_update(path: Path, completed_updates: int) -> None:
+    """Drop records written after the last atomic checkpoint, if any."""
+    if not path.exists():
+        return
+    kept: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if int(record.get("update", 0)) <= completed_updates:
+            kept.append(json.dumps(record))
+    text = "\n".join(kept)
+    path.write_text(text + ("\n" if text else ""), encoding="utf-8")
+
+
 def train_geometry_patch(
     model: torch.nn.Module,
     scene_dirs: list[Path],
@@ -5179,17 +5737,31 @@ def train_geometry_patch(
         args._spoo_naturalness = None
         args._spoo_laplacian = None
         if args.baseline_spoo_naturalness:
+            naturalness_reference = texture.detach()
+            if args.baseline_spoo_naturalness_reference_image:
+                naturalness_reference = load_texture_image(
+                    args.baseline_spoo_naturalness_reference_image,
+                    texture_hw(args, texture),
+                    device,
+                ).detach()
             args._spoo_naturalness = SpooVgg19Naturalness(
-                texture.detach(), weights_path=args.baseline_spoo_vgg19_weights
+                naturalness_reference,
+                weights_path=args.baseline_spoo_vgg19_weights,
             ).to(device).eval()
-            args._spoo_laplacian = spoo_matting_laplacian(texture.detach())
+            args._spoo_laplacian = spoo_matting_laplacian(
+                naturalness_reference
+            )
         args._spoo_borders = spoo_initial_borders(
-            texture_hw(args, texture)
+            texture_hw(args, texture),
+            bottom_margin_pixels=args.baseline_spoo_bottom_margin_pixels,
         ).to(device=device, dtype=torch.float32)
         args._spoo_borders.requires_grad_(not args.freeze_texture)
         args._spoo_region_frozen = False
         args._spoo_mask_active = False
-        args._spoo_second_stage = False
+        # Formal convergence runs execute the source paper's two phases as two
+        # separately audited jobs.  Phase two starts from phase one's restored
+        # best texture and explicitly enables the realism term from update 0.
+        args._spoo_second_stage = bool(args.baseline_spoo_force_second_stage)
         args._spoo_mask_weight = float(args.baseline_spoo_mask_weight)
         args._spoo_mask_update = 0
         args._spoo_initial_area = float(spoo_soft_rectangle(
@@ -5216,58 +5788,196 @@ def train_geometry_patch(
 
     patch_dir = output_dir / "geometry_patch"
     patch_dir.mkdir(parents=True, exist_ok=True)
-    initial_texture_npz = patch_dir / "initial_texture.npz"
-    np.savez_compressed(initial_texture_npz, texture=texture.detach().float().cpu().numpy())
-    initial_base = paper_base_texture_preview(texture, args)
-    initial_base_image = to_pil_image(initial_base)
-    initial_base_image.save(patch_dir / "initial_texture.png")
-    initial_base_image.save(patch_dir / "initial_patch.png")
-    initial_deployed = prepare_texture_for_render(
-        texture.detach(), args, training=False, n_frames=1
-    )[0].float().cpu().clamp(0, 1)
-    initial_deployed_image = to_pil_image(initial_deployed)
-    initial_deployed_image.save(patch_dir / "initial_deployed_patch.png")
     history_path = patch_dir / "training_history.jsonl"
-    if history_path.exists():
-        history_path.unlink()
-    if args.attack_loss == "baseline_spoo_depth":
-        initial_alpha = spoo_soft_rectangle(
-            args._spoo_borders.detach(),
-            texture_hw(args, texture),
-            args.baseline_spoo_mask_sharpness,
+    checkpoint_path = patch_dir / "training_checkpoint.pt"
+    # This path is part of the final metadata for both fresh and resumed runs.
+    # Keep it outside the fresh-run branch so a successful resume can finalize.
+    initial_texture_npz = patch_dir / "initial_texture.npz"
+    update_idx = 0
+    start_iteration = 0
+    resumed = False
+    resumed_last_loss = None
+    adaptive_state = None
+    adaptive_best_parameters = None
+    if args.auto_resume and checkpoint_path.exists():
+        if args.inner_loop != 1:
+            raise ValueError("--auto_resume currently requires --inner_loop 1")
+        try:
+            checkpoint = torch.load(
+                checkpoint_path, map_location="cpu", weights_only=False
+            )
+        except TypeError:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        expected_signature = _training_checkpoint_signature(args, scene_dirs, texture)
+        if checkpoint.get("signature") != expected_signature:
+            raise ValueError(
+                "Refusing to resume from a checkpoint made with different settings:\n"
+                f"saved={checkpoint.get('signature')}\ncurrent={expected_signature}"
+            )
+        saved_parameters = checkpoint.get("patch_parameters", [])
+        if len(saved_parameters) != len(patch_parameters):
+            raise ValueError(
+                "Checkpoint parameter count does not match this attack configuration"
+            )
+        with torch.no_grad():
+            for parameter, saved in zip(patch_parameters, saved_parameters):
+                parameter.copy_(saved.to(device=parameter.device, dtype=parameter.dtype))
+        if optimizer is not None and checkpoint.get("optimizer") is not None:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if auxiliary_optimizer is not None and checkpoint.get("auxiliary_optimizer") is not None:
+            auxiliary_optimizer.load_state_dict(checkpoint["auxiliary_optimizer"])
+        rng.bit_generator.state = checkpoint["numpy_rng_state"]
+        if checkpoint.get("torch_rng_state") is not None:
+            torch.set_rng_state(checkpoint["torch_rng_state"])
+        if torch.cuda.is_available() and checkpoint.get("cuda_rng_states") is not None:
+            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_states"])
+        update_idx = int(checkpoint["update_idx"])
+        start_iteration = int(checkpoint["next_iteration"])
+        resumed_last_loss = checkpoint.get("last_loss")
+        adaptive_state = checkpoint.get("adaptive_state")
+        saved_best = checkpoint.get("adaptive_best_parameters")
+        if saved_best is not None:
+            adaptive_best_parameters = [
+                value.to(device=parameter.device, dtype=parameter.dtype)
+                for parameter, value in zip(patch_parameters, saved_best)
+            ]
+        args._budget_duals = dict(checkpoint.get("budget_duals", {}))
+        args._floor_duals = dict(checkpoint.get("floor_duals", {}))
+        _truncate_history_after_update(history_path, update_idx)
+        resumed = True
+        print(
+            f"[resume] {checkpoint_path}: update={update_idx}, "
+            f"next_iteration={start_iteration}"
         )
+
+    if not resumed:
         np.savez_compressed(
-            patch_dir / "initial_adaptive_mask.npz",
-            adaptive_mask=initial_alpha.float().cpu().numpy(),
+            initial_texture_npz, texture=texture.detach().float().cpu().numpy()
         )
-    elif args.attack_loss == APARATE_SHAPE_EXTENSION:
-        initial_alpha = adaptive_alpha(
-            args._adaptive_mask_logits.detach(), args.baseline_mask_temperature,
-            texture_hw(args, texture),
-        )
-        np.savez_compressed(
-            patch_dir / "initial_adaptive_mask.npz",
-            adaptive_mask=initial_alpha.float().cpu().numpy(),
-        )
-        to_pil_image(initial_alpha.squeeze(0).float().cpu()).save(
-            patch_dir / "initial_adaptive_mask.png"
-        )
+        initial_base = paper_base_texture_preview(texture, args)
+        initial_base_image = to_pil_image(initial_base)
+        initial_base_image.save(patch_dir / "initial_texture.png")
+        initial_base_image.save(patch_dir / "initial_patch.png")
+        initial_deployed = prepare_texture_for_render(
+            texture.detach(), args, training=False, n_frames=1
+        )[0].float().cpu().clamp(0, 1)
+        initial_deployed_image = to_pil_image(initial_deployed)
+        initial_deployed_image.save(patch_dir / "initial_deployed_patch.png")
+        if history_path.exists():
+            history_path.unlink()
+        if args.attack_loss == "baseline_spoo_depth":
+            initial_alpha = spoo_soft_rectangle(
+                args._spoo_borders.detach(),
+                texture_hw(args, texture),
+                args.baseline_spoo_mask_sharpness,
+            )
+            np.savez_compressed(
+                patch_dir / "initial_adaptive_mask.npz",
+                adaptive_mask=initial_alpha.float().cpu().numpy(),
+            )
+        elif args.attack_loss == APARATE_SHAPE_EXTENSION:
+            initial_alpha = adaptive_alpha(
+                args._adaptive_mask_logits.detach(), args.baseline_mask_temperature,
+                texture_hw(args, texture),
+            )
+            np.savez_compressed(
+                patch_dir / "initial_adaptive_mask.npz",
+                adaptive_mask=initial_alpha.float().cpu().numpy(),
+            )
+            to_pil_image(initial_alpha.squeeze(0).float().cpu()).save(
+                patch_dir / "initial_adaptive_mask.png"
+            )
 
     total_updates = args.iterations * args.inner_loop
     warmup_updates = args.warmup_iterations * args.inner_loop
+    adaptive_enabled = args.scheduler == "adaptive_plateau"
+    if adaptive_enabled:
+        if not args.audit_plan or args.audit_every <= 0:
+            raise ValueError(
+                "--scheduler adaptive_plateau requires --audit_plan and "
+                "--audit_every > 0"
+            )
+        if args.inner_loop != 1:
+            raise ValueError("adaptive_plateau currently requires --inner_loop 1")
+        if not (0.0 < args.adaptive_lr_factor < 1.0):
+            raise ValueError("--adaptive_lr_factor must be strictly between 0 and 1")
+        if args.adaptive_lr_patience < 1 or args.adaptive_stop_patience < 1:
+            raise ValueError("adaptive patience values must be positive integers")
+        if not (0.0 < args.adaptive_min_lr <= args.patch_lr):
+            raise ValueError("--adaptive_min_lr must be in (0, --patch_lr]")
+        if args.adaptive_improvement_threshold < 0.0:
+            raise ValueError("--adaptive_improvement_threshold must be non-negative")
+        if adaptive_state is None:
+            adaptive_state = {
+                "lr": float(args.patch_lr),
+                "best_score": -float("inf"),
+                "best_update": 0,
+                "plateau_reference": -float("inf"),
+                "bad_audits": 0,
+                "stopped": False,
+            }
+        if adaptive_best_parameters is None:
+            adaptive_best_parameters = [
+                parameter.detach().clone() for parameter in patch_parameters
+            ]
+    audit_history_path = patch_dir / "audit_history.jsonl"
+    if not resumed and audit_history_path.exists():
+        audit_history_path.unlink()
     spoo_stage_two_start = max(
         1, int(round(total_updates * args.baseline_spoo_late_start_fraction))
     )
     spoo_best_start = max(
         0, int(round(total_updates * args.baseline_spoo_best_start_fraction))
     )
-    update_idx = 0
     started = time.time()
-    last_loss = None
+    last_loss = resumed_last_loss
     vo_best_texture = texture.detach().clone() if args.attack_loss in VO_BASELINE_LOSSES else None
     vo_best_score = -float("inf")
     vo_best_update = 0
     last_training_batch = None
+    stop_training = False
+
+    def handle_audit(result: dict) -> str:
+        nonlocal adaptive_state, adaptive_best_parameters
+        with audit_history_path.open("a", encoding="utf-8") as audit_file:
+            audit_file.write(json.dumps(result) + "\n")
+        if not adaptive_enabled:
+            return "none"
+        assert adaptive_state is not None
+        previous_best = float(adaptive_state.get("best_score", -float("inf")))
+        adaptive_state["current_update"] = int(result["update"])
+        adaptive_state, event = update_adaptive_plateau_state(
+            adaptive_state,
+            float(result["score"]),
+            factor=args.adaptive_lr_factor,
+            lr_patience=args.adaptive_lr_patience,
+            stop_patience=args.adaptive_stop_patience,
+            min_lr=args.adaptive_min_lr,
+            improvement_threshold=args.adaptive_improvement_threshold,
+        )
+        if float(result["score"]) > previous_best:
+            adaptive_best_parameters = [
+                parameter.detach().clone() for parameter in patch_parameters
+            ]
+        if event == "reduce_lr":
+            print(
+                f"[adaptive] plateau at update {result['update']}; "
+                f"lr -> {adaptive_state['lr']:.8g}",
+                flush=True,
+            )
+        elif event == "early_stop":
+            print(
+                f"[adaptive] converged at update {result['update']}; "
+                f"best update={adaptive_state['best_update']} "
+                f"best score={adaptive_state['best_score']:+.6f}",
+                flush=True,
+            )
+        return event
+
+    if adaptive_enabled and not resumed:
+        handle_audit(run_fixed_audit(
+            model, texture, args, device, dtype, intrinsics, update_idx=0
+        ))
 
     if args.freeze_texture:
         last_loss = 0.0
@@ -5286,7 +5996,7 @@ def train_geometry_patch(
     with history_path.open("a", encoding="utf-8") as history_file:
         if args.freeze_texture:
             pass
-        for iteration in range(args.iterations):
+        for iteration in range(start_iteration, args.iterations):
             if args.freeze_texture:
                 break
             args._eot_strength = current_eot_strength(args, update_idx, total_updates)
@@ -5404,21 +6114,30 @@ def train_geometry_patch(
                 optimizer.zero_grad(set_to_none=True)
                 if auxiliary_optimizer is not None:
                     auxiliary_optimizer.zero_grad(set_to_none=True)
-                current_lr = (
-                    spoo_polynomial_lr(args.patch_lr, update_idx, total_updates)
-                    if args.attack_loss == "baseline_spoo_depth"
-                    else (
-                        args.patch_lr
-                        if args.attack_loss in VO_BASELINE_LOSSES
-                        else scheduled_lr(
+                # Adaptive convergence owns the learning rate for every method.
+                # Paper-specific fixed-horizon schedules are retained only when
+                # adaptive mode is disabled; otherwise the nominal max step count
+                # would silently change the LR trajectory and the plateau audit
+                # would no longer be deciding convergence.
+                if adaptive_enabled:
+                    current_lr = (
+                        float(adaptive_state["lr"])
+                        * min(1.0, (update_idx + 1) / max(warmup_updates, 1))
+                    )
+                elif args.attack_loss == "baseline_spoo_depth":
+                    current_lr = spoo_polynomial_lr(
+                        args.patch_lr, update_idx, total_updates
+                    )
+                elif args.attack_loss in VO_BASELINE_LOSSES:
+                    current_lr = args.patch_lr
+                else:
+                    current_lr = scheduled_lr(
                         args.patch_lr,
                         update_idx,
                         total_updates,
                         warmup_updates,
                         args.scheduler,
                     )
-                    )
-                )
                 args._eot_strength = current_eot_strength(args, update_idx, total_updates)
                 set_optimizer_lr(optimizer, current_lr)
                 losses = []
@@ -5443,6 +6162,7 @@ def train_geometry_patch(
                 # Off is n=1, which is byte-for-byte the previous behaviour.
                 eot_draws = (max(1, int(args.eot_samples)) if args.physical_eot else 1)
                 grad_divisor = len(batch) * eot_draws
+                extra_terms = {}
                 softmin_w = None
                 if args.subset_agg == "softmin" and len(batch) > 1:
                     # Weights need all damages before any backward, and three
@@ -5509,6 +6229,12 @@ def train_geometry_patch(
                 _work = (list(enumerate(getattr(args, "_softmin_combos", [])))
                          if softmin_w is not None
                          else [(i, (i, "identity")) for i in range(len(batch))])
+                projected_subset_softmin = (
+                    args.attack_loss in ("mirage_projected", "mirage_projected_split_pose")
+                    and args.projected_subset_agg == "softmin"
+                    and len(batch) > 1
+                )
+                projected_pending = []
                 for _wi, (_bi, _tk) in _work:
                     if softmin_w is not None and float(softmin_w[_wi]) <= 0.0:
                         continue
@@ -5538,15 +6264,23 @@ def train_geometry_patch(
                             # AdamW performs descent. Task scores are larger-is-worse,
                             # hence their max-min direction enters with a minus sign;
                             # physical regularizers retain the ordinary descent sign.
-                            if softmin_w is not None:
+                            if projected_subset_softmin:
+                                projected_pending.append({
+                                    "task_gradient": task_gradient,
+                                    "reg_gradient": reg_gradient,
+                                    "damage": float(terms["projected_track_score"]),
+                                    "subset": item.get("subset_name", str(_bi)),
+                                })
+                            elif softmin_w is not None:
                                 _w = float(softmin_w[_wi]) / eot_draws
                                 contribution = (-task_gradient + reg_gradient) * _w
                             else:
                                 contribution = (-task_gradient + reg_gradient) / grad_divisor
-                            if texture.grad is None:
-                                texture.grad = contribution.detach().clone()
-                            else:
-                                texture.grad.add_(contribution.detach())
+                            if not projected_subset_softmin:
+                                if texture.grad is None:
+                                    texture.grad = contribution.detach().clone()
+                                else:
+                                    texture.grad.add_(contribution.detach())
                         else:
                             loss, terms, maximize_loss = attack_objective_loss(
                                 model,
@@ -5584,8 +6318,53 @@ def train_geometry_patch(
                         paper_realism_terms.append(float(reg_terms["paper_realism"].detach().cpu()))
                         coverages.append(item["geometry"]["mask_coverage_mean"])
 
+                if projected_subset_softmin:
+                    damages = torch.tensor(
+                        [entry["damage"] for entry in projected_pending],
+                        dtype=torch.float64,
+                    )
+                    tau = max(float(args.projected_subset_softmin_tau_px), 1e-6)
+                    weights = torch.softmax(-damages / tau, dim=0)
+                    if args.softmin_topk and args.softmin_topk < len(projected_pending):
+                        keep = torch.topk(weights, args.softmin_topk).indices
+                        selected = torch.zeros_like(weights)
+                        selected[keep] = weights[keep]
+                        weights = selected / selected.sum()
+                    for weight, entry in zip(weights, projected_pending):
+                        contribution = (
+                            -entry["task_gradient"] + entry["reg_gradient"]
+                        ) * float(weight)
+                        if texture.grad is None:
+                            texture.grad = contribution.detach().clone()
+                        else:
+                            texture.grad.add_(contribution.detach())
+                    softmin_j = -tau * (
+                        torch.logsumexp(-damages / tau, dim=0)
+                        - math.log(damages.numel())
+                    )
+                    extra_terms.update({
+                        "projected_subset_softmin_J": float(softmin_j),
+                        "projected_subset_weakest": int(torch.argmin(damages)),
+                        "projected_subset_names": [
+                            entry["subset"] for entry in projected_pending
+                        ],
+                        "projected_subset_damages": [float(value) for value in damages],
+                        "projected_subset_weights": [float(value) for value in weights],
+                    })
+
                 if texture.grad is None:
                     raise RuntimeError("Geometry patch gradient is None.")
+                # Record the actual gradient presented to the optimiser.  This
+                # is intentionally measured after all task aggregation,
+                # regularisation and gradient averaging, but before the
+                # optimiser mutates its internal state or the patch tensor.
+                # RMS is logged alongside the conventional L2 norm because
+                # source-faithful baselines may optimise a different texture
+                # resolution from MIRAGE-3D.
+                texture_grad_norm = float(
+                    texture.grad.detach().float().norm().cpu()
+                )
+                texture_grad_rms = texture_grad_norm / math.sqrt(texture.numel())
                 if args.attack_loss in VO_BASELINE_LOSSES:
                     # In the formal profile there is one fixed sequence and no
                     # EOT, so this is the same criterion the current texture
@@ -5644,6 +6423,8 @@ def train_geometry_patch(
                     "lr": current_lr,
                     "attack_loss": args.attack_loss,
                     "attack_metric": last_loss,
+                    "texture_grad_norm": texture_grad_norm,
+                    "texture_grad_rms": texture_grad_rms,
                     "regularization_total": float(np.mean(reg_totals)) if reg_totals else 0.0,
                     "tv": float(np.mean(tv_terms)) if tv_terms else 0.0,
                     "low_frequency": float(np.mean(low_freq_terms)) if low_freq_terms else 0.0,
@@ -5658,8 +6439,7 @@ def train_geometry_patch(
                     "eot_strength": float(getattr(args, "_eot_strength", 0.0)),
                     "scenes": [item["seq"] for item in batch],
                     "subsets": [item.get("subset_name") for item in batch],
-                    **(extra_terms if args.subset_agg == "softmin"
-                       and len(batch) > 1 else {}),
+                    **extra_terms,
                 }
                 for key, values in attack_term_values.items():
                     record[key] = float(np.mean(values))
@@ -5683,6 +6463,62 @@ def train_geometry_patch(
                     for name, value in getattr(args, "_budget_duals", {}).items():
                         record[f"budget_dual_after_{name}"] = float(value)
                 history_file.write(json.dumps(record) + "\n")
+                if (args.audit_plan and args.audit_every > 0
+                        and (update_idx % args.audit_every == 0
+                             or update_idx == total_updates)):
+                    event = handle_audit(run_fixed_audit(
+                        model, texture, args, device, dtype, intrinsics, update_idx
+                    ))
+                    stop_training = event == "early_stop"
+                should_checkpoint = (
+                    args.checkpoint_every > 0
+                    and (
+                        update_idx % args.checkpoint_every == 0
+                        or update_idx == total_updates
+                    )
+                )
+                if should_checkpoint:
+                    if args.inner_loop != 1:
+                        raise ValueError(
+                            "Periodic resumable checkpoints currently require --inner_loop 1"
+                        )
+                    history_file.flush()
+                    checkpoint_state = {
+                        "format_version": 1,
+                        "signature": _training_checkpoint_signature(
+                            args, scene_dirs, texture
+                        ),
+                        "patch_parameters": [
+                            parameter.detach().cpu() for parameter in patch_parameters
+                        ],
+                        "optimizer": (
+                            optimizer.state_dict() if optimizer is not None else None
+                        ),
+                        "auxiliary_optimizer": (
+                            auxiliary_optimizer.state_dict()
+                            if auxiliary_optimizer is not None else None
+                        ),
+                        "update_idx": update_idx,
+                        "next_iteration": iteration + 1,
+                        "last_loss": last_loss,
+                        "numpy_rng_state": rng.bit_generator.state,
+                        "torch_rng_state": torch.get_rng_state(),
+                        "cuda_rng_states": (
+                            torch.cuda.get_rng_state_all()
+                            if torch.cuda.is_available() else None
+                        ),
+                        "budget_duals": dict(getattr(args, "_budget_duals", {})),
+                        "floor_duals": dict(getattr(args, "_floor_duals", {})),
+                        "adaptive_state": adaptive_state,
+                        "adaptive_best_parameters": (
+                            [parameter.detach().cpu()
+                             for parameter in adaptive_best_parameters]
+                            if adaptive_best_parameters is not None else None
+                        ),
+                    }
+                    _atomic_save_training_checkpoint(
+                        checkpoint_path, checkpoint_state
+                    )
                 if update_idx == 1 or update_idx % args.log_every == 0 or update_idx == total_updates:
                     print(
                         f"[train-geometry] update {update_idx:06d}/{total_updates:06d} "
@@ -5690,14 +6526,13 @@ def train_geometry_patch(
                         f"reg={record['regularization_total']:.6f} "
                         f"coverage={record['mask_coverage_mean']:.6f}"
                     )
-                if (args.audit_plan and args.audit_every > 0
-                        and (update_idx % args.audit_every == 0
-                             or update_idx == total_updates)):
-                    run_fixed_audit(model, texture, args, device, dtype,
-                                    intrinsics, update_idx)
+                if stop_training:
+                    break
 
             last_training_batch = batch
             del batch
+            if stop_training:
+                break
 
     if args.attack_loss in VO_BASELINE_LOSSES and last_training_batch:
         final_scores = []
@@ -5719,6 +6554,17 @@ def train_geometry_patch(
                 texture.copy_(vo_best_texture)
         args._vo_best_score = vo_best_score
         args._vo_best_update = vo_best_update
+
+    if adaptive_enabled:
+        np.savez_compressed(
+            patch_dir / "last_texture_before_best_restore.npz",
+            texture=texture.detach().float().cpu().numpy(),
+        )
+        if adaptive_best_parameters is not None:
+            with torch.no_grad():
+                for parameter, best in zip(
+                        patch_parameters, adaptive_best_parameters):
+                    parameter.copy_(best)
 
     texture_npz = patch_dir / "geometry_patch_texture.npz"
     save_values = {"texture": texture.detach().float().cpu().numpy()}
@@ -5856,11 +6702,15 @@ def train_geometry_patch(
             "depth_eps": args.baseline_depth_eps,
             "focus_quad_world": args.baseline_focus_quad_world,
             "spoo_target_area_fraction": args.baseline_spoo_target_area_fraction,
+            "spoo_bottom_margin_pixels": args.baseline_spoo_bottom_margin_pixels,
             "spoo_mask_weight": args.baseline_spoo_mask_weight,
             "spoo_mask_sharpness": args.baseline_spoo_mask_sharpness,
             "spoo_border_lr": args.baseline_spoo_border_lr,
             "spoo_lbfgs_history": args.baseline_spoo_lbfgs_history,
             "spoo_naturalness": bool(args.baseline_spoo_naturalness),
+            "spoo_naturalness_reference_image": (
+                args.baseline_spoo_naturalness_reference_image or None
+            ),
             "spoo_vgg19_weights": args.baseline_spoo_vgg19_weights,
             "spoo_style_weight": args.baseline_spoo_style_weight,
             "spoo_content_weight": args.baseline_spoo_content_weight,
@@ -5868,6 +6718,9 @@ def train_geometry_patch(
             "spoo_realism_weight": args.baseline_spoo_realism_weight,
             "spoo_late_start_fraction": args.baseline_spoo_late_start_fraction,
             "spoo_best_start_fraction": args.baseline_spoo_best_start_fraction,
+            "spoo_force_second_stage": bool(
+                args.baseline_spoo_force_second_stage
+            ),
             "spoo_mask_schedule_fraction": args.baseline_spoo_mask_schedule_fraction,
             "spoo_mask_update_interval": args.baseline_spoo_mask_update_interval,
             "spoo_final_mask_weight": float(getattr(
@@ -5922,10 +6775,24 @@ def train_geometry_patch(
         },
         "scheduler": args.scheduler,
         "warmup_iterations": args.warmup_iterations,
+        "adaptive_scheduler": (
+            {
+                "factor": args.adaptive_lr_factor,
+                "lr_patience": args.adaptive_lr_patience,
+                "stop_patience": args.adaptive_stop_patience,
+                "min_lr": args.adaptive_min_lr,
+                "improvement_threshold": args.adaptive_improvement_threshold,
+                "state": adaptive_state,
+                "audit_plan": args.audit_plan,
+                "audit_every": args.audit_every,
+            }
+            if adaptive_enabled else None
+        ),
         "iterations": args.iterations,
         "inner_loop": args.inner_loop,
         "scenes_per_iteration": args.scenes_per_iteration,
         "total_updates": total_updates,
+        "completed_updates": update_idx,
         "elapsed_seconds": time.time() - started,
         "last_logged_attack_metric": last_loss,
         "depth_visibility": {
@@ -6182,8 +7049,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--scenes_per_iteration", type=int, default=1)
     parser.add_argument("--patch_lr", type=float, default=0.001)
-    parser.add_argument("--scheduler", choices=("cosine", "none"), default="cosine")
+    parser.add_argument(
+        "--scheduler",
+        choices=("cosine", "none", "adaptive_plateau"),
+        default="cosine",
+        help=(
+            "adaptive_plateau keeps a nonzero LR and changes it only from fixed "
+            "audit results; it requires --audit_plan and --audit_every"
+        ),
+    )
     parser.add_argument("--warmup_iterations", type=int, default=20)
+    parser.add_argument("--adaptive_lr_factor", type=float, default=0.5)
+    parser.add_argument("--adaptive_lr_patience", type=int, default=3)
+    parser.add_argument("--adaptive_stop_patience", type=int, default=5)
+    parser.add_argument("--adaptive_min_lr", type=float, default=1e-5)
+    parser.add_argument(
+        "--adaptive_improvement_threshold",
+        type=float,
+        default=0.005,
+        help="minimum fixed-audit worst-log-ratio gain that resets plateau patience",
+    )
     parser.add_argument("--feature_layer", default="aggregator_final")
     parser.add_argument(
         "--attack_loss",
@@ -6231,11 +7116,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--baseline_depth_eps", type=float, default=1e-3)
     parser.add_argument("--baseline_spoo_target_area_fraction", type=float, default=1.0 / 9.0)
+    parser.add_argument("--baseline_spoo_bottom_margin_pixels", type=int, default=40)
     parser.add_argument("--baseline_spoo_mask_weight", type=float, default=1e-3)
     parser.add_argument("--baseline_spoo_mask_sharpness", type=float, default=1.0)
     parser.add_argument("--baseline_spoo_border_lr", type=float, default=1.0)
     parser.add_argument("--baseline_spoo_lbfgs_history", type=int, default=20)
     parser.add_argument("--baseline_spoo_naturalness", action="store_true")
+    parser.add_argument(
+        "--baseline_spoo_naturalness_reference_image", default="",
+        help=(
+            "Optional immutable content/style/matting reference. This keeps the "
+            "paper's warning image fixed when phase two starts from phase one's "
+            "best optimized texture."
+        ),
+    )
     parser.add_argument("--baseline_spoo_vgg19_weights", default=None)
     # Source weights divided by its 1e6 adversarial coefficient. This keeps
     # every relative coefficient while avoiding unnecessarily huge gradients.
@@ -6245,6 +7139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline_spoo_realism_weight", type=float, default=2e-5)
     parser.add_argument("--baseline_spoo_late_start_fraction", type=float, default=0.5)
     parser.add_argument("--baseline_spoo_best_start_fraction", type=float, default=0.1)
+    parser.add_argument("--baseline_spoo_force_second_stage", action="store_true")
     parser.add_argument("--baseline_spoo_mask_schedule_fraction", type=float, default=0.6)
     parser.add_argument("--baseline_spoo_mask_update_interval", type=int, default=20)
     parser.add_argument("--baseline_spoo_mask_upscaler", type=float, default=1.5)
@@ -6340,6 +7235,17 @@ def parse_args() -> argparse.Namespace:
         help="跨子集聚合方式；softmin 把更新集中到当前最弱的子集",
     )
     parser.add_argument(
+        "--projected_subset_agg", choices=("mean", "softmin"), default="mean",
+        help=(
+            "aggregation across independently sampled query/frame sets for "
+            "mirage_projected; softmin is currently restricted to Track-only"
+        ),
+    )
+    parser.add_argument(
+        "--projected_subset_softmin_tau_px", type=float, default=0.25,
+        help="temperature in Track EPE pixels for robust query-set aggregation",
+    )
+    parser.add_argument(
         "--softmin_tau", type=float, default=0.05,
         help="soft-min 温度；越小越接近硬 min",
     )
@@ -6370,6 +7276,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dynamic_frames_per_set", type=int, default=10,
         help="每组多少帧",
+    )
+    parser.add_argument(
+        "--dynamic_query_sampling",
+        choices=("earliest", "uniform_query"),
+        default="earliest",
+        help=(
+            "how input frame 0 (the Track query) is selected: earliest preserves "
+            "the historical sorted-set behavior; uniform_query samples it "
+            "uniformly before drawing the remaining frames"
+        ),
     )
     parser.add_argument(
         "--mirage_projected_tasks", default="",
@@ -6410,8 +7326,35 @@ def parse_args() -> argparse.Namespace:
              "from carrying the whole objective",
     )
     parser.add_argument(
+        "--mirage_projected_track_mode",
+        choices=("capped_all", "eval_epe", "eval_epe_softmin"),
+        default="capped_all",
+        help="capped_all preserves the historical proxy; eval_epe follows the "
+             "formal Track EPE filter; eval_epe_softmin prioritises the least "
+             "damaged eligible target frame",
+    )
+    parser.add_argument(
+        "--mirage_projected_track_min_points_per_frame",
+        type=int,
+        default=20,
+        help="minimum known-visible points in a target frame for eval_epe mode; "
+             "must match eval_universal_four_tasks --min_track_points",
+    )
+    parser.add_argument(
+        "--mirage_projected_track_target_softmin_tau_px",
+        type=float,
+        default=0.25,
+        help="temperature in pixels for eval_epe_softmin target-frame aggregation",
+    )
+    parser.add_argument(
         "--mirage_projected_min_queries", type=int, default=20,
         help="minimum valid GT query points required for a dynamic subset's first frame",
+    )
+    parser.add_argument(
+        "--mirage_projected_max_queries", type=int, default=0,
+        help="training-only cap on valid Track queries per dynamic subset; 0 keeps "
+             "all queries. Queries are selected uniformly and formal evaluation "
+             "remains uncapped",
     )
     parser.add_argument(
         "--mirage_projected_direction_scale", type=float, default=0.0,
@@ -6452,6 +7395,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--activation_checkpoint", action="store_true")
     parser.add_argument(
+        "--activation_checkpoint_mode", choices=("global", "all"), default="global",
+        help="which Aggregator attention blocks are recomputed during backward; "
+             "global preserves historical behavior, all uses less memory for long "
+             "30-frame Track training at additional compute cost",
+    )
+    parser.add_argument(
         "--no_freeze_model_parameters",
         dest="freeze_model_parameters",
         action="store_false",
@@ -6463,6 +7412,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip_existing_outputs", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=0,
+        help="atomically save a resumable training checkpoint every N updates; "
+             "0 disables periodic checkpoints",
+    )
+    parser.add_argument(
+        "--auto_resume",
+        action="store_true",
+        help="resume from geometry_patch/training_checkpoint.pt when it exists; "
+             "the saved scene/split/context/quad signature must match",
+    )
 
     parser.add_argument("--fx", type=float, default=535.4)
     parser.add_argument("--fy", type=float, default=539.2)
@@ -6637,6 +7599,16 @@ def main() -> None:
                                      "mirage_projected_split_pose")):
         raise SystemExit("softmin 目前只支持 attack_objective_loss 分支，"
                          "mirage_projected 走的是自定义梯度路径")
+    if args.projected_subset_agg == "softmin":
+        if args.attack_loss not in ("mirage_projected", "mirage_projected_split_pose"):
+            raise SystemExit(
+                "--projected_subset_agg softmin requires a mirage_projected loss"
+            )
+        if requested_mirage_projected_tasks(args) != ("track",):
+            raise SystemExit(
+                "projected subset softmin is currently defined only for "
+                "--mirage_projected_tasks track"
+            )
     set_random_seeds(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

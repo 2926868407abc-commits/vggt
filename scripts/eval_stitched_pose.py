@@ -60,7 +60,11 @@ def make_windows(frame_indices: Iterable[int], window: int, stride: int) -> list
     return [frames[start : start + window] for start in starts]
 
 
-def load_planned_windows(path: str | Path, scene: str) -> tuple[list[int], list[list[int]]]:
+def load_planned_windows(
+    path: str | Path,
+    scene: str,
+    allow_training_frames: bool = False,
+) -> tuple[list[int], list[list[int]]]:
     """Load one scene's frozen held-out windows and recover first-seen frame order."""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     entries = [entry for entry in raw if str(entry.get("scene")) == scene]
@@ -70,7 +74,8 @@ def load_planned_windows(path: str | Path, scene: str) -> tuple[list[int], list[
     selected = []
     seen = set()
     for entry in entries:
-        if bool(entry.get("contains_training_frames", False)):
+        if (bool(entry.get("contains_training_frames", False))
+                and not allow_training_frames):
             raise ValueError(f"Frame plan entry {entry.get('name')} contains training frames")
         frames = [int(value) for value in entry["frames"]]
         if len(frames) != len(set(frames)):
@@ -145,12 +150,76 @@ def estimate_prediction_sim3(
     return scale, q, translation, diagnostic
 
 
+def estimate_sim3_from_points(
+    local_c2w: np.ndarray,
+    global_c2w: np.ndarray,
+    local_points: np.ndarray,
+    global_points: np.ndarray,
+    fallback_scale: float = 1.0,
+) -> tuple[float, np.ndarray, np.ndarray, dict]:
+    """Scale from scene points, rotation from camera orientations.
+
+    Camera centres over a short overlap are too tightly clustered to determine scale,
+    but the points they observe are not. Rotation is still taken from the orientations,
+    which stay well determined regardless of how little the camera translated.
+    """
+    local = np.asarray(local_c2w, dtype=np.float64)
+    global_ = np.asarray(global_c2w, dtype=np.float64)
+    lp = np.asarray(local_points, dtype=np.float64).reshape(-1, 3)
+    gp = np.asarray(global_points, dtype=np.float64).reshape(-1, 3)
+    keep = np.isfinite(lp).all(1) & np.isfinite(gp).all(1)
+    lp, gp = lp[keep], gp[keep]
+    if len(lp) < 32:
+        raise ValueError(f"only {len(lp)} finite overlap points")
+
+    q_candidates = global_[:, :3, :3] @ np.swapaxes(local[:, :3, :3], -1, -2)
+    q = nearest_rotation(q_candidates.sum(axis=0))
+
+    x_mean, y_mean = lp.mean(axis=0), gp.mean(axis=0)
+    qx = (q @ (lp - x_mean).T).T
+    yc = gp - y_mean
+    denominator = float(np.sum(qx * qx))
+    numerator = float(np.sum(qx * yc))
+    scale_observable = denominator > 1e-6 and numerator > 1e-8
+    scale = numerator / denominator if scale_observable else float(fallback_scale)
+    if not np.isfinite(scale) or scale <= 0:
+        scale = float(fallback_scale)
+        scale_observable = False
+    scale = float(np.clip(scale, 0.05, 20.0))
+
+    # translation is fixed on the cameras, so the stitched trajectory stays continuous
+    cam_x, cam_y = local[:, :3, 3].mean(axis=0), global_[:, :3, 3].mean(axis=0)
+    translation = cam_y - scale * (q @ cam_x)
+
+    mapped = apply_sim3_to_c2w(local, scale, q, translation)
+    pos_residual = np.linalg.norm(mapped[:, :3, 3] - global_[:, :3, 3], axis=-1)
+    rot_delta = mapped[:, :3, :3] @ np.swapaxes(global_[:, :3, :3], -1, -2)
+    cos_angle = np.clip((np.trace(rot_delta, axis1=1, axis2=2) - 1.0) * 0.5, -1.0, 1.0)
+    diagnostic = {
+        "overlap": int(len(local)),
+        "scale": scale,
+        "scale_observable": bool(scale_observable),
+        "scale_source": "points",
+        "n_points": int(len(lp)),
+        "point_spread_rms": math.sqrt(denominator / max(len(lp), 1)),
+        "local_overlap_rms": float(np.sqrt(
+            ((local[:, :3, 3] - cam_x) ** 2).sum(-1).mean())),
+        "position_residual_rmse": float(np.sqrt(np.mean(pos_residual**2))),
+        "rotation_residual_rmse_deg": float(np.sqrt(np.mean(
+            np.degrees(np.arccos(cos_angle)) ** 2))),
+    }
+    return scale, q, translation, diagnostic
+
+
 def apply_sim3_to_c2w(c2w: np.ndarray, scale: float, rotation: np.ndarray,
                       translation: np.ndarray) -> np.ndarray:
     poses = np.asarray(c2w, dtype=np.float64)
     out = np.array(poses, copy=True)
     out[:, :3, :3] = np.einsum("ij,njk->nik", rotation, poses[:, :3, :3])
-    out[:, :3, 3] = scale * np.einsum("ij,nj->ni", rotation, poses[:, :3, 3])
+    out[:, :3, 3] = (
+        scale * np.einsum("ij,nj->ni", rotation, poses[:, :3, 3])
+        + np.asarray(translation, dtype=np.float64)[None, :]
+    )
     out[:, 3, :] = np.asarray([0.0, 0.0, 0.0, 1.0])
     return out
 
@@ -165,8 +234,14 @@ def stitch_windows(window_records: list[dict], pose_key: str) -> tuple[np.ndarra
         raise ValueError("first window frame/pose length mismatch")
     stitched = {frame: pose.copy() for frame, pose in zip(first_frames, first_poses)}
     ordered_frames = list(first_frames)
-    diagnostics = [{"window": 0, "frames": first_frames, "overlap": 0, "scale": 1.0}]
+    diagnostics = [{"window": 0, "frames": first_frames, "overlap": 0,
+                    "scale": 1.0, "scale_source": "anchor"}]
     previous_scale = 1.0
+    point_key0 = f"{pose_key.rsplit('_', 1)[0]}_points"
+    stitched_points = {}
+    if window_records[0].get(point_key0) is not None:
+        p0 = np.asarray(window_records[0][point_key0], dtype=np.float64)
+        stitched_points = {f: p0[i] for i, f in enumerate(first_frames)}
 
     for window_idx, record in enumerate(window_records[1:], start=1):
         frames = [int(v) for v in record["frames"]]
@@ -179,14 +254,32 @@ def stitch_windows(window_records: list[dict], pose_key: str) -> tuple[np.ndarra
         local_lookup = {frame: i for i, frame in enumerate(frames)}
         local_overlap = np.stack([poses[local_lookup[frame]] for frame in overlap_frames])
         global_overlap = np.stack([stitched[frame] for frame in overlap_frames])
-        scale, rotation, translation, diagnostic = estimate_prediction_sim3(
-            local_overlap, global_overlap, fallback_scale=previous_scale)
+        point_key = f"{pose_key.rsplit('_', 1)[0]}_points"
+        lpts = record.get(point_key)
+        gpts = stitched_points.get(overlap_frames[0]) if stitched_points else None
+        if lpts is not None and gpts is not None:
+            li = [local_lookup[f] for f in overlap_frames]
+            lsel = np.asarray(lpts)[li]
+            gsel = np.stack([stitched_points[f] for f in overlap_frames])
+            scale, rotation, translation, diagnostic = estimate_sim3_from_points(
+                local_overlap, global_overlap, lsel, gsel,
+                fallback_scale=previous_scale)
+        else:
+            scale, rotation, translation, diagnostic = estimate_prediction_sim3(
+                local_overlap, global_overlap, fallback_scale=previous_scale)
+            diagnostic["scale_source"] = "cameras"
         previous_scale = scale
         mapped = apply_sim3_to_c2w(poses, scale, rotation, translation)
-        for frame, pose in zip(frames, mapped):
+        if lpts is not None:
+            lp_all = np.asarray(lpts, dtype=np.float64)
+            mapped_pts = (scale * (rotation @ lp_all.reshape(-1, 3).T).T
+                          + translation).reshape(lp_all.shape)
+        for i, (frame, pose) in enumerate(zip(frames, mapped)):
             if frame not in stitched:
                 stitched[frame] = pose
                 ordered_frames.append(frame)
+                if lpts is not None:
+                    stitched_points[frame] = mapped_pts[i]
         diagnostic.update({
             "window": window_idx,
             "frames": frames,
@@ -259,7 +352,11 @@ def infer(args: argparse.Namespace) -> None:
         count = len(all_images)
         split = count // 2
         if args.frame_plan:
-            selected, windows = load_planned_windows(args.frame_plan, scene_name)
+            selected, windows = load_planned_windows(
+                args.frame_plan,
+                scene_name,
+                allow_training_frames=args.allow_training_frames,
+            )
             if selected[-1] >= count:
                 raise IndexError(
                     f"Planned frame {selected[-1]} exceeds {scene_name} length {count}"
@@ -321,12 +418,21 @@ def infer(args: argparse.Namespace) -> None:
                 actual = data["frames"].astype(np.int64).tolist()
                 if actual != frames:
                     raise ValueError(f"cached window {window_idx} frame mismatch")
-                records.append({
+                rec = {
                     "frames": actual,
                     "clean_c2w": data["clean_c2w"].astype(np.float64),
                     "attack_c2w": data["attack_c2w"].astype(np.float64),
                     "coverage": float(data["coverage"]),
-                })
+                }
+                records.append(rec)
+            # infer writes the point arrays alongside, under pose_windows/,
+            # not into the windows/ npz the poses come from
+            pose_npz = scene_out / "pose_windows" / f"w{window_idx:04d}.npz"
+            if pose_npz.exists():
+                with np.load(pose_npz) as pdata:
+                    for key in ("clean_points", "attack_points"):
+                        if key in pdata.files:
+                            records[-1][key] = pdata[key].astype(np.float64)
         clean_frames, clean_c2w, clean_diag = stitch_windows(records, "clean_c2w")
         attack_frames, attack_c2w, attack_diag = stitch_windows(records, "attack_c2w")
         if not np.array_equal(clean_frames, attack_frames) or clean_frames.tolist() != selected:
@@ -470,7 +576,14 @@ def parse_args() -> argparse.Namespace:
     p_infer = sub.add_parser("infer", parents=[common])
     p_infer.add_argument("--protocol", default="/mnt/data/wangqq/vggt/data/tum_universal_all/protocol.json")
     p_infer.add_argument("--texture", required=True)
-    p_infer.add_argument("--quad_file", default="/mnt/data/wangqq/vggt/data/tum10_split/plane_quad_world.txt")
+    p_infer.add_argument(
+        "--quad_file",
+        default=(
+            "/mnt/data/wangqq/vggt/assets/visibility_fix/"
+            "sitting_xyz_monitor_on_stable_plane_v5.txt"
+        ),
+        help="Frozen physical carrier quad. The formal per-scene runs use v5.",
+    )
     p_infer.add_argument("--ckpt", default="facebook/VGGT-1B")
     p_infer.add_argument("--device", default="cuda:0")
     p_infer.add_argument("--split", choices=("unseen", "train", "all"), default="unseen")
@@ -486,6 +599,14 @@ def parse_args() -> argparse.Namespace:
     p_infer.add_argument(
         "--frame_plan", default="",
         help="Optional frozen JSON eval plan; overrides the built-in chronological split.")
+    p_infer.add_argument(
+        "--allow_training_frames",
+        action="store_true",
+        help=(
+            "explicitly allow a plan marked as containing training frames; "
+            "diagnostics only, never enable for held-out reporting"
+        ),
+    )
 
     p_metrics = sub.add_parser("metrics", parents=[common])
     p_metrics.add_argument("--recons_root", default="/mnt/data/wangqq/recons_eval")

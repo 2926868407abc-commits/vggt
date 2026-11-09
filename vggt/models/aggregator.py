@@ -272,7 +272,11 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            if self.training:
+            checkpoint_mode = getattr(self, "gradient_checkpointing", False)
+            checkpoint_frame = checkpoint_mode is True or checkpoint_mode in (
+                "all", "frame"
+            )
+            if self.training or checkpoint_frame:
                 tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
                 tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
@@ -295,7 +299,11 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            if self.training:
+            checkpoint_mode = getattr(self, "gradient_checkpointing", False)
+            checkpoint_global = checkpoint_mode is True or checkpoint_mode in (
+                "all", "global"
+            )
+            if self.training or checkpoint_global:
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos)

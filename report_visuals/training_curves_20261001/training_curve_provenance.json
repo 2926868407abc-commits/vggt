@@ -1,0 +1,35 @@
+{
+  "mirage": {
+    "pose_warmup_updates": 3700,
+    "five_task_updates": 6300,
+    "gradient_field": "projected_direction_scale",
+    "gradient_definition": "L2 norm of the projected attack direction before regularizer addition"
+  },
+  "spoo": {
+    "texture_stage_updates": 900,
+    "region_style_stage_updates": 800,
+    "gradient_field": "texture_grad_norm",
+    "gradient_definition": "L2 norm of the actual accumulated texture gradient immediately before L-BFGS.step",
+    "loss_source": "original formal run",
+    "gradient_source": "same-configuration replay with identical sampled subsets",
+    "formal_replay_validation": {
+      "stage1": {
+        "formal_updates": 900,
+        "replay_updates": 900,
+        "compared_updates": 900,
+        "mean_absolute_difference": 0.046337075895733305,
+        "max_absolute_difference": 0.18499839305877686,
+        "correlation": 0.985946449356306
+      },
+      "stage2": {
+        "formal_updates": 900,
+        "replay_updates": 800,
+        "compared_updates": 800,
+        "mean_absolute_difference": 0.0730339403450489,
+        "max_absolute_difference": 0.364363431930542,
+        "correlation": 0.9616996873076019
+      }
+    }
+  },
+  "smoothing": "EMA with span 50; faint lines are raw per-update observations"
+}

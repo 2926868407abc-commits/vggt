@@ -298,7 +298,10 @@ def infer(args: argparse.Namespace) -> None:
     for scene in args.scenes:
         if args.frame_plan:
             selected_frames, planned_windows = load_planned_windows(
-                args.frame_plan, scene)
+                args.frame_plan,
+                scene,
+                allow_training_frames=args.allow_training_frames,
+            )
             if args.max_windows:
                 planned_windows = planned_windows[:args.max_windows]
                 selected_frames = []
@@ -377,12 +380,37 @@ def infer(args: argparse.Namespace) -> None:
                     attack_pred, gt, args, np.random.default_rng(seed)),
             }
             out.write_text(json.dumps(record, indent=2), encoding="utf-8")
+            extra = {}
+            if args.save_window_points > 0:
+                # only the frames that can overlap a neighbour are needed, and
+                # a fixed stride keeps the archive small enough to keep per run
+                for cond, pred in (("clean", clean_pred), ("attack", attack_pred)):
+                    pm = np.asarray(pred["point_map"], dtype=np.float32)
+                    flat = pm.reshape(len(frames), -1, 3)
+                    finite = np.isfinite(flat).all(-1)
+                    keep = []
+                    for fi in range(len(frames)):
+                        idx = np.flatnonzero(finite[fi])
+                        if len(idx) > args.save_window_points:
+                            step = len(idx) // args.save_window_points
+                            idx = idx[::step][:args.save_window_points]
+                        keep.append(idx)
+                    n = min(len(i) for i in keep) if keep else 0
+                    if n == 0:
+                        continue
+                    # the same pixel index across frames, so a frame subset can
+                    # be sliced later without re-deriving correspondences
+                    common = keep[0][:n]
+                    extra[f"{cond}_points"] = np.stack(
+                        [flat[fi][common] for fi in range(len(frames))]
+                    ).astype(np.float32)
             np.savez_compressed(
                 pose_out,
                 frames=np.asarray(frames, dtype=np.int64),
                 clean_c2w=clean_pred["c2w"].astype(np.float32),
                 attack_c2w=attack_pred["c2w"].astype(np.float32),
                 coverage=np.asarray(record["coverage"], dtype=np.float32),
+                **extra,
             )
             print(
                 f"[window] {scene} {window_index + 1}/{len(source_windows)} "
@@ -403,12 +431,18 @@ def infer(args: argparse.Namespace) -> None:
                 actual = stored["frames"].astype(np.int64).tolist()
                 if actual != frames:
                     raise ValueError(f"cached pose window {window_index} frame mismatch")
-                pose_records.append({
+                rec = {
                     "frames": actual,
                     "clean_c2w": stored["clean_c2w"].astype(np.float64),
                     "attack_c2w": stored["attack_c2w"].astype(np.float64),
                     "coverage": float(stored["coverage"]),
-                })
+                }
+                # present only when infer ran with --save_window_points;
+                # the stitcher falls back to camera centres without them
+                for key in ("clean_points", "attack_points"):
+                    if key in stored.files:
+                        rec[key] = stored[key].astype(np.float64)
+                pose_records.append(rec)
         clean_frames, clean_c2w, clean_diag = stitch_windows(
             pose_records, "clean_c2w")
         attack_frames, attack_c2w, attack_diag = stitch_windows(
@@ -470,8 +504,11 @@ def aggregate_condition(records: list[dict], condition: str) -> dict[str, float 
 
 def summarize(args: argparse.Namespace) -> None:
     root = Path(args.output_root)
+    pose_csv = Path(args.pose_csv).resolve()
+    pose_bytes = pose_csv.read_bytes()
+    pose_sha256 = hashlib.sha256(pose_bytes).hexdigest()
     pose_rows = {}
-    with Path(args.pose_csv).open(newline="", encoding="utf-8") as handle:
+    with pose_csv.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
             pose_rows[row["scene"]] = row
     rows = []
@@ -483,10 +520,29 @@ def summarize(args: argparse.Namespace) -> None:
         clean = aggregate_condition(records, "clean")
         attacked = aggregate_condition(records, "attack")
         pose = pose_rows[scene]
+        pose_diag_path = pose_csv.parent / scene / "stitch_diagnostics.json"
+        if not pose_diag_path.exists():
+            raise FileNotFoundError(
+                f"Missing pose-stitch provenance for {scene}: {pose_diag_path}"
+            )
+        pose_diag = json.loads(pose_diag_path.read_text(encoding="utf-8"))
+        if pose_diag.get("scale_source") != "camera_centres_only":
+            raise RuntimeError(
+                "The four-task main table requires CameraHead-only pose stitching. "
+                f"Refusing pose CSV backed by scale_source="
+                f"{pose_diag.get('scale_source')!r}: {pose_csv}"
+            )
+        n_unique_frames = len({f for record in records for f in record["frames"]})
+        if "n_frames" in pose and int(pose["n_frames"]) != n_unique_frames:
+            raise RuntimeError(
+                f"pose CSV for {scene} has {pose['n_frames']} frames, but dense-task "
+                f"windows contain {n_unique_frames} unique frames; refusing to mix "
+                "different evaluation plans"
+            )
         row = {
             "scene": scene,
             "n_windows": len(records),
-            "n_unique_frames": len({f for record in records for f in record["frames"]}),
+            "n_unique_frames": n_unique_frames,
             "mean_coverage": float(np.mean([record["coverage"] for record in records])),
             "clean_ATE": float(pose["clean_ATE"]),
             "attack_ATE": float(pose["attack_ATE"]),
@@ -502,7 +558,10 @@ def summarize(args: argparse.Namespace) -> None:
         rows.append(row)
         (root / scene / "four_task_summary.json").write_text(
             json.dumps({"scene": scene, "clean": clean, "attack": attacked,
-                        "pose": pose}, indent=2), encoding="utf-8")
+                        "pose": pose, "pose_csv": str(pose_csv),
+                        "pose_metric_role": "main_camera_head_only",
+                        "pose_stitch_diagnostics": str(pose_diag_path),
+                        "pose_csv_sha256": pose_sha256}, indent=2), encoding="utf-8")
 
     csv_path = root / "four_task_by_scene.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -515,6 +574,17 @@ def summarize(args: argparse.Namespace) -> None:
     macro["total_unique_frames"] = int(sum(row["n_unique_frames"] for row in rows))
     (root / "four_task_macro.json").write_text(
         json.dumps(macro, indent=2), encoding="utf-8")
+    (root / "summary_provenance.json").write_text(
+        json.dumps({
+            "pose_csv": str(pose_csv),
+            "pose_metric_role": "main_camera_head_only",
+            "pose_csv_sha256": pose_sha256,
+            "pose_csv_mtime_ns": pose_csv.stat().st_mtime_ns,
+            "scenes": list(args.scenes),
+            "four_task_csv": str(csv_path.resolve()),
+        }, indent=2),
+        encoding="utf-8",
+    )
     print(f"[summary] {csv_path}", flush=True)
     for row in rows:
         print(
@@ -540,11 +610,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--frame_plan", default="",
         help="Frozen held-out window plan; enables one all-head forward per condition.")
+    p.add_argument(
+        "--allow_training_frames",
+        action="store_true",
+        help=(
+            "explicit diagnostic override for plans marked as containing training "
+            "frames; held-out evaluation must leave this disabled"
+        ),
+    )
     p.add_argument("--texture", required=True)
     p.add_argument("--protocol", default=str(REPO_ROOT / "data/tum_universal_all/protocol.json"))
     p.add_argument("--tum_root", default="/mnt/data/wangqq/recons_eval/data/tum_all_sync")
     p.add_argument("--gt_name", default="groundtruth.txt")
-    p.add_argument("--quad_file", default=str(REPO_ROOT / "data/tum10_split/plane_quad_world.txt"))
+    p.add_argument("--save_window_points", type=int, default=0,
+                   help="每帧保存多少个预测点用于拼接尺度估计；0=不保存")
+    p.add_argument(
+        "--quad_file",
+        default=str(
+            REPO_ROOT
+            / "assets/visibility_fix/sitting_xyz_monitor_on_stable_plane_v5.txt"
+        ),
+        help="Frozen physical carrier quad. The formal per-scene runs use v5.",
+    )
     p.add_argument("--ckpt", default=str(REPO_ROOT / "checkpoints/VGGT-1B"))
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--visibility_depth_margin", type=float, default=0.08)

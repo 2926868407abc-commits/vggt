@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 V=/mnt/data/wangqq/vggt
-PY=/mnt/data/wangqq/conda_envs/recons_eval/bin/python3
+PY="${PY:-/mnt/data/wangqq/conda_envs/recons_eval/bin/python3}"
 TUM=/mnt/data/wangqq/recons_eval/data/tum_all_sync
 POOLS="$V/data/tum_universal_all/universal_train_firsthalf_pools.json"
 OUT="$V/outputs/tum_gt_pool_universal_all_firsthalf"
@@ -21,6 +21,11 @@ scenes=(
 )
 
 running=0
+jobs="${GT_POOL_JOBS:-4}"
+if (( jobs < 1 )); then
+  echo "GT_POOL_JOBS must be at least 1" >&2
+  exit 2
+fi
 for scene in "${scenes[@]}"; do
   if [[ -f "$OUT/$scene/pool_meta.json" ]]; then
     echo "skip complete pool $scene"
@@ -36,7 +41,7 @@ for scene in "${scenes[@]}"; do
     --out_dir "$OUT" \
     --lazy_tracks >"$log" 2>&1 &
   running=$((running + 1))
-  if (( running == 4 )); then
+  if (( running == jobs )); then
     wait
     running=0
   fi
